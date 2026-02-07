@@ -13,6 +13,35 @@ def cmd_db_init(args):
     init_db(config)
 
 
+def cmd_sync(args):
+    from runbase.config import load_config
+
+    config = load_config()
+
+    if not args.icloud:
+        print("No sync source specified. Use --icloud.")
+        sys.exit(1)
+
+    from runbase.ingest.icloud_sync import sync_icloud
+
+    result = sync_icloud(config, dry_run=args.dry_run, verbose=args.verbose)
+    _print_sync_summary(result, dry_run=args.dry_run)
+
+
+def _print_sync_summary(result: dict, dry_run: bool = False):
+    prefix = "[DRY RUN] " if dry_run else ""
+    print(f"\n{prefix}Sync complete:")
+    print(f"  New:     {result['new']}")
+    print(f"  Skipped: {result['skipped']}")
+    print(f"  Errors:  {result['errors']}")
+
+    if result["errors"] > 0:
+        print("\nErrors:")
+        for d in result["details"]:
+            if d["status"] == "error":
+                print(f"  {d['file']}: {d['error']}")
+
+
 def cmd_stub(name):
     def handler(args):
         print(f"'{name}' is not yet implemented.")
@@ -29,10 +58,14 @@ def main():
     db_init = db_sub.add_parser("init", help="Initialize the database schema")
     db_init.set_defaults(func=cmd_db_init)
 
-    # Stub subcommands for future phases
+    # sync subcommand
     sync_parser = subparsers.add_parser("sync", help="Sync data from sources")
-    sync_parser.set_defaults(func=cmd_stub("sync"))
+    sync_parser.add_argument("--icloud", action="store_true", help="Sync from iCloud HealthFit folder")
+    sync_parser.add_argument("--dry-run", action="store_true", help="Show what would be imported without writing")
+    sync_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    sync_parser.set_defaults(func=cmd_sync)
 
+    # Stub subcommands for future phases
     import_parser = subparsers.add_parser("import", help="Import historical data")
     import_parser.set_defaults(func=cmd_stub("import"))
 

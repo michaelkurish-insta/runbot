@@ -1,7 +1,7 @@
 PyYAML
 
 # Future phases (uncomment as needed)
-# fitparse        # .fit file parsing (Phase 1)
+fitparse           # .fit file parsing (Phase 1)
 # gpxpy           # .gpx file parsing (Phase 1)
 # lxml            # .tcx file parsing (Phase 1)
 # openpyxl        # .xlsx spreadsheet import (Phase 2)

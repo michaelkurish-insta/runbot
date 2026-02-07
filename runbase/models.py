@@ -7,17 +7,19 @@ class Activity:
     id: Optional[int] = None
     date: str = ""
     start_time: Optional[str] = None
-    distance_m: Optional[float] = None
+    distance_mi: Optional[float] = None
     duration_s: Optional[float] = None
-    avg_pace_s_per_km: Optional[float] = None
+    avg_pace_s_per_mi: Optional[float] = None
+    avg_pace_display: Optional[str] = None
     avg_hr: Optional[float] = None
     max_hr: Optional[float] = None
     avg_cadence: Optional[float] = None
-    total_ascent_m: Optional[float] = None
-    total_descent_m: Optional[float] = None
+    total_ascent_ft: Optional[float] = None
+    total_descent_ft: Optional[float] = None
     calories: Optional[float] = None
     workout_type: Optional[str] = None
     workout_name: Optional[str] = None
+    fit_file_path: Optional[str] = None
     intensity_score: Optional[float] = None
     notes: Optional[str] = None
     shoe_id: Optional[int] = None
@@ -33,13 +35,13 @@ class ActivitySource:
     source: str = ""
     source_id: Optional[str] = None
     raw_file_path: Optional[str] = None
-    distance_m: Optional[float] = None
+    distance_mi: Optional[float] = None
     duration_s: Optional[float] = None
-    avg_pace_s_per_km: Optional[float] = None
+    avg_pace_s_per_mi: Optional[float] = None
     avg_hr: Optional[float] = None
     max_hr: Optional[float] = None
     avg_cadence: Optional[float] = None
-    total_ascent_m: Optional[float] = None
+    total_ascent_ft: Optional[float] = None
     calories: Optional[float] = None
     workout_name: Optional[str] = None
     notes: Optional[str] = None
@@ -52,11 +54,12 @@ class Interval:
     id: Optional[int] = None
     activity_id: Optional[int] = None
     rep_number: Optional[int] = None
-    prescribed_distance_m: Optional[float] = None
-    actual_distance_m: Optional[float] = None
-    canonical_distance_m: Optional[float] = None
+    prescribed_distance_mi: Optional[float] = None
+    actual_distance_mi: Optional[float] = None
+    canonical_distance_mi: Optional[float] = None
     duration_s: Optional[float] = None
-    avg_pace_s_per_km: Optional[float] = None
+    avg_pace_s_per_mi: Optional[float] = None
+    avg_pace_display: Optional[str] = None
     avg_hr: Optional[float] = None
     avg_cadence: Optional[float] = None
     is_recovery: bool = False
@@ -69,11 +72,11 @@ class Stream:
     timestamp_s: Optional[float] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
-    altitude_m: Optional[float] = None
+    altitude_ft: Optional[float] = None
     heart_rate: Optional[int] = None
     cadence: Optional[int] = None
-    pace_s_per_km: Optional[float] = None
-    distance_m: Optional[float] = None
+    pace_s_per_mi: Optional[float] = None
+    distance_mi: Optional[float] = None
 
 
 @dataclass
