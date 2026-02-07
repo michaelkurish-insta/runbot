@@ -42,6 +42,41 @@ def _print_sync_summary(result: dict, dry_run: bool = False):
                 print(f"  {d['file']}: {d['error']}")
 
 
+def cmd_import(args):
+    from runbase.config import load_config
+
+    config = load_config()
+
+    if not args.xlsx:
+        print("No import source specified. Use --xlsx.")
+        sys.exit(1)
+
+    from runbase.ingest.xlsx_import import import_xlsx
+
+    result = import_xlsx(config, dry_run=args.dry_run, verbose=args.verbose)
+    _print_import_summary(result, dry_run=args.dry_run)
+
+
+def _print_import_summary(result: dict, dry_run: bool = False):
+    prefix = "[DRY RUN] " if dry_run else ""
+
+    if result.get("already_imported"):
+        print(f"\n{prefix}XLSX already imported (file hash match). Nothing to do.")
+        return
+
+    print(f"\n{prefix}Import complete:")
+    print(f"  New:              {result['new']}")
+    print(f"  Skipped:          {result['skipped']}")
+    print(f"  Errors:           {result['errors']}")
+    print(f"  Non-running:      {result['skipped_non_running']}")
+
+    stats = result.get("parse_stats", {})
+    if stats:
+        print(f"\n  Parse breakdown:")
+        for method, count in sorted(stats.items()):
+            print(f"    {method}: {count}")
+
+
 def cmd_stub(name):
     def handler(args):
         print(f"'{name}' is not yet implemented.")
@@ -65,9 +100,12 @@ def main():
     sync_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     sync_parser.set_defaults(func=cmd_sync)
 
-    # Stub subcommands for future phases
+    # import subcommand
     import_parser = subparsers.add_parser("import", help="Import historical data")
-    import_parser.set_defaults(func=cmd_stub("import"))
+    import_parser.add_argument("--xlsx", action="store_true", help="Import from training_log.xlsx")
+    import_parser.add_argument("--dry-run", action="store_true", help="Show what would be imported without writing")
+    import_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    import_parser.set_defaults(func=cmd_import)
 
     reconcile_parser = subparsers.add_parser("reconcile", help="Reconcile activities across sources")
     reconcile_parser.set_defaults(func=cmd_stub("reconcile"))

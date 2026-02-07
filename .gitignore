@@ -4,3 +4,4 @@ __pycache__/
 venv/
 config/config.yaml
 *.db
+*.xlsx
