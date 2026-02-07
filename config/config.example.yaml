@@ -1,0 +1,41 @@
+paths:
+  db: "~/runbase/data/runbase.db"
+  raw_store: "~/runbase/data/raw/"
+  icloud_healthfit: "~/Library/Mobile Documents/iCloud~com~altifondo~HealthFit/Documents/"
+  garmin_export_zip: "~/Downloads/garmin_export.zip"
+  xlsx_import: "~/runbase/import/training_log.xlsx"
+
+strava:
+  client_id: "${STRAVA_CLIENT_ID}"
+  client_secret: "${STRAVA_CLIENT_SECRET}"
+  token_file: "~/runbase/state/strava_tokens.json"
+
+garmin:
+  email: "${GARMIN_EMAIL}"
+  password: "${GARMIN_PASSWORD}"
+
+runalyze:
+  username: "${RUNALYZE_USERNAME}"
+  password: "${RUNALYZE_PASSWORD}"
+  method: "csv_scrape"
+
+llm:
+  provider: "ollama"
+  model: "phi3:mini"
+  endpoint: "http://localhost:11434"
+
+reconcile:
+  distance_tolerance_pct: 5
+  time_match_window_minutes: 5
+  source_priority:
+    - "manual_override"
+    - "master_xlsx"
+    - "workout_name_parse"
+    - "fit_file"
+    - "strava"
+    - "garmin"
+    - "runalyze"
+
+review:
+  host: "127.0.0.1"
+  port: 5050

@@ -1,0 +1,10 @@
+PyYAML
+
+# Future phases (uncomment as needed)
+# fitparse        # .fit file parsing (Phase 1)
+# gpxpy           # .gpx file parsing (Phase 1)
+# lxml            # .tcx file parsing (Phase 1)
+# openpyxl        # .xlsx spreadsheet import (Phase 2)
+# flask           # review UI (Phase 5)
+# requests        # API calls (Phase 3)
+# garminconnect   # Garmin API (Phase 2)
