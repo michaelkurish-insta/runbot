@@ -18,14 +18,27 @@ def cmd_sync(args):
 
     config = load_config()
 
-    if not args.icloud:
-        print("No sync source specified. Use --icloud.")
+    if not args.icloud and not args.strava:
+        print("No sync source specified. Use --icloud or --strava.")
         sys.exit(1)
 
-    from runbase.ingest.icloud_sync import sync_icloud
+    if args.icloud:
+        from runbase.ingest.icloud_sync import sync_icloud
 
-    result = sync_icloud(config, dry_run=args.dry_run, verbose=args.verbose)
-    _print_sync_summary(result, dry_run=args.dry_run)
+        result = sync_icloud(config, dry_run=args.dry_run, verbose=args.verbose)
+        _print_sync_summary(result, dry_run=args.dry_run)
+
+    if args.strava:
+        from runbase.ingest.strava_sync import sync_strava
+
+        result = sync_strava(
+            config,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            full_history=args.full_history,
+            fetch_streams=not args.no_streams,
+        )
+        _print_strava_summary(result, dry_run=args.dry_run)
 
 
 def _print_sync_summary(result: dict, dry_run: bool = False):
@@ -40,6 +53,28 @@ def _print_sync_summary(result: dict, dry_run: bool = False):
         for d in result["details"]:
             if d["status"] == "error":
                 print(f"  {d['file']}: {d['error']}")
+
+
+def _print_strava_summary(result: dict, dry_run: bool = False):
+    prefix = "[DRY RUN] " if dry_run else ""
+    print(f"\n{prefix}Strava sync complete:")
+    print(f"  Matched:       {result['matched']}")
+    print(f"  Unmatched:     {result['unmatched']}")
+    print(f"  Skipped:       {result['skipped']}")
+    print(f"  Errors:        {result['errors']}")
+    print(f"  Fields filled: {result['fields_filled']}")
+    print(f"  Laps inserted: {result['laps_inserted']}")
+    print(f"  Streams pts:   {result['streams_inserted']}")
+    print(f"  Shoes created: {result['shoes_created']}")
+
+    if result["rate_limit_pauses"] > 0:
+        print(f"  Rate pauses:   {result['rate_limit_pauses']}")
+
+    if result["errors"] > 0:
+        print("\nErrors:")
+        for d in result["details"]:
+            if d["status"] == "error":
+                print(f"  strava:{d['strava_id']}: {d['error']}")
 
 
 def cmd_import(args):
@@ -96,6 +131,9 @@ def main():
     # sync subcommand
     sync_parser = subparsers.add_parser("sync", help="Sync data from sources")
     sync_parser.add_argument("--icloud", action="store_true", help="Sync from iCloud HealthFit folder")
+    sync_parser.add_argument("--strava", action="store_true", help="Sync from Strava API")
+    sync_parser.add_argument("--full-history", action="store_true", help="Ignore last sync timestamp, fetch everything")
+    sync_parser.add_argument("--no-streams", action="store_true", help="Skip per-second stream data (faster sync)")
     sync_parser.add_argument("--dry-run", action="store_true", help="Show what would be imported without writing")
     sync_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     sync_parser.set_defaults(func=cmd_sync)

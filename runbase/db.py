@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS activities (
     calories            REAL,
     workout_type        TEXT,
     workout_name        TEXT,
+    strides             INTEGER,
+    workout_category    TEXT,
     fit_file_path       TEXT,
     intensity_score     REAL,
     notes               TEXT,

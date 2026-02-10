@@ -59,6 +59,8 @@ class ParsedRow:
     raw_cardio: str | None
     parse_method: str
     pace_source: str | None
+    strides: int | None = None
+    workout_category: str | None = None
     splits_s: list[float] | None = None
 
 
@@ -224,6 +226,83 @@ def _parse_rows(raw_rows: list[dict], verbose: bool) -> tuple[list[ParsedRow], i
     return parsed, skipped_non_running, parse_stats
 
 
+def _parse_strides(cardio_note: str | None, workout_title: str | None) -> int | None:
+    """Extract strides count from cardio_note (col 9) or workout_title (col 10).
+
+    Matches patterns like "4 strides", "strides(6)", "6strides", "6.5 strides".
+    Returns rounded integer count, or None if no count found.
+    """
+    for text in (cardio_note, workout_title):
+        if not text:
+            continue
+        m = re.search(r'(\d+\.?\d*)\s*strides', str(text), re.IGNORECASE)
+        if m:
+            return round(float(m.group(1)))
+        # Also match "strides(N)" and "strides (N)"
+        m = re.search(r'strides\s*\(\s*(\d+\.?\d*)\s*\)', str(text), re.IGNORECASE)
+        if m:
+            return round(float(m.group(1)))
+    return None
+
+
+def _parse_workout_category(cardio_note: str | None, workout_title: str | None) -> str | None:
+    """Classify workout category from cardio_note (col 9) and workout_title (col 10).
+
+    Returns one of: tempo, interval, repetition, fartlek, hills, race, long, easy, strides.
+    Returns None only if no classification can be made (caller should default to 'easy').
+    """
+    cn = str(cardio_note).strip() if cardio_note else ""
+    wt = str(workout_title).strip() if workout_title else ""
+    cn_lower = cn.lower()
+    wt_lower = wt.lower()
+
+    # Skip lift-only entries
+    if cn_lower == "lift":
+        return None
+
+    # Race detection — check both fields
+    race_patterns = (
+        r'\b\d+k\s+race\b', r'\b\d+\s*mile\s+race\b', r'\bmile\s+TT\b',
+        r'\b\d+\s*TT\b', r'\bhalf\s+race\b', r'\bfull\s+race\b',
+        r'\brace\b', r'\bgoal\s+mile\b', r'\beaster\s+mile\b',
+    )
+    for pat in race_patterns:
+        if re.search(pat, cn, re.IGNORECASE) or re.search(pat, wt, re.IGNORECASE):
+            return "race"
+
+    # Speed workout types from cardio_note
+    if re.search(r'\bspeed\s+T\b|^ST$|\bspeed\s+T/R\b', cn, re.IGNORECASE):
+        return "tempo"
+    if re.search(r'\bspeed\s+I\b', cn, re.IGNORECASE):
+        return "interval"
+    if re.search(r'\bspeed\s+R\b|\bspeed\s+R/I\b', cn, re.IGNORECASE):
+        return "repetition"
+    if re.search(r'\bspeed\s+F\b', cn, re.IGNORECASE):
+        return "fartlek"
+
+    # Hills
+    if re.search(r'\bhills?\b', cn_lower):
+        return "hills"
+
+    # Long run — check workout_title
+    if re.search(r'\blong\b', wt_lower):
+        return "long"
+
+    # Strides-only (no speed/race keywords above matched)
+    if re.search(r'\bstrides?\b', cn_lower) or re.search(r'\bstrides?\b', wt_lower):
+        return "easy"
+
+    # Pre-race / shake out
+    if re.search(r'\bshake\s*out\b|\bpre[\s-]?race\b', cn_lower):
+        return "easy"
+
+    # If cardio_note is empty, default easy
+    if not cn:
+        return "easy"
+
+    return None
+
+
 def _parse_numeric_row(raw: dict) -> ParsedRow:
     """Parse a row with numeric cardio (distance in miles)."""
     date_str = _normalize_date(raw["date"])
@@ -266,15 +345,22 @@ def _parse_numeric_row(raw: dict) -> ParsedRow:
     if avg_pace is not None:
         avg_pace_display = format_pace(avg_pace)
 
-    # Workout name: prefer col 10, fallback to col 9
+    # Workout name: col 10 only (col 9 is category/strides metadata)
     workout_name = None
     wt = raw.get("workout_title")
     if wt and str(wt).strip():
         workout_name = str(wt).strip()
-    else:
-        cn = raw.get("cardio_note")
-        if cn and str(cn).strip():
-            workout_name = str(cn).strip()
+
+    # Strides and workout category
+    cardio_note = raw.get("cardio_note")
+    cn_str = str(cardio_note).strip() if cardio_note else None
+    if cn_str == "" or cn_str == "None":
+        cn_str = None
+
+    strides = _parse_strides(cn_str, workout_name)
+    workout_category = _parse_workout_category(cn_str, workout_name)
+    if workout_category is None:
+        workout_category = "easy"
 
     # Intensity score
     intensity = raw.get("intensity")
@@ -311,6 +397,8 @@ def _parse_numeric_row(raw: dict) -> ParsedRow:
         raw_cardio=str(raw["cardio"]) if raw["cardio"] is not None else None,
         parse_method="numeric",
         pace_source=pace_source,
+        strides=strides,
+        workout_category=workout_category,
         splits_s=note_result.splits_s,
     )
 
@@ -372,15 +460,22 @@ def _parse_text_row(raw: dict) -> ParsedRow | None:
         except (ValueError, TypeError):
             pass
 
-    # Workout name
+    # Workout name: col 10 only
     workout_name = None
     wt = raw.get("workout_title")
     if wt and str(wt).strip():
         workout_name = str(wt).strip()
-    else:
-        cn = raw.get("cardio_note")
-        if cn and str(cn).strip():
-            workout_name = str(cn).strip()
+
+    # Strides and workout category
+    cardio_note = raw.get("cardio_note")
+    cn_str = str(cardio_note).strip() if cardio_note else None
+    if cn_str == "" or cn_str == "None":
+        cn_str = None
+
+    strides = _parse_strides(cn_str, workout_name)
+    workout_category = _parse_workout_category(cn_str, workout_name)
+    if workout_category is None:
+        workout_category = "easy"
 
     return ParsedRow(
         row_number=raw["row_number"],
@@ -399,6 +494,8 @@ def _parse_text_row(raw: dict) -> ParsedRow | None:
         raw_cardio=cardio_text,
         parse_method=parse_method,
         pace_source=pace_source,
+        strides=strides,
+        workout_category=workout_category,
     )
 
 
@@ -574,11 +671,12 @@ def _insert_row(conn, parsed: ParsedRow, xlsx_path: str,
             """INSERT INTO activities
                (date, distance_mi, duration_s, avg_pace_s_per_mi, avg_pace_display,
                 avg_hr, avg_cadence, workout_type, workout_name,
-                intensity_score, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                strides, workout_category, intensity_score, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (parsed.date, parsed.distance_mi, parsed.duration_s,
              parsed.avg_pace_s_per_mi, parsed.avg_pace_display,
              parsed.avg_hr, parsed.avg_cadence, "running", parsed.workout_name,
+             parsed.strides, parsed.workout_category,
              parsed.intensity_score, parsed.notes),
         )
         activity_id = cursor.lastrowid

@@ -19,6 +19,8 @@ class Activity:
     calories: Optional[float] = None
     workout_type: Optional[str] = None
     workout_name: Optional[str] = None
+    strides: Optional[int] = None
+    workout_category: Optional[str] = None
     fit_file_path: Optional[str] = None
     intensity_score: Optional[float] = None
     notes: Optional[str] = None
