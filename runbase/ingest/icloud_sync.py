@@ -9,6 +9,32 @@ from runbase.db import get_connection
 from runbase.ingest.fit_parser import parse_fit_file
 
 
+def _enrich_new_activities(conn, activity_ids: list[int], verbose: bool) -> int:
+    """Try to match new FIT activities against orphaned Strava sources."""
+    from runbase.reconcile.matcher import find_strava_match
+    from runbase.reconcile.enricher import enrich_from_strava
+
+    enriched = 0
+    for activity_id in activity_ids:
+        row = conn.execute(
+            "SELECT date, distance_mi FROM activities WHERE id = ?",
+            (activity_id,),
+        ).fetchone()
+        if not row:
+            continue
+
+        date, distance_mi = row
+        match = find_strava_match(conn, date, distance_mi)
+        if match:
+            if verbose:
+                print(f"  ENRICH activity #{activity_id} ← Strava \"{match.get('strava_name', '')}\"")
+            enrich_from_strava(conn, activity_id, match, verbose=verbose)
+            conn.commit()
+            enriched += 1
+
+    return enriched
+
+
 def sync_icloud(config: dict, dry_run: bool = False, verbose: bool = False) -> dict:
     """Scan iCloud HealthFit folder and import new .fit files.
 
@@ -23,14 +49,18 @@ def sync_icloud(config: dict, dry_run: bool = False, verbose: bool = False) -> d
         print(f"Found {len(fit_files)} .fit file(s) in {icloud_path}")
 
     conn = get_connection(config)
-    result = {"new": 0, "skipped": 0, "errors": 0, "details": []}
+    result = {"new": 0, "skipped": 0, "errors": 0, "enriched": 0, "details": []}
 
+    new_activity_ids = []
     for file_path in fit_files:
         try:
-            imported = _import_single_file(conn, file_path, raw_store_path, dry_run, verbose)
-            if imported:
+            activity_id = _import_single_file(conn, file_path, raw_store_path, dry_run, verbose)
+            if activity_id is not None:
                 result["new"] += 1
-                result["details"].append({"file": str(file_path), "status": "imported"})
+                result["details"].append({"file": str(file_path), "status": "imported",
+                                          "activity_id": activity_id})
+                if not dry_run and activity_id > 0:
+                    new_activity_ids.append(activity_id)
             else:
                 result["skipped"] += 1
                 if verbose:
@@ -40,6 +70,10 @@ def sync_icloud(config: dict, dry_run: bool = False, verbose: bool = False) -> d
             result["details"].append({"file": str(file_path), "status": "error", "error": str(e)})
             if verbose:
                 print(f"  ERROR {file_path.name}: {e}")
+
+    # Post-import enrichment: match new activities against orphaned Strava sources
+    if new_activity_ids:
+        result["enriched"] = _enrich_new_activities(conn, new_activity_ids, verbose)
 
     # Update sync state
     if not dry_run and result["new"] > 0:
@@ -101,14 +135,14 @@ def _copy_to_raw_store(file_path: Path, raw_store_path: str) -> str:
 
 def _import_single_file(
     conn, file_path: Path, raw_store_path: str, dry_run: bool, verbose: bool
-) -> bool:
-    """Parse and import a single .fit file. Returns True if imported, False if skipped."""
+) -> int | None:
+    """Parse and import a single .fit file. Returns activity_id if imported, None if skipped."""
     from runbase.ingest.fit_parser import _compute_file_hash
 
     file_hash = _compute_file_hash(str(file_path))
 
     if _is_already_processed(conn, str(file_path), file_hash):
-        return False
+        return None
 
     parsed = parse_fit_file(str(file_path))
 
@@ -116,7 +150,7 @@ def _import_single_file(
         if verbose:
             print(f"  DRY   {file_path.name} → {parsed.activity.date} "
                   f"{parsed.activity.distance_mi:.2f}mi {parsed.activity.avg_pace_display}/mi")
-        return True
+        return 0  # truthy, signals dry-run import
 
     # Archive to raw store
     archived_path = _copy_to_raw_store(file_path, raw_store_path)
@@ -194,7 +228,7 @@ def _import_single_file(
                   f"({a.date}, {a.distance_mi:.2f}mi @ {a.avg_pace_display}/mi, "
                   f"{stream_count} streams, {lap_count} laps)")
 
-        return True
+        return activity_id
 
     except Exception:
         conn.rollback()

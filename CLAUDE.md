@@ -20,7 +20,8 @@ RunBase is a personal running data pipeline that ingests workout data from multi
 - `python -m runbase sync --strava -v` — sync from Strava API (incremental)
 - `python -m runbase sync --strava --full-history -v` — full Strava history sync
 - `python -m runbase import --xlsx -v` — import historical XLSX spreadsheet
-- `python -m runbase reconcile` — reconcile activities across sources (not yet implemented)
+- `python -m runbase reconcile -v` — match activities against orphaned Strava sources
+- `python -m runbase reconcile --backfill-dates -v` — one-time: fetch dates for Strava orphans (requires API)
 - `python -m runbase review` — launch the Flask review UI (not yet implemented)
 - `python -m runbase status` — show pipeline status (not yet implemented)
 - `python scripts/setup_strava_auth.py` — set up Strava OAuth tokens
@@ -39,7 +40,9 @@ runbase/
 │   ├── icloud_sync.py     # iCloud HealthFit folder scanner + importer
 │   ├── xlsx_import.py     # XLSX import with note parsing, interval splits, strides, categories
 │   └── strava_sync.py     # Strava API sync with rate limiting, stream/lap fetch, shoe matching
-├── reconcile/             # Cross-source matching, conflict detection, field resolution (planned)
+├── reconcile/
+│   ├── matcher.py         # Find orphaned Strava sources matching date+distance, backfill dates
+│   └── enricher.py        # Apply shoe/name/category from matched Strava source to activity
 └── review/                # Flask app for conflict resolution and data browsing (planned)
 ```
 
@@ -59,6 +62,7 @@ See `runbase_build_plan.md` for the full phased build plan.
 - Phase 2a (XLSX import): Complete
 - Phase 3 (Strava API sync): Complete
 - Phase 2b (XLSX backfill — strides + workout_category): Code done, pending migration run
+- Phase 4 (Reconciliation — FIT↔Strava matching + enrichment): Complete
 
 ## Key Patterns
 

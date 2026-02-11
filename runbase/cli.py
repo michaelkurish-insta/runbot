@@ -44,9 +44,11 @@ def cmd_sync(args):
 def _print_sync_summary(result: dict, dry_run: bool = False):
     prefix = "[DRY RUN] " if dry_run else ""
     print(f"\n{prefix}Sync complete:")
-    print(f"  New:     {result['new']}")
-    print(f"  Skipped: {result['skipped']}")
-    print(f"  Errors:  {result['errors']}")
+    print(f"  New:      {result['new']}")
+    print(f"  Skipped:  {result['skipped']}")
+    print(f"  Errors:   {result['errors']}")
+    if result.get("enriched"):
+        print(f"  Enriched: {result['enriched']}")
 
     if result["errors"] > 0:
         print("\nErrors:")
@@ -112,6 +114,77 @@ def _print_import_summary(result: dict, dry_run: bool = False):
             print(f"    {method}: {count}")
 
 
+def cmd_reconcile(args):
+    from runbase.config import load_config
+    from runbase.db import get_connection
+
+    config = load_config()
+    conn = get_connection(config)
+
+    # Step 1: Backfill dates if requested
+    if args.backfill_dates:
+        from runbase.reconcile.matcher import backfill_strava_dates
+        updated = backfill_strava_dates(config, conn, verbose=args.verbose)
+        print(f"\nBackfill complete: {updated} orphaned Strava sources updated with dates.")
+        if not args.dry_run:
+            # If only backfilling, we can stop here unless there's also matching to do
+            pass
+
+    # Step 2: Find activities without a linked Strava source
+    from runbase.reconcile.matcher import find_strava_match
+    from runbase.reconcile.enricher import enrich_from_strava
+
+    rows = conn.execute(
+        """SELECT a.id, a.date, a.distance_mi
+           FROM activities a
+           WHERE NOT EXISTS (
+               SELECT 1 FROM activity_sources s
+               WHERE s.activity_id = a.id AND s.source = 'strava'
+           )
+           ORDER BY a.date"""
+    ).fetchall()
+
+    if args.verbose:
+        print(f"\nFound {len(rows)} activities without a linked Strava source.")
+
+    matched = 0
+    shoes_set = 0
+    names_set = 0
+    categories_set = 0
+
+    for r in rows:
+        activity_id, date, distance_mi = r
+        match = find_strava_match(conn, date, distance_mi)
+        if not match:
+            continue
+
+        strava_name = match.get("strava_name", "")
+        if args.verbose:
+            print(f"  MATCH activity #{activity_id} ({date}, {distance_mi:.2f}mi) "
+                  f'← Strava "{strava_name}"')
+
+        if not args.dry_run:
+            result = enrich_from_strava(conn, activity_id, match, verbose=args.verbose)
+            conn.commit()
+            if result["shoe_set"]:
+                shoes_set += 1
+            if result["name_set"]:
+                names_set += 1
+            if result["category_set"]:
+                categories_set += 1
+
+        matched += 1
+
+    prefix = "[DRY RUN] " if args.dry_run else ""
+    print(f"\n{prefix}Reconcile complete:")
+    print(f"  Matched:      {matched}")
+    print(f"  Shoes set:    {shoes_set}")
+    print(f"  Names set:    {names_set}")
+    print(f"  Categories:   {categories_set}")
+
+    conn.close()
+
+
 def cmd_stub(name):
     def handler(args):
         print(f"'{name}' is not yet implemented.")
@@ -146,7 +219,11 @@ def main():
     import_parser.set_defaults(func=cmd_import)
 
     reconcile_parser = subparsers.add_parser("reconcile", help="Reconcile activities across sources")
-    reconcile_parser.set_defaults(func=cmd_stub("reconcile"))
+    reconcile_parser.add_argument("--backfill-dates", action="store_true",
+                                  help="Backfill start_date on orphaned Strava sources (one-time, requires API)")
+    reconcile_parser.add_argument("--dry-run", action="store_true", help="Show matches without writing")
+    reconcile_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    reconcile_parser.set_defaults(func=cmd_reconcile)
 
     review_parser = subparsers.add_parser("review", help="Launch the review UI")
     review_parser.set_defaults(func=cmd_stub("review"))

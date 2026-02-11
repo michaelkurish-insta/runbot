@@ -384,6 +384,8 @@ def _insert_activity_source(conn, activity_id: int | None, strava_data: dict,
         "strava_type": strava_data.get("type"),
         "match_status": match_status,
         "gear_id": strava_data.get("gear_id"),
+        "start_date": strava_data.get("date"),
+        "start_time": strava_data.get("start_time"),
     }
     if strava_data.get("elapsed_s"):
         metadata["elapsed_s"] = strava_data["elapsed_s"]
