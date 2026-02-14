@@ -80,6 +80,48 @@ def find_strava_match(conn, date: str, distance_mi: float,
     return best_match
 
 
+def find_strava_group_match(conn, date: str, distance_mi: float,
+                            tolerance_pct: float = 5.0) -> list[dict] | None:
+    """Find a group of same-day orphans whose summed distance matches.
+
+    For multi-activity days (warm-up + main + cool-down), individual orphans
+    won't match the XLSX total, but their sum may.
+
+    Returns the list of orphan dicts (sorted by start_time) if the sum matches,
+    or None if no group match.
+    """
+    if distance_mi is None or distance_mi <= 0:
+        return None
+
+    orphans = _load_orphaned_strava_sources(conn)
+    if not orphans:
+        return None
+
+    # Filter to same-day orphans only (exact date match — group activities
+    # are on the same day)
+    same_day = [o for o in orphans if o["start_date"] == date]
+    if len(same_day) < 2:
+        return None  # Need at least 2 orphans to form a group
+
+    # All must have distance
+    if any(o["distance_mi"] is None or o["distance_mi"] <= 0 for o in same_day):
+        return None
+
+    total_dist = sum(o["distance_mi"] for o in same_day)
+    diff_pct = abs(total_dist - distance_mi) / distance_mi * 100
+
+    if diff_pct > tolerance_pct:
+        return None
+
+    # Sort by start_time (metadata) so warm-up comes first
+    def sort_key(o):
+        st = o["metadata"].get("start_time", "")
+        return st or ""
+
+    same_day.sort(key=sort_key)
+    return same_day
+
+
 def backfill_strava_dates(config: dict, conn, verbose: bool = False) -> int:
     """One-time backfill: add start_date to orphaned Strava sources missing it.
 

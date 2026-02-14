@@ -270,12 +270,15 @@ def _extract_laps(messages, streams: list[Stream]) -> list[Interval]:
 
         laps.append(Interval(
             rep_number=len(laps) + 1,
-            actual_distance_mi=distance_mi,
+            gps_measured_distance_mi=distance_mi,
             duration_s=duration,
             avg_pace_s_per_mi=avg_pace,
             avg_pace_display=avg_pace_display,
             avg_hr=avg_hr,
             avg_cadence=avg_cadence,
+            start_timestamp_s=lap_start_ts,
+            end_timestamp_s=lap_end_ts,
+            source="fit_lap",
         ))
 
     return laps

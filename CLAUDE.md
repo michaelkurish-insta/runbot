@@ -22,6 +22,12 @@ RunBase is a personal running data pipeline that ingests workout data from multi
 - `python -m runbase import --xlsx -v` — import historical XLSX spreadsheet
 - `python -m runbase reconcile -v` — match activities against orphaned Strava sources
 - `python -m runbase reconcile --backfill-dates -v` — one-time: fetch dates for Strava orphans (requires API)
+- `python -m runbase vdot` — show current VDOT + training paces
+- `python -m runbase vdot --set 50` — set VDOT manually
+- `python -m runbase vdot --from-race <activity_id>` — calculate VDOT from a race
+- `python -m runbase enrich -v` — batch enrich all activities (pace zones, track detection, etc.)
+- `python -m runbase enrich --activity <id> -v` — enrich a single activity
+- `python -m runbase analyze locations -v` — show workout location clusters
 - `python -m runbase review` — launch the Flask review UI (not yet implemented)
 - `python -m runbase status` — show pipeline status (not yet implemented)
 - `python scripts/setup_strava_auth.py` — set up Strava OAuth tokens
@@ -43,6 +49,12 @@ runbase/
 ├── reconcile/
 │   ├── matcher.py         # Find orphaned Strava sources matching date+distance, backfill dates
 │   └── enricher.py        # Apply shoe/name/category from matched Strava source to activity
+├── analysis/
+│   ├── vdot.py            # VDOT calculator (Daniels-Gilbert), pace zones, zone boundaries
+│   ├── track_detect.py    # GPS-based track detection, 100m distance snapping
+│   ├── pace_segments.py   # Stream-based pace segmentation for unstructured runs
+│   ├── locations.py       # Workout location clustering, measured course detection
+│   └── interval_enricher.py # Enrichment waterfall orchestrator
 └── review/                # Flask app for conflict resolution and data browsing (planned)
 ```
 
@@ -63,6 +75,7 @@ See `runbase_build_plan.md` for the full phased build plan.
 - Phase 3 (Strava API sync): Complete
 - Phase 2b (XLSX backfill — strides + workout_category): Code done, pending migration run
 - Phase 4 (Reconciliation — FIT↔Strava matching + enrichment): Complete
+- Phase 5 (Interval enrichment — VDOT, pace zones, track detection, walking scrub): Complete
 
 ## Key Patterns
 
@@ -73,3 +86,7 @@ See `runbase_build_plan.md` for the full phased build plan.
 - Strava sync matches existing activities by date + distance tolerance, fills missing fields
 - XLSX note parsing uses a 5-pattern regex cascade (splits/full/pace+HR/pace-only/@pattern/fallback)
 - FIT and Strava cadence for running is per-foot (half strides) — double for full strides/min
+- Enrichment waterfall: track detection → measured course → walking scrub → stride detection → pace zones
+- VDOT stored in `vdot_history` table; current VDOT = most recent entry on or before activity date
+- Unstructured runs (easy/long/recovery) get pace segments from stream data; structured workouts keep FIT laps
+- Auto-enrichment runs on new FIT imports if a VDOT is set

@@ -36,6 +36,39 @@ reconcile:
     - "garmin"
     - "runalyze"
 
+paces:
+  walking_threshold_s_per_mi: 660   # 11:00/mi — anything slower is walking
+  stride_max_duration_s: 30         # intervals shorter than this are strides
+  track_detection:
+    max_bbox_m: 300                 # pre-filter: skip window if bbox exceeds this
+    match_score_max: 0.15           # max matchShapes score (lower = better match)
+    min_short_axis_m: 50            # min short axis of convex hull minAreaRect
+    max_short_axis_m: 120           # max short axis
+    min_long_axis_m: 120            # min long axis
+    max_long_axis_m: 220            # max long axis
+    min_aspect_ratio: 1.5           # min aspect ratio (long/short)
+    max_aspect_ratio: 3.0           # max aspect ratio
+    min_fill_ratio: 0.75            # min hull area / bounding rect area (rejects narrow shapes)
+    window_size: 300                # sliding window size (GPS points)
+    window_step: 50                 # sliding window step
+    known_track_radius_m: 200       # reuse detected track if centroid within this
+    distance_snap_m: 100            # snap canonical distance to nearest N meters
+  measured_courses: []              # populated by user after `analyze locations`
+  # Each course has a specific snap_distance_m — intervals whose GPS distance
+  # is within 20% of snap_distance_m get snapped to exactly that distance.
+  # Example:
+  # measured_courses:
+  #   - name: "My 200m loop"
+  #     lat: 40.6602
+  #     lon: -73.9690
+  #     radius_m: 150
+  #     snap_distance_m: 200
+  #   - name: "My mile loop"
+  #     lat: 40.6610
+  #     lon: -73.9685
+  #     radius_m: 500
+  #     snap_distance_m: 1609       # exact mile, not rounded to 1600
+
 review:
   host: "127.0.0.1"
   port: 5050

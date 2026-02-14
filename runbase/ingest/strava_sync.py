@@ -430,7 +430,7 @@ def _fetch_and_insert_laps(client, conn, strava_id: str, activity_id: int,
 
         conn.execute(
             """INSERT INTO intervals
-               (activity_id, rep_number, actual_distance_mi, duration_s,
+               (activity_id, rep_number, gps_measured_distance_mi, duration_s,
                 avg_pace_s_per_mi, avg_pace_display, avg_hr, avg_cadence, is_recovery)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (activity_id, i, round(dist_mi, 3) if dist_mi else None, round(dur_s, 1) if dur_s else None,
@@ -582,6 +582,66 @@ def _ensure_shoe(conn, client, gear_id: str, shoe_cache: dict,
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
+def backfill_orphan_streams(config: dict, conn, pairs: list[tuple],
+                            verbose: bool = False) -> dict:
+    """Fetch streams and laps from Strava for newly-linked orphans.
+
+    Args:
+        config: App config dict.
+        conn: Open DB connection.
+        pairs: List of (strava_id, activity_id) tuples to fetch.
+        verbose: Print progress.
+
+    Returns dict with keys: streams_inserted, laps_inserted, errors, rate_limit_pauses.
+    """
+    if not pairs:
+        return {"streams_inserted": 0, "laps_inserted": 0, "errors": 0, "rate_limit_pauses": 0}
+
+    client = _get_client(config)
+    rate_limiter = StravaRateLimiter()
+
+    result = {"streams_inserted": 0, "laps_inserted": 0, "errors": 0, "rate_limit_pauses": 0}
+
+    for strava_id, activity_id in pairs:
+        if not rate_limiter.check(verbose):
+            result["rate_limit_pauses"] = rate_limiter.pause_count
+            break
+
+        try:
+            # Streams
+            if not _activity_has_streams(conn, activity_id):
+                stream_count = _fetch_and_insert_streams(
+                    client, conn, strava_id, activity_id, rate_limiter, verbose)
+                result["streams_inserted"] += stream_count
+                if verbose and stream_count:
+                    print(f"    STREAMS strava:{strava_id} → activity #{activity_id}: {stream_count} points")
+
+            # Laps (only if activity has no intervals yet)
+            if not rate_limiter.check(verbose):
+                result["rate_limit_pauses"] = rate_limiter.pause_count
+                break
+
+            if not _activity_has_intervals(conn, activity_id):
+                lap_count = _fetch_and_insert_laps(
+                    client, conn, strava_id, activity_id, rate_limiter, verbose)
+                result["laps_inserted"] += lap_count
+                if verbose and lap_count:
+                    print(f"    LAPS strava:{strava_id} → activity #{activity_id}: {lap_count} intervals")
+
+            conn.commit()
+        except Exception as e:
+            result["errors"] += 1
+            if verbose:
+                print(f"    ERROR fetching strava:{strava_id}: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+    result["rate_limit_pauses"] = rate_limiter.pause_count
+    return result
+
 
 def sync_strava(config: dict, dry_run: bool = False, verbose: bool = False,
                 full_history: bool = False, fetch_streams: bool = True) -> dict:

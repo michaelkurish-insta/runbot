@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS activities (
     fit_file_path       TEXT,
     intensity_score     REAL,
     notes               TEXT,
+    adjusted_distance_mi REAL,
+    vdot                REAL,
     shoe_id             INTEGER REFERENCES shoes(id),
     rpe                 INTEGER,
     created_at          TEXT DEFAULT (datetime('now')),
@@ -59,14 +61,22 @@ CREATE TABLE IF NOT EXISTS intervals (
     activity_id             INTEGER REFERENCES activities(id),
     rep_number              INTEGER,
     prescribed_distance_mi  REAL,
-    actual_distance_mi      REAL,
+    gps_measured_distance_mi REAL,
     canonical_distance_mi   REAL,
     duration_s              REAL,
     avg_pace_s_per_mi       REAL,
     avg_pace_display        TEXT,
     avg_hr                  REAL,
     avg_cadence             REAL,
-    is_recovery             BOOLEAN DEFAULT FALSE
+    is_recovery             BOOLEAN DEFAULT FALSE,
+    pace_zone               TEXT,
+    is_walking              BOOLEAN DEFAULT FALSE,
+    is_stride               BOOLEAN DEFAULT FALSE,
+    is_race                 BOOLEAN DEFAULT FALSE,
+    location_type           TEXT,
+    start_timestamp_s       REAL,
+    end_timestamp_s         REAL,
+    source                  TEXT
 );
 
 -- Per-second time series (from .fit files)
@@ -142,6 +152,28 @@ CREATE TABLE IF NOT EXISTS processed_files (
     activity_id         INTEGER REFERENCES activities(id)
 );
 
+-- VDOT history
+CREATE TABLE IF NOT EXISTS vdot_history (
+    id              INTEGER PRIMARY KEY,
+    effective_date  TEXT NOT NULL,
+    vdot            REAL NOT NULL,
+    source          TEXT,
+    activity_id     INTEGER REFERENCES activities(id),
+    notes           TEXT,
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
+-- Detected track locations (cached for fast lookup)
+CREATE TABLE IF NOT EXISTS detected_tracks (
+    id                      INTEGER PRIMARY KEY,
+    lat                     REAL NOT NULL,
+    lon                     REAL NOT NULL,
+    orientation_deg         REAL,
+    fit_score               REAL,
+    detected_by_activity_id INTEGER REFERENCES activities(id),
+    created_at              TEXT DEFAULT (datetime('now'))
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(date);
 CREATE INDEX IF NOT EXISTS idx_activity_sources_activity ON activity_sources(activity_id);
@@ -150,6 +182,7 @@ CREATE INDEX IF NOT EXISTS idx_intervals_activity ON intervals(activity_id);
 CREATE INDEX IF NOT EXISTS idx_streams_activity ON streams(activity_id);
 CREATE INDEX IF NOT EXISTS idx_conflicts_status ON conflicts(status);
 CREATE INDEX IF NOT EXISTS idx_processed_files_hash ON processed_files(file_hash);
+CREATE INDEX IF NOT EXISTS idx_vdot_history_date ON vdot_history(effective_date);
 """
 
 DEFAULT_DB_PATH = Path.home() / "runbase" / "data" / "runbase.db"
@@ -172,10 +205,63 @@ def get_connection(config=None):
     return conn
 
 
+def _migrate_schema(conn):
+    """Add columns that may be missing from existing databases."""
+    migrations = [
+        # Phase 5: interval enrichment columns
+        ("intervals", "pace_zone", "TEXT"),
+        ("intervals", "is_walking", "BOOLEAN DEFAULT FALSE"),
+        ("intervals", "is_stride", "BOOLEAN DEFAULT FALSE"),
+        ("intervals", "location_type", "TEXT"),
+        ("intervals", "start_timestamp_s", "REAL"),
+        ("intervals", "end_timestamp_s", "REAL"),
+        ("intervals", "source", "TEXT"),
+        ("intervals", "is_race", "BOOLEAN DEFAULT FALSE"),
+        # Phase 5: activity enrichment columns
+        ("activities", "adjusted_distance_mi", "REAL"),
+        ("activities", "vdot", "REAL"),
+    ]
+
+    existing = {}
+    for table, col, col_type in migrations:
+        if table not in existing:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            existing[table] = {r[1] for r in rows}
+        if col not in existing[table]:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+
+    # Column renames
+    renames = [
+        ("intervals", "actual_distance_mi", "gps_measured_distance_mi"),
+    ]
+    for table, old_col, new_col in renames:
+        if table not in existing:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            existing[table] = {r[1] for r in rows}
+        if old_col in existing[table] and new_col not in existing[table]:
+            conn.execute(f"ALTER TABLE {table} RENAME COLUMN {old_col} TO {new_col}")
+
+    # New tables for existing databases
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS detected_tracks (
+            id                      INTEGER PRIMARY KEY,
+            lat                     REAL NOT NULL,
+            lon                     REAL NOT NULL,
+            orientation_deg         REAL,
+            fit_score               REAL,
+            detected_by_activity_id INTEGER REFERENCES activities(id),
+            created_at              TEXT DEFAULT (datetime('now'))
+        );
+    """)
+
+    conn.commit()
+
+
 def init_db(config=None):
     """Create all tables and indexes."""
     conn = get_connection(config)
     conn.executescript(SCHEMA_SQL)
+    _migrate_schema(conn)
     conn.close()
     db_path = get_db_path(config)
     print(f"Database initialized at {db_path}")

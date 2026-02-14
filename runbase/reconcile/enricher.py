@@ -127,3 +127,40 @@ def enrich_from_strava(conn, activity_id: int, strava_source: dict,
                 print(f"    CATEGORY → {category}")
 
     return result
+
+
+def enrich_group_from_strava(conn, activity_id: int, group: list[dict],
+                              verbose: bool = False) -> dict:
+    """Enrich an activity from a group of orphaned Strava sources.
+
+    Picks the "primary" orphan (highest workout_type, or longest distance)
+    for enrichment (name/category/shoe). Links all orphans to the activity.
+
+    Returns dict with keys: linked_count, shoe_set, name_set, category_set.
+    """
+    # Rank workout_type: race=1 > long=2 > workout=3 > default/None=99
+    WORKOUT_TYPE_PRIORITY = {1: 0, 2: 1, 3: 2}
+
+    def primary_sort_key(orphan):
+        meta = orphan.get("metadata", {})
+        wt = meta.get("workout_type")
+        priority = WORKOUT_TYPE_PRIORITY.get(wt, 99)
+        # Negative distance so larger distance sorts first within same priority
+        dist = -(orphan.get("distance_mi") or 0)
+        return (priority, dist)
+
+    sorted_group = sorted(group, key=primary_sort_key)
+    primary = sorted_group[0]
+
+    # Enrich from primary (sets name, category, shoe, and links it)
+    result = enrich_from_strava(conn, activity_id, primary, verbose=verbose)
+
+    # Link remaining orphans (just set activity_id, don't re-enrich)
+    for orphan in sorted_group[1:]:
+        conn.execute(
+            "UPDATE activity_sources SET activity_id = ? WHERE id = ?",
+            (activity_id, orphan["id"]),
+        )
+
+    result["linked_count"] = len(group)
+    return result

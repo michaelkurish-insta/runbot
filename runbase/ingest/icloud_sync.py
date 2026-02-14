@@ -35,6 +35,28 @@ def _enrich_new_activities(conn, activity_ids: list[int], verbose: bool) -> int:
     return enriched
 
 
+def _interval_enrich_new(conn, activity_ids: list[int], config: dict, verbose: bool) -> int:
+    """Run interval enrichment on newly imported activities (if VDOT is set)."""
+    from runbase.analysis.vdot import get_current_vdot
+    from runbase.analysis.interval_enricher import enrich_activity
+
+    enriched = 0
+    for activity_id in activity_ids:
+        row = conn.execute("SELECT date FROM activities WHERE id = ?", (activity_id,)).fetchone()
+        if not row:
+            continue
+        vdot = get_current_vdot(conn, row[0])
+        if not vdot:
+            continue
+        try:
+            enrich_activity(conn, activity_id, config, verbose=verbose)
+            enriched += 1
+        except Exception as e:
+            if verbose:
+                print(f"  WARN  interval enrichment failed for #{activity_id}: {e}")
+    return enriched
+
+
 def sync_icloud(config: dict, dry_run: bool = False, verbose: bool = False) -> dict:
     """Scan iCloud HealthFit folder and import new .fit files.
 
@@ -74,6 +96,10 @@ def sync_icloud(config: dict, dry_run: bool = False, verbose: bool = False) -> d
     # Post-import enrichment: match new activities against orphaned Strava sources
     if new_activity_ids:
         result["enriched"] = _enrich_new_activities(conn, new_activity_ids, verbose)
+
+    # Post-import interval enrichment (pace zones, track detection, etc.)
+    if new_activity_ids:
+        result["interval_enriched"] = _interval_enrich_new(conn, new_activity_ids, config, verbose)
 
     # Update sync state
     if not dry_run and result["new"] > 0:
@@ -203,12 +229,13 @@ def _import_single_file(
         for lap in parsed.laps:
             cursor.execute(
                 """INSERT INTO intervals
-                   (activity_id, rep_number, actual_distance_mi, duration_s,
-                    avg_pace_s_per_mi, avg_pace_display, avg_hr, avg_cadence, is_recovery)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (activity_id, lap.rep_number, lap.actual_distance_mi, lap.duration_s,
+                   (activity_id, rep_number, gps_measured_distance_mi, duration_s,
+                    avg_pace_s_per_mi, avg_pace_display, avg_hr, avg_cadence, is_recovery,
+                    start_timestamp_s, end_timestamp_s, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (activity_id, lap.rep_number, lap.gps_measured_distance_mi, lap.duration_s,
                  lap.avg_pace_s_per_mi, lap.avg_pace_display, lap.avg_hr, lap.avg_cadence,
-                 lap.is_recovery),
+                 lap.is_recovery, lap.start_timestamp_s, lap.end_timestamp_s, lap.source),
             )
 
         # 5. Record processed file

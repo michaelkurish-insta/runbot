@@ -734,7 +734,7 @@ def _insert_row(conn, parsed: ParsedRow, xlsx_path: str,
                 cursor.execute(
                     """INSERT INTO intervals
                        (activity_id, rep_number, prescribed_distance_mi,
-                        actual_distance_mi, duration_s,
+                        gps_measured_distance_mi, duration_s,
                         avg_pace_s_per_mi, avg_pace_display, is_recovery)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (activity_id, i, interval_dist,

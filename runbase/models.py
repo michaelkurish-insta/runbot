@@ -25,6 +25,8 @@ class Activity:
     intensity_score: Optional[float] = None
     notes: Optional[str] = None
     shoe_id: Optional[int] = None
+    adjusted_distance_mi: Optional[float] = None
+    vdot: Optional[float] = None
     rpe: Optional[int] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
@@ -57,7 +59,7 @@ class Interval:
     activity_id: Optional[int] = None
     rep_number: Optional[int] = None
     prescribed_distance_mi: Optional[float] = None
-    actual_distance_mi: Optional[float] = None
+    gps_measured_distance_mi: Optional[float] = None
     canonical_distance_mi: Optional[float] = None
     duration_s: Optional[float] = None
     avg_pace_s_per_mi: Optional[float] = None
@@ -65,6 +67,13 @@ class Interval:
     avg_hr: Optional[float] = None
     avg_cadence: Optional[float] = None
     is_recovery: bool = False
+    pace_zone: Optional[str] = None
+    is_walking: bool = False
+    is_stride: bool = False
+    location_type: Optional[str] = None
+    start_timestamp_s: Optional[float] = None
+    end_timestamp_s: Optional[float] = None
+    source: Optional[str] = None
 
 
 @dataclass
@@ -79,6 +88,17 @@ class Stream:
     cadence: Optional[int] = None
     pace_s_per_mi: Optional[float] = None
     distance_mi: Optional[float] = None
+
+
+@dataclass
+class VdotEntry:
+    id: Optional[int] = None
+    effective_date: str = ""
+    vdot: float = 0.0
+    source: Optional[str] = None
+    activity_id: Optional[int] = None
+    notes: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 @dataclass
