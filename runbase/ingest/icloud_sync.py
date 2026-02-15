@@ -213,15 +213,18 @@ def _import_single_file(
              json.dumps(parsed.device_info) if parsed.device_info else None),
         )
 
+        source_id = cursor.lastrowid
+
         # 3. Batch insert streams
         if parsed.streams:
             cursor.executemany(
                 """INSERT INTO streams
                    (activity_id, timestamp_s, lat, lon, altitude_ft,
-                    heart_rate, cadence, pace_s_per_mi, distance_mi)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    heart_rate, cadence, pace_s_per_mi, distance_mi, source_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [(activity_id, st.timestamp_s, st.lat, st.lon, st.altitude_ft,
-                  st.heart_rate, st.cadence, st.pace_s_per_mi, st.distance_mi)
+                  st.heart_rate, st.cadence, st.pace_s_per_mi, st.distance_mi,
+                  source_id)
                  for st in parsed.streams],
             )
 

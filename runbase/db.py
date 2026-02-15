@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS streams (
     heart_rate          INTEGER,
     cadence             INTEGER,
     pace_s_per_mi       REAL,
-    distance_mi         REAL
+    distance_mi         REAL,
+    source_id           INTEGER REFERENCES activity_sources(id)
 );
 
 -- Shoe tracking
@@ -220,6 +221,8 @@ def _migrate_schema(conn):
         # Phase 5: activity enrichment columns
         ("activities", "adjusted_distance_mi", "REAL"),
         ("activities", "vdot", "REAL"),
+        # Stream source tracking
+        ("streams", "source_id", "INTEGER REFERENCES activity_sources(id)"),
     ]
 
     existing = {}

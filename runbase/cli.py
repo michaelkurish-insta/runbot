@@ -417,6 +417,58 @@ def cmd_analyze_locations(args):
     conn.close()
 
 
+_DISTANCE_ALIASES = {
+    "mile": 1609, "mi": 1609, "1mi": 1609,
+    "5k": 5000, "10k": 10000,
+    "half": 21097, "marathon": 42195,
+}
+
+
+def cmd_fastest(args):
+    from runbase.config import load_config
+    from runbase.db import get_connection
+    from runbase.analysis.fastest import find_fastest
+
+    dist_str = args.distance.lower()
+    if dist_str in _DISTANCE_ALIASES:
+        target_m = _DISTANCE_ALIASES[dist_str]
+        dist_label = dist_str
+    else:
+        try:
+            target_m = float(args.distance)
+        except ValueError:
+            print(f"Unknown distance: {args.distance}")
+            sys.exit(1)
+        dist_label = f"{target_m:g}m"
+
+    config = load_config()
+    conn = get_connection(config)
+    results = find_fastest(conn, target_m, top_n=args.top, verbose=args.verbose)
+
+    if not results:
+        print(f"No {dist_label} segments found.")
+        return
+
+    print(f"\nTop {len(results)} fastest {dist_label}:\n")
+    print(f"  {'#':>3}  {'Date':<12} {'Act#':>5}  {'Workout':<30} "
+          f"{'Time':>8}  {'Pace':>9}  {'Source':<10}")
+    print(f"  {'':->3}  {'':->12} {'':->5}  {'':->30} "
+          f"{'':->8}  {'':->9}  {'':->10}")
+
+    for i, r in enumerate(results, 1):
+        secs = r["duration_s"]
+        if secs < 60:
+            time_str = f"{secs:5.1f}s"
+        else:
+            m, s = divmod(secs, 60)
+            time_str = f"{int(m)}:{s:04.1f}"
+        pace = r["pace_s_per_mi"]
+        pace_str = f"{int(pace // 60)}:{pace % 60:04.1f}/mi"
+        print(f"  {i:>3}  {r['date']:<12} #{r['activity_id']:>4}  "
+              f"{r['workout_name']:<30} {time_str:>8}  {pace_str:>9}  "
+              f"{r['source_type']:<10}")
+
+
 def cmd_stub(name):
     def handler(args):
         print(f"'{name}' is not yet implemented.")
@@ -487,6 +539,17 @@ def main():
     locations_parser = analyze_sub.add_parser("locations", help="Show workout location clusters")
     locations_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     locations_parser.set_defaults(func=cmd_analyze_locations)
+
+    fastest_parser = subparsers.add_parser(
+        "fastest", help="Find fastest segments at a given distance")
+    fastest_parser.add_argument(
+        "distance",
+        help="Target distance in meters (or alias: mile, 5k, 10k, half, marathon)")
+    fastest_parser.add_argument(
+        "-n", "--top", type=int, default=10,
+        help="Number of results (default 10)")
+    fastest_parser.add_argument("-v", "--verbose", action="store_true")
+    fastest_parser.set_defaults(func=cmd_fastest)
 
     review_parser = subparsers.add_parser("review", help="Launch the review UI")
     review_parser.set_defaults(func=cmd_stub("review"))

@@ -81,7 +81,7 @@ def find_strava_match(conn, date: str, distance_mi: float,
 
 
 def find_strava_group_match(conn, date: str, distance_mi: float,
-                            tolerance_pct: float = 5.0) -> list[dict] | None:
+                            tolerance_pct: float = 10.0) -> list[dict] | None:
     """Find a group of same-day orphans whose summed distance matches.
 
     For multi-activity days (warm-up + main + cool-down), individual orphans
@@ -97,21 +97,39 @@ def find_strava_group_match(conn, date: str, distance_mi: float,
     if not orphans:
         return None
 
-    # Filter to same-day orphans only (exact date match — group activities
-    # are on the same day)
-    same_day = [o for o in orphans if o["start_date"] == date]
-    if len(same_day) < 2:
-        return None  # Need at least 2 orphans to form a group
+    # Build candidate dates (±1 day) — same tolerance as 1:1 matcher
+    dt = datetime.strptime(date, "%Y-%m-%d")
+    candidate_dates = {
+        date,
+        (dt - timedelta(days=1)).strftime("%Y-%m-%d"),
+        (dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+    }
 
-    # All must have distance
-    if any(o["distance_mi"] is None or o["distance_mi"] <= 0 for o in same_day):
+    # Filter to orphans within ±1 day, then group by actual date
+    nearby = [o for o in orphans if o["start_date"] in candidate_dates]
+    # Group by date — all orphans in a group must share the same day
+    from collections import defaultdict
+    by_date = defaultdict(list)
+    for o in nearby:
+        by_date[o["start_date"]].append(o)
+
+    # Try each candidate date's group
+    best_group = None
+    best_diff_pct = float("inf")
+    for d, group in by_date.items():
+        if len(group) < 2:
+            continue
+        if any(o["distance_mi"] is None or o["distance_mi"] <= 0 for o in group):
+            continue
+        total_dist = sum(o["distance_mi"] for o in group)
+        diff_pct = abs(total_dist - distance_mi) / distance_mi * 100
+        if diff_pct <= tolerance_pct and diff_pct < best_diff_pct:
+            best_group = group
+            best_diff_pct = diff_pct
+
+    if best_group is None:
         return None
-
-    total_dist = sum(o["distance_mi"] for o in same_day)
-    diff_pct = abs(total_dist - distance_mi) / distance_mi * 100
-
-    if diff_pct > tolerance_pct:
-        return None
+    same_day = best_group
 
     # Sort by start_time (metadata) so warm-up comes first
     def sort_key(o):

@@ -24,6 +24,19 @@ from runbase.analysis.locations import find_matching_courses, best_course_for_in
 
 METERS_PER_MILE = 1609.344
 
+
+def _recalc_pace(iv: dict) -> None:
+    """Recalculate avg pace from canonical distance and duration after snapping."""
+    dist = iv.get("canonical_distance_mi")
+    dur = iv.get("duration_s")
+    if dist and dist > 0 and dur and dur > 0:
+        pace = dur / dist
+        iv["avg_pace_s_per_mi"] = pace
+        mins = int(pace // 60)
+        secs = pace - mins * 60
+        iv["avg_pace_display"] = f"{mins}:{secs:04.1f}"
+
+
 # Distance bounds (meters) for snapping when activity name doesn't imply a
 # workout or race.  Below min: likely strides.  Above max: likely a warm-up mile.
 TRACK_SNAP_MIN_DISTANCE_M = 180
@@ -204,7 +217,7 @@ def _load_streams(conn, activity_id: int) -> list[dict]:
     """Load stream data for an activity."""
     rows = conn.execute(
         """SELECT timestamp_s, lat, lon, altitude_ft, heart_rate, cadence,
-                  pace_s_per_mi, distance_mi
+                  pace_s_per_mi, distance_mi, source_id
            FROM streams WHERE activity_id = ? ORDER BY timestamp_s""",
         (activity_id,),
     ).fetchall()
@@ -212,10 +225,31 @@ def _load_streams(conn, activity_id: int) -> list[dict]:
         {
             "timestamp_s": r[0], "lat": r[1], "lon": r[2], "altitude_ft": r[3],
             "heart_rate": r[4], "cadence": r[5], "pace_s_per_mi": r[6],
-            "distance_mi": r[7],
+            "distance_mi": r[7], "source_id": r[8],
         }
         for r in rows
     ]
+
+
+def _split_streams_by_source(streams: list[dict]) -> list[list[dict]]:
+    """Split streams into per-source groups.
+
+    For activities with multiple Strava sub-activities (group-matched),
+    each source's streams must be processed independently to avoid
+    interleaving GPS data from different locations/times.
+
+    Returns a list of stream lists.  Single-source activities return
+    one group containing all streams.
+    """
+    source_ids = {s.get("source_id") for s in streams}
+    source_ids.discard(None)
+    if len(source_ids) <= 1:
+        return [streams]
+    groups = {}
+    for s in streams:
+        sid = s.get("source_id")
+        groups.setdefault(sid, []).append(s)
+    return list(groups.values())
 
 
 def _check_has_xlsx_splits(conn, activity_id: int) -> bool:
@@ -508,10 +542,15 @@ def enrich_activity(conn, activity_id: int, config: dict,
             intervals = _load_intervals(conn, activity_id)
 
     # --- Track detection (Step 1) ---
+    # Run per source group to avoid mixing GPS from group-matched sub-activities.
     if streams and intervals:
-        track_result = detect_track_activity(
-            conn, activity_id, intervals, streams, track_cfg
-        )
+        stream_groups = _split_streams_by_source(streams)
+        track_result = {"is_track": False}
+        for sg in stream_groups:
+            r = detect_track_activity(conn, activity_id, intervals, sg, track_cfg)
+            if r["is_track"] and (not track_result["is_track"]
+                                  or r["fit_score"] < track_result.get("fit_score", 1)):
+                track_result = r
         if track_result["is_track"]:
             snap_m = track_cfg.get("distance_snap_m", 100)
             win_start = track_result.get("window_start_ts")
@@ -586,6 +625,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
                     if avg_pace and pace and pace < avg_pace:
                         iv["canonical_distance_mi"] = snap_to_100m(
                             iv["gps_measured_distance_mi"], snap_m)
+                        _recalc_pace(iv)
 
             else:
                 # --- Generic: snap if 180m < distance <= 1300m ---
@@ -594,6 +634,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
                     if TRACK_SNAP_MIN_DISTANCE_M < dist_m <= TRACK_SNAP_MAX_DISTANCE_M:
                         iv["canonical_distance_mi"] = snap_to_100m(
                             iv["gps_measured_distance_mi"], snap_m)
+                        _recalc_pace(iv)
 
             if verbose:
                 method = track_result["method"]
@@ -642,6 +683,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
                     snap_m = course["snap_distance_m"]
                     interval["location_type"] = "measured_course"
                     interval["canonical_distance_mi"] = round(snap_m / METERS_PER_MILE, 4)
+                    _recalc_pace(interval)
                     summary["measured_intervals"] += 1
                     if verbose:
                         raw_m = round(gps_dist * METERS_PER_MILE)
@@ -676,12 +718,16 @@ def enrich_activity(conn, activity_id: int, config: dict,
         conn.execute(
             """UPDATE intervals
                SET pace_zone = ?, is_walking = ?, is_stride = ?,
-                   is_race = ?, location_type = ?, canonical_distance_mi = ?
+                   is_race = ?, location_type = ?, canonical_distance_mi = ?,
+                   avg_pace_s_per_mi = ?, avg_pace_display = ?
                WHERE id = ?""",
             (interval.get("pace_zone"), interval.get("is_walking", False),
              interval.get("is_stride", False), interval.get("is_race", False),
              interval.get("location_type"),
-             interval.get("canonical_distance_mi"), interval["id"]),
+             interval.get("canonical_distance_mi"),
+             interval.get("avg_pace_s_per_mi"),
+             interval.get("avg_pace_display"),
+             interval["id"]),
         )
 
     # --- Compute adjusted_distance_mi (Step 6) ---

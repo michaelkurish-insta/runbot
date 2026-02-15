@@ -480,7 +480,8 @@ def _fetch_and_insert_laps(client, conn, strava_id: str, activity_id: int,
 
 
 def _fetch_and_insert_streams(client, conn, strava_id: str, activity_id: int,
-                              rate_limiter: StravaRateLimiter, verbose: bool) -> int:
+                              rate_limiter: StravaRateLimiter, verbose: bool,
+                              source_id: int | None = None) -> int:
     """Fetch streams from Strava and insert. Returns point count."""
     stream_types = ["time", "latlng", "altitude", "heartrate", "cadence",
                     "velocity_smooth", "distance"]
@@ -548,13 +549,13 @@ def _fetch_and_insert_streams(client, conn, strava_id: str, activity_id: int,
         if i < len(dist_arr) and dist_arr[i] is not None:
             dist_mi = round(dist_arr[i] / METERS_PER_MILE, 4)
 
-        rows.append((activity_id, ts, lat, lon, alt_ft, hr, cad, pace, dist_mi))
+        rows.append((activity_id, ts, lat, lon, alt_ft, hr, cad, pace, dist_mi, source_id))
 
     conn.executemany(
         """INSERT INTO streams
            (activity_id, timestamp_s, lat, lon, altitude_ft,
-            heart_rate, cadence, pace_s_per_mi, distance_mi)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            heart_rate, cadence, pace_s_per_mi, distance_mi, source_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         rows,
     )
     return len(rows)
@@ -732,7 +733,7 @@ def backfill_orphan_streams(config: dict, conn, pairs: list[tuple],
     Args:
         config: App config dict.
         conn: Open DB connection.
-        pairs: List of (strava_id, activity_id) tuples to fetch.
+        pairs: List of (strava_id, activity_id, source_id) tuples to fetch.
         verbose: Print progress.
 
     Returns dict with keys: streams_inserted, laps_inserted, errors, rate_limit_pauses.
@@ -745,7 +746,9 @@ def backfill_orphan_streams(config: dict, conn, pairs: list[tuple],
 
     result = {"streams_inserted": 0, "laps_inserted": 0, "errors": 0, "rate_limit_pauses": 0}
 
-    for strava_id, activity_id in pairs:
+    for item in pairs:
+        strava_id, activity_id = item[0], item[1]
+        source_id = item[2] if len(item) > 2 else None
         if not rate_limiter.check(verbose):
             result["rate_limit_pauses"] = rate_limiter.pause_count
             break
@@ -754,7 +757,8 @@ def backfill_orphan_streams(config: dict, conn, pairs: list[tuple],
             # Streams
             if not _activity_has_streams(conn, activity_id):
                 stream_count = _fetch_and_insert_streams(
-                    client, conn, strava_id, activity_id, rate_limiter, verbose)
+                    client, conn, strava_id, activity_id, rate_limiter, verbose,
+                    source_id=source_id)
                 result["streams_inserted"] += stream_count
                 if verbose and stream_count:
                     print(f"    STREAMS strava:{strava_id} → activity #{activity_id}: {stream_count} points")
@@ -885,7 +889,7 @@ def sync_strava(config: dict, dry_run: bool = False, verbose: bool = False,
                     result["fields_filled"] += len(filled)
 
                     # Insert activity source
-                    _insert_activity_source(conn, activity_id, strava_data, match_status)
+                    src_id = _insert_activity_source(conn, activity_id, strava_data, match_status)
 
                     # Laps (skip if activity already has intervals from XLSX)
                     if not _activity_has_intervals(conn, activity_id):
@@ -900,7 +904,8 @@ def sync_strava(config: dict, dry_run: bool = False, verbose: bool = False,
                     if fetch_streams and not _activity_has_streams(conn, activity_id):
                         if rate_limiter.check(verbose):
                             stream_count = _fetch_and_insert_streams(
-                                client, conn, strava_id, activity_id, rate_limiter, verbose)
+                                client, conn, strava_id, activity_id, rate_limiter, verbose,
+                                source_id=src_id)
                             result["streams_inserted"] += stream_count
                             if verbose and stream_count:
                                 print(f"    STREAMS {stream_count} points")
