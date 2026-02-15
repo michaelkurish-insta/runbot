@@ -68,6 +68,11 @@ python -m runbase sync --strava --full-history -v
 
 # Skip per-second streams for faster sync
 python -m runbase sync --strava --no-streams -v
+
+# Backfill Strava laps for XLSX activities (one-time, ~4 API calls/min)
+# Fetches lap data with timestamps for activities that already have XLSX intervals.
+# Needed for measured course detection (work-rep centroid matching).
+python -m runbase sync --strava --backfill-laps -v
 ```
 
 Strava sync matches against existing activities (date + distance tolerance), fills in missing fields (HR, cadence, elevation, laps, streams), and creates shoes.

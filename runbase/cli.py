@@ -29,6 +29,18 @@ def cmd_sync(args):
         _print_sync_summary(result, dry_run=args.dry_run)
 
     if args.strava:
+        if args.backfill_laps:
+            from runbase.ingest.strava_sync import backfill_strava_laps
+
+            result = backfill_strava_laps(config, verbose=args.verbose)
+            print(f"\nStrava lap backfill complete:")
+            print(f"  Activities fetched: {result['fetched']}")
+            print(f"  Skipped:            {result['skipped']}")
+            print(f"  Errors:             {result['errors']}")
+            if result["rate_limit_pauses"]:
+                print(f"  Rate pauses:        {result['rate_limit_pauses']}")
+            return
+
         from runbase.ingest.strava_sync import sync_strava
 
         result = sync_strava(
@@ -427,6 +439,8 @@ def main():
     sync_parser.add_argument("--strava", action="store_true", help="Sync from Strava API")
     sync_parser.add_argument("--full-history", action="store_true", help="Ignore last sync timestamp, fetch everything")
     sync_parser.add_argument("--no-streams", action="store_true", help="Skip per-second stream data (faster sync)")
+    sync_parser.add_argument("--backfill-laps", action="store_true",
+                             help="Fetch Strava laps for activities that already have XLSX intervals (one-time)")
     sync_parser.add_argument("--dry-run", action="store_true", help="Show what would be imported without writing")
     sync_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     sync_parser.set_defaults(func=cmd_sync)

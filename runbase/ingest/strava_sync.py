@@ -337,6 +337,28 @@ FILLABLE_FIELDS = [
     "calories", "duration_s", "avg_hr", "avg_cadence",
 ]
 
+# Generic FIT/Strava default names that should be replaced by real Strava names
+_GENERIC_NAME_PATTERNS = [
+    "Outdoor Running", "Indoor Running", "Treadmill Running",
+    "Morning Run", "Afternoon Run", "Evening Run", "Lunch Run",
+    "Night Run",
+]
+
+
+def _is_generic_name(name: str | None) -> bool:
+    """Check if a workout name is a generic default that should be overridden."""
+    if not name:
+        return True
+    # Match exact generic names and day-prefixed variants like "Monday Morning Run"
+    name_lower = name.lower().strip()
+    for pattern in _GENERIC_NAME_PATTERNS:
+        if name_lower == pattern.lower():
+            return True
+        # "Monday Morning Run", "Tuesday Afternoon Run", etc.
+        if name_lower.endswith(pattern.lower()):
+            return True
+    return False
+
 
 def _merge_fields(conn, activity_id: int, strava_data: dict, verbose: bool) -> list:
     """Fill NULL fields on canonical activity with Strava data. Returns list of filled fields."""
@@ -371,6 +393,22 @@ def _merge_fields(conn, activity_id: int, strava_data: dict, verbose: bool) -> l
             filled.append(db_col)
             if verbose:
                 print(f"    FILL {db_col} = {strava_val}")
+
+    # Replace generic workout names with real Strava names
+    strava_name = strava_data.get("name")
+    if strava_name and not _is_generic_name(strava_name):
+        row = conn.execute(
+            "SELECT workout_name FROM activities WHERE id = ?", (activity_id,)
+        ).fetchone()
+        current_name = row[0] if row else None
+        if _is_generic_name(current_name):
+            conn.execute(
+                "UPDATE activities SET workout_name = ?, updated_at = datetime('now') WHERE id = ?",
+                (strava_name, activity_id),
+            )
+            filled.append("workout_name")
+            if verbose:
+                print(f"    NAME '{current_name}' → '{strava_name}'")
 
     return filled
 
@@ -582,6 +620,110 @@ def _ensure_shoe(conn, client, gear_id: str, shoe_cache: dict,
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
+def backfill_strava_laps(config: dict, verbose: bool = False) -> dict:
+    """Fetch Strava laps for activities that have XLSX intervals but no Strava laps.
+
+    These activities were matched during Strava sync but their laps were skipped
+    because XLSX intervals already existed.  Strava laps are stored alongside
+    XLSX intervals with source='strava_lap' and include timestamps for GPS-based
+    centroid computation in the enrichment pipeline.
+
+    Returns dict with keys: fetched, skipped, errors, rate_limit_pauses.
+    """
+    conn = get_connection(config)
+    client = _get_client(config)
+    rate_limiter = StravaRateLimiter()
+
+    # Find activities with a Strava source + existing intervals but no strava_lap
+    rows = conn.execute("""
+        SELECT a.id,
+               json_extract(s.metadata_json, '$.strava_id') AS strava_id,
+               a.workout_name
+        FROM activities a
+        JOIN activity_sources s ON s.activity_id = a.id AND s.source = 'strava'
+        WHERE EXISTS (
+            SELECT 1 FROM intervals i
+            WHERE i.activity_id = a.id AND (i.source IS NULL OR i.source = 'xlsx_split')
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM intervals i
+            WHERE i.activity_id = a.id AND i.source = 'strava_lap'
+        )
+        ORDER BY a.date
+    """).fetchall()
+
+    result = {"fetched": 0, "skipped": 0, "errors": 0, "rate_limit_pauses": 0}
+
+    if verbose:
+        print(f"Found {len(rows)} activities needing Strava laps.")
+
+    for activity_id, strava_id, name in rows:
+        if not strava_id:
+            result["skipped"] += 1
+            continue
+
+        if not rate_limiter.check(verbose):
+            result["rate_limit_pauses"] = rate_limiter.pause_count
+            break
+
+        try:
+            laps = client.get_activity_laps(int(strava_id))
+            _update_rate_limiter(client, rate_limiter)
+
+            cumulative_s = 0.0
+            count = 0
+            for i, lap in enumerate(laps, start=1):
+                dist_mi = float(lap.distance) / METERS_PER_MILE if lap.distance else None
+                elapsed_s = float(int(lap.elapsed_time)) if lap.elapsed_time else None
+                moving_s = float(int(lap.moving_time)) if lap.moving_time else None
+                dur_s = moving_s  # use moving time for pace
+
+                pace = None
+                pace_display = None
+                if dist_mi and dist_mi > 0 and dur_s and dur_s > 0:
+                    pace = round(dur_s / dist_mi, 1)
+                    pace_display = format_pace(pace)
+
+                avg_hr = round(float(lap.average_heartrate), 1) if lap.average_heartrate else None
+                avg_cadence = round(float(lap.average_cadence) * 2, 1) if lap.average_cadence else None
+
+                start_ts = cumulative_s
+                end_ts = cumulative_s + (elapsed_s or 0)
+                cumulative_s = end_ts
+
+                conn.execute(
+                    """INSERT INTO intervals
+                       (activity_id, rep_number, gps_measured_distance_mi, duration_s,
+                        avg_pace_s_per_mi, avg_pace_display, avg_hr, avg_cadence,
+                        is_recovery, start_timestamp_s, end_timestamp_s, source)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (activity_id, i,
+                     round(dist_mi, 3) if dist_mi else None,
+                     round(dur_s, 1) if dur_s else None,
+                     pace, pace_display, avg_hr, avg_cadence, False,
+                     round(start_ts, 1), round(end_ts, 1), "strava_lap"),
+                )
+                count += 1
+
+            conn.commit()
+            result["fetched"] += 1
+            if verbose:
+                print(f"  #{activity_id} ({name or '?'}): {count} Strava laps")
+
+        except Exception as e:
+            result["errors"] += 1
+            if verbose:
+                print(f"  #{activity_id} ERROR: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+    result["rate_limit_pauses"] = rate_limiter.pause_count
+    conn.close()
+    return result
+
 
 def backfill_orphan_streams(config: dict, conn, pairs: list[tuple],
                             verbose: bool = False) -> dict:

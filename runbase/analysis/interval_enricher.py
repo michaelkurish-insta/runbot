@@ -124,6 +124,34 @@ def _is_workout_name(name: str | None) -> bool:
     return any(p.search(name) for p in _WORKOUT_NAME_PATTERNS)
 
 
+_TEMPO_NAME_PATTERNS = [
+    re.compile(r"\bat\s*T\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s*miles?\s*at\s*T\b", re.IGNORECASE),
+    re.compile(r"\btempo\b", re.IGNORECASE),
+    re.compile(r"\b@\s*t\b", re.IGNORECASE),
+]
+
+_HILLS_NAME_PATTERNS = [
+    re.compile(r"\bhill", re.IGNORECASE),
+    re.compile(r"\bmins?\s*H\b"),
+]
+
+
+def _infer_workout_category(name: str | None) -> str | None:
+    """Infer workout_category from the activity name. Returns None if unknown."""
+    if not name:
+        return None
+    if _is_race_name(name):
+        return "race"
+    if any(p.search(name) for p in _TEMPO_NAME_PATTERNS):
+        return "tempo"
+    if any(p.search(name) for p in _HILLS_NAME_PATTERNS):
+        return "hills"
+    if _is_workout_name(name):
+        return "repetition"
+    return None
+
+
 def _get_paces_config(config: dict) -> dict:
     """Extract paces config with defaults."""
     paces = config.get("paces", {})
@@ -224,6 +252,116 @@ def _compute_centroid(streams: list[dict]) -> tuple[float, float] | None:
     return (sum(lats) / len(lats), sum(lons) / len(lons))
 
 
+_WORK_PACE_ZONES = {"T", "I", "R", "FR"}
+
+
+_TRUSTED_INTERVAL_SOURCES = {"fit_lap", "strava_lap"}
+
+
+def _compute_work_group_centroids(
+    intervals: list[dict],
+    streams: list[dict],
+    boundaries: dict | None,
+) -> dict[int, tuple[float, float]]:
+    """Compute GPS centroids for groups of work intervals by distance bucket.
+
+    Uses interval timestamps to extract stream points for centroid computation.
+    Trusts timestamps from FIT laps and Strava laps.  Falls back to filtering
+    stream points by work-pace zone for activities without any trusted laps
+    (pre-Strava XLSX-only activities).
+
+    Returns:
+        Dict mapping distance_bucket_m → (lat, lon) centroid.
+    """
+    if not boundaries or not streams:
+        return {}
+
+    import bisect
+
+    # Build sorted geo points for timestamp-based lookup
+    geo_pts = sorted(
+        ((s["timestamp_s"], s["lat"], s["lon"]) for s in streams
+         if s.get("timestamp_s") is not None and s.get("lat") is not None),
+        key=lambda x: x[0],
+    )
+    if not geo_pts:
+        return {}
+
+    geo_ts = [p[0] for p in geo_pts]
+
+    def _stream_points_in_range(t_start: float, t_end: float):
+        lo = bisect.bisect_left(geo_ts, t_start)
+        hi = bisect.bisect_right(geo_ts, t_end)
+        return geo_pts[lo:hi]
+
+    # Separate work intervals into trusted-timestamp vs no-timestamp
+    ts_groups: dict[int, list[dict]] = {}
+    no_ts_buckets: set[int] = set()
+
+    for iv in intervals:
+        if iv.get("is_recovery"):
+            continue
+        if iv.get("source") == "pace_segment":
+            continue
+        pace = iv.get("avg_pace_s_per_mi")
+        gps_dist = iv.get("gps_measured_distance_mi")
+        if not pace or pace <= 0 or not gps_dist:
+            continue
+        zone = classify_pace(pace, boundaries)
+        if zone not in _WORK_PACE_ZONES:
+            continue
+        bucket = round(gps_dist * METERS_PER_MILE / 100) * 100
+
+        ts_start = iv.get("start_timestamp_s")
+        ts_end = iv.get("end_timestamp_s")
+        if (ts_start is not None and ts_end is not None
+                and iv.get("source") in _TRUSTED_INTERVAL_SOURCES):
+            ts_groups.setdefault(bucket, []).append(iv)
+        else:
+            no_ts_buckets.add(bucket)
+
+    # Compute per-group centroids from trusted-timestamp intervals
+    centroids: dict[int, tuple[float, float]] = {}
+    for bucket, ivs in ts_groups.items():
+        lats: list[float] = []
+        lons: list[float] = []
+        for iv in ivs:
+            for _, lat, lon in _stream_points_in_range(
+                iv["start_timestamp_s"], iv["end_timestamp_s"]
+            ):
+                lats.append(lat)
+                lons.append(lon)
+        if lats:
+            centroids[bucket] = (sum(lats) / len(lats), sum(lons) / len(lons))
+
+    # For buckets without trusted timestamps, fall back to stream-pace filtering.
+    # This only applies to pre-Strava XLSX-only activities (no Strava laps).
+    if no_ts_buckets:
+        work_lats: list[float] = []
+        work_lons: list[float] = []
+        for s in streams:
+            if s.get("lat") is None or s.get("pace_s_per_mi") is None:
+                continue
+            pace = s["pace_s_per_mi"]
+            if pace <= 0:
+                continue
+            zone = classify_pace(pace, boundaries)
+            if zone in _WORK_PACE_ZONES:
+                work_lats.append(s["lat"])
+                work_lons.append(s["lon"])
+
+        if work_lats:
+            work_centroid = (
+                sum(work_lats) / len(work_lats),
+                sum(work_lons) / len(work_lons),
+            )
+            for bucket in no_ts_buckets:
+                if bucket not in centroids:
+                    centroids[bucket] = work_centroid
+
+    return centroids
+
+
 def _estimate_interval_timestamps(intervals: list[dict], streams: list[dict]) -> None:
     """Estimate start/end timestamps for intervals that lack them.
 
@@ -306,6 +444,18 @@ def enrich_activity(conn, activity_id: int, config: dict,
         summary["skipped"] = True
         summary["skip_reason"] = "not found"
         return summary
+
+    # Infer workout_category from name if not set
+    if not activity["workout_category"]:
+        inferred = _infer_workout_category(activity["workout_name"])
+        if inferred:
+            activity["workout_category"] = inferred
+            conn.execute(
+                "UPDATE activities SET workout_category = ?, updated_at = datetime('now') WHERE id = ?",
+                (inferred, activity_id),
+            )
+            if verbose:
+                print(f"    Category inferred: '{inferred}' from '{activity['workout_name']}'")
 
     # Load current VDOT
     vdot = get_current_vdot(conn, activity["date"])
@@ -453,30 +603,50 @@ def enrich_activity(conn, activity_id: int, config: dict,
     # --- Measured course detection (Step 2) ---
     # Only apply to structured workouts — skip easy runs whose FIT auto-laps
     # happen to be near measured course distances.
+    # Uses work-rep centroids per distance group (not activity centroid) to avoid
+    # false matches when warmup/cooldown shifts the overall centroid.
     is_structured_activity = is_structured(activity_info)
-    centroid = _compute_centroid(streams) if streams else None
-    nearby_courses = (find_matching_courses(centroid[0], centroid[1], config)
-                      if centroid and is_structured_activity else [])
-    if nearby_courses:
-        for interval in intervals:
-            if interval["is_recovery"] or interval.get("location_type"):
-                continue
-            # Skip auto-generated pace segments — only snap real laps
-            if interval.get("source") == "pace_segment":
-                continue
-            gps_dist = interval.get("gps_measured_distance_mi")
-            if not gps_dist:
-                continue
-            course = best_course_for_interval(gps_dist, nearby_courses)
-            if course:
-                snap_m = course["snap_distance_m"]
-                interval["location_type"] = "measured_course"
-                interval["canonical_distance_mi"] = round(snap_m / METERS_PER_MILE, 4)
-                summary["measured_intervals"] += 1
+    if is_structured_activity and streams and boundaries:
+        # Ensure all intervals have estimated timestamps for centroid calc
+        _estimate_interval_timestamps(intervals, streams)
+
+        group_centroids = _compute_work_group_centroids(
+            intervals, streams, boundaries
+        )
+
+        # For each distance group, check if its centroid matches a course
+        matched_buckets: dict[int, list[dict]] = {}  # bucket → matching courses
+        for bucket, (glat, glon) in group_centroids.items():
+            courses = find_matching_courses(glat, glon, config)
+            if courses:
+                matched_buckets[bucket] = courses
                 if verbose:
-                    raw_m = round(gps_dist * METERS_PER_MILE)
-                    print(f"    Interval {raw_m}m → {round(snap_m)}m"
-                          f" ({course.get('name', 'measured')})")
+                    print(f"    {bucket}m group centroid ({glat:.5f}, {glon:.5f})"
+                          f" near {[c['name'] for c in courses]}")
+
+        if matched_buckets:
+            for interval in intervals:
+                if interval["is_recovery"] or interval.get("location_type"):
+                    continue
+                if interval.get("source") == "pace_segment":
+                    continue
+                gps_dist = interval.get("gps_measured_distance_mi")
+                if not gps_dist:
+                    continue
+                bucket = round(gps_dist * METERS_PER_MILE / 100) * 100
+                courses = matched_buckets.get(bucket)
+                if not courses:
+                    continue
+                course = best_course_for_interval(gps_dist, courses)
+                if course:
+                    snap_m = course["snap_distance_m"]
+                    interval["location_type"] = "measured_course"
+                    interval["canonical_distance_mi"] = round(snap_m / METERS_PER_MILE, 4)
+                    summary["measured_intervals"] += 1
+                    if verbose:
+                        raw_m = round(gps_dist * METERS_PER_MILE)
+                        print(f"    Interval {raw_m}m → {round(snap_m)}m"
+                              f" ({course.get('name', 'measured')})")
 
     # --- Walking scrub (Step 3) ---
     for interval in intervals:
