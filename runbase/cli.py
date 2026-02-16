@@ -241,7 +241,48 @@ def cmd_reconcile(args):
 
         group_matched += 1
 
-    # Step 4: Fetch streams/laps for newly linked orphans (opt-in)
+    # Step 4: Promote orphaned Strava sources to activities (opt-in)
+    promoted_count = 0
+    promoted_activities = []
+    if args.promote_orphans:
+        from runbase.reconcile.matcher import find_promotable_orphans
+        from runbase.reconcile.enricher import promote_orphans
+
+        if args.verbose:
+            print(f"\nLooking for promotable orphans (since {args.promote_since})...")
+
+        groups = find_promotable_orphans(conn, cutoff_date=args.promote_since,
+                                         verbose=args.verbose)
+
+        if groups:
+            total_orphans = sum(len(g) for g in groups)
+            if args.verbose:
+                print(f"  Found {len(groups)} day(s) with {total_orphans} orphan(s) to promote.")
+
+            if args.dry_run:
+                for group in groups:
+                    primary = group[0]
+                    total_dist = sum(o["distance_mi"] or 0 for o in group)
+                    names = [o.get("strava_name") or o.get("workout_name") or "?" for o in group]
+                    if len(group) == 1:
+                        print(f"  [DRY RUN] Would promote {primary['start_date']} "
+                              f"{total_dist:.2f}mi \"{names[0]}\"")
+                    else:
+                        dists = [f"{o['distance_mi']:.2f}" for o in group]
+                        print(f"  [DRY RUN] Would promote {primary['start_date']} "
+                              f"{' + '.join(dists)} = {total_dist:.2f}mi ({', '.join(names)})")
+                promoted_count = len(groups)
+            else:
+                promoted_activities = promote_orphans(conn, groups, verbose=args.verbose)
+                promoted_count = len(promoted_activities)
+
+                # Collect stream fetch pairs from promoted activities
+                for p in promoted_activities:
+                    stream_fetch_pairs.extend(p["pairs"])
+        elif args.verbose:
+            print("  No promotable orphans found.")
+
+    # Step 5: Fetch streams/laps for newly linked orphans (opt-in)
     stream_result = {"streams_inserted": 0, "laps_inserted": 0, "errors": 0, "rate_limit_pauses": 0}
     if args.fetch_streams and stream_fetch_pairs and not args.dry_run:
         from runbase.ingest.strava_sync import backfill_orphan_streams
@@ -251,10 +292,30 @@ def cmd_reconcile(args):
         stream_result = backfill_orphan_streams(
             config, conn, stream_fetch_pairs, verbose=args.verbose)
 
+    # Step 6: Enrich promoted activities (if streams were fetched)
+    enriched_count = 0
+    if promoted_activities and not args.dry_run:
+        from runbase.analysis.interval_enricher import enrich_activity
+
+        if args.verbose:
+            print(f"\nEnriching {len(promoted_activities)} promoted activity/ies...")
+        for p in promoted_activities:
+            try:
+                result = enrich_activity(conn, p["activity_id"], config, verbose=args.verbose)
+                if not result["skipped"]:
+                    enriched_count += 1
+            except Exception as e:
+                if args.verbose:
+                    print(f"    ERROR enriching activity #{p['activity_id']}: {e}")
+
     prefix = "[DRY RUN] " if args.dry_run else ""
     print(f"\n{prefix}Reconcile complete:")
     print(f"  1:1 matched:    {matched}")
     print(f"  Group matched:  {group_matched}")
+    if args.promote_orphans:
+        print(f"  Promoted:       {promoted_count}")
+        if enriched_count:
+            print(f"  Enriched:       {enriched_count}")
     print(f"  Shoes set:      {shoes_set}")
     print(f"  Names set:      {names_set}")
     print(f"  Categories:     {categories_set}")
@@ -509,6 +570,10 @@ def main():
                                   help="Backfill start_date on orphaned Strava sources (one-time, requires API)")
     reconcile_parser.add_argument("--fetch-streams", action="store_true",
                                   help="Fetch streams/laps from Strava for newly group-matched orphans")
+    reconcile_parser.add_argument("--promote-orphans", action="store_true",
+                                  help="Create activities from orphaned Strava sources that have no matching activity")
+    reconcile_parser.add_argument("--promote-since", type=str, default="2025-12-01", metavar="YYYY-MM-DD",
+                                  help="Cutoff date for orphan promotion (default: 2025-12-01)")
     reconcile_parser.add_argument("--dry-run", action="store_true", help="Show matches without writing")
     reconcile_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     reconcile_parser.set_defaults(func=cmd_reconcile)

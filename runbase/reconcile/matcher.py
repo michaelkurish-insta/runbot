@@ -9,7 +9,8 @@ METERS_PER_MILE = 1609.344
 def _load_orphaned_strava_sources(conn) -> list[dict]:
     """Load all Strava activity_sources with activity_id IS NULL."""
     rows = conn.execute(
-        """SELECT id, source_id, distance_mi, duration_s, workout_name, metadata_json
+        """SELECT id, source_id, distance_mi, duration_s, workout_name, metadata_json,
+                  avg_pace_s_per_mi, avg_hr, max_hr, avg_cadence, total_ascent_ft, calories
            FROM activity_sources
            WHERE source = 'strava' AND activity_id IS NULL"""
     ).fetchall()
@@ -24,6 +25,12 @@ def _load_orphaned_strava_sources(conn) -> list[dict]:
             "duration_s": r[3],
             "workout_name": r[4],
             "metadata": meta,
+            "avg_pace_s_per_mi": r[6],
+            "avg_hr": r[7],
+            "max_hr": r[8],
+            "avg_cadence": r[9],
+            "total_ascent_ft": r[10],
+            "calories": r[11],
             "start_date": meta.get("start_date"),
             "gear_id": meta.get("gear_id"),
             "strava_name": meta.get("strava_name"),
@@ -138,6 +145,82 @@ def find_strava_group_match(conn, date: str, distance_mi: float,
 
     same_day.sort(key=sort_key)
     return same_day
+
+
+def find_promotable_orphans(conn, cutoff_date: str = "2025-12-01",
+                            verbose: bool = False) -> list[list[dict]]:
+    """Find orphaned Strava sources eligible for promotion to activities.
+
+    Loads orphans with start_date >= cutoff_date, excludes any that could
+    plausibly match an existing activity (±1 day, 15% distance tolerance),
+    and groups the remainder by start_date.
+
+    Returns list of groups (each group is a list of orphan dicts for that day).
+    """
+    orphans = _load_orphaned_strava_sources(conn)
+    if not orphans:
+        return []
+
+    # Filter to orphans after cutoff with valid distance
+    candidates = [
+        o for o in orphans
+        if o["start_date"] and o["start_date"] >= cutoff_date
+        and o["distance_mi"] and o["distance_mi"] > 0
+    ]
+
+    if verbose:
+        print(f"  Orphans after {cutoff_date}: {len(candidates)}")
+
+    # Exclude orphans that could match an existing activity
+    promotable = []
+    for orphan in candidates:
+        orphan_date = orphan["start_date"]
+        dt = datetime.strptime(orphan_date, "%Y-%m-%d")
+        nearby_dates = {
+            orphan_date,
+            (dt - timedelta(days=1)).strftime("%Y-%m-%d"),
+            (dt + timedelta(days=1)).strftime("%Y-%m-%d"),
+        }
+        placeholders = ",".join("?" * len(nearby_dates))
+
+        # Check if any existing activity is within ±1 day and 15% distance
+        rows = conn.execute(
+            f"""SELECT distance_mi FROM activities
+                WHERE date IN ({placeholders}) AND distance_mi IS NOT NULL""",
+            tuple(nearby_dates),
+        ).fetchall()
+
+        could_match = False
+        for (act_dist,) in rows:
+            if act_dist > 0:
+                diff_pct = abs(orphan["distance_mi"] - act_dist) / act_dist * 100
+                if diff_pct <= 15:
+                    could_match = True
+                    break
+
+        if not could_match:
+            promotable.append(orphan)
+        elif verbose:
+            print(f"    SKIP strava:{orphan['source_id']} ({orphan_date}, "
+                  f"{orphan['distance_mi']:.2f}mi) — could match existing activity")
+
+    if verbose:
+        print(f"  Promotable orphans: {len(promotable)}")
+
+    # Group by start_date
+    from collections import defaultdict
+    by_date = defaultdict(list)
+    for o in promotable:
+        by_date[o["start_date"]].append(o)
+
+    # Sort each group by start_time
+    groups = []
+    for date_key in sorted(by_date.keys()):
+        group = by_date[date_key]
+        group.sort(key=lambda o: o["metadata"].get("start_time", "") or "")
+        groups.append(group)
+
+    return groups
 
 
 def backfill_strava_dates(config: dict, conn, verbose: bool = False) -> int:
