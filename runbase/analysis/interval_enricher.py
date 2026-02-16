@@ -698,7 +698,12 @@ def enrich_activity(conn, activity_id: int, config: dict,
             summary["walking_intervals"] += 1
 
     # --- Stride detection (Step 4) ---
+    # Only flag manually entered intervals (FIT/Strava laps, XLSX splits),
+    # not auto-generated pace segments whose short duration is just a
+    # transition between pace changes.
     for interval in intervals:
+        if interval.get("source") == "pace_segment":
+            continue
         duration = interval.get("duration_s")
         if duration and duration < stride_max and not interval["is_recovery"]:
             interval["is_stride"] = True
