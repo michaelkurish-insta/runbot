@@ -15,6 +15,7 @@ RunBase is a personal running data pipeline that ingests workout data from multi
 ## Key Commands
 
 - `pip install -r requirements.txt` — install dependencies
+- `python -m runbase pipeline -v` — full sync pipeline: iCloud → Strava → enrich (cron-friendly)
 - `python -m runbase db init` — initialize the SQLite database with full schema
 - `python -m runbase sync --icloud -v` — sync .fit files from iCloud HealthFit folder
 - `python -m runbase sync --strava -v` — sync from Strava API (incremental)

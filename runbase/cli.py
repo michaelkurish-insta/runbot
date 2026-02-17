@@ -530,6 +530,56 @@ def cmd_fastest(args):
               f"{r['source_type']:<10}")
 
 
+def cmd_pipeline(args):
+    """Run the full sync pipeline: iCloud → Strava → enrich new activities."""
+    from runbase.config import load_config
+    from runbase.db import get_connection, _migrate_schema
+
+    config = load_config()
+    verbose = args.verbose
+
+    # Step 1: iCloud sync (FIT files)
+    if verbose:
+        print("=== iCloud sync ===")
+    from runbase.ingest.icloud_sync import sync_icloud
+
+    icloud_result = sync_icloud(config, verbose=verbose)
+    new_activity_ids = [
+        d["activity_id"] for d in icloud_result.get("details", [])
+        if d.get("status") == "new" and d.get("activity_id")
+    ]
+
+    if verbose or icloud_result["new"]:
+        print(f"  {icloud_result['new']} new, {icloud_result['skipped']} skipped")
+
+    # Step 2: Strava sync
+    if verbose:
+        print("\n=== Strava sync ===")
+    from runbase.ingest.strava_sync import sync_strava
+
+    strava_result = sync_strava(config, verbose=verbose, fetch_streams=True)
+    if verbose or strava_result["matched"]:
+        print(f"  {strava_result['matched']} matched, {strava_result['fields_filled']} fields filled")
+
+    # Step 3: Enrich new activities
+    if new_activity_ids:
+        if verbose:
+            print(f"\n=== Enriching {len(new_activity_ids)} new activities ===")
+        conn = get_connection(config)
+        _migrate_schema(conn)
+        from runbase.analysis.interval_enricher import enrich_activity
+
+        for aid in new_activity_ids:
+            enrich_activity(conn, aid, config, verbose=verbose)
+        conn.close()
+    elif verbose:
+        print("\n  No new activities to enrich.")
+
+    # Summary
+    print(f"\nPipeline complete: {icloud_result['new']} new activities, "
+          f"{strava_result['matched']} Strava matched")
+
+
 def cmd_stub(name):
     def handler(args):
         print(f"'{name}' is not yet implemented.")
@@ -615,6 +665,12 @@ def main():
         help="Number of results (default 10)")
     fastest_parser.add_argument("-v", "--verbose", action="store_true")
     fastest_parser.set_defaults(func=cmd_fastest)
+
+    # pipeline subcommand (cron-friendly)
+    pipeline_parser = subparsers.add_parser(
+        "pipeline", help="Run full sync pipeline: iCloud → Strava → enrich")
+    pipeline_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    pipeline_parser.set_defaults(func=cmd_pipeline)
 
     review_parser = subparsers.add_parser("review", help="Launch the review UI")
     review_parser.set_defaults(func=cmd_stub("review"))

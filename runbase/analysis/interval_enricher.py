@@ -754,8 +754,10 @@ def enrich_activity(conn, activity_id: int, config: dict,
         )
 
     # --- Compute adjusted_distance_mi (Step 6) ---
-    # Use pace_segment intervals if they exist, otherwise use original intervals
-    # This avoids double-counting when both FIT laps and pace segments exist
+    # Use pace_segment intervals if they exist, otherwise use original intervals.
+    # This avoids double-counting when both FIT laps and pace segments exist.
+    # Strides always count (even when their distance is absorbed into walking
+    # pace_segments), so add stride distance from FIT/Strava laps separately.
     segment_intervals = [i for i in intervals if i.get("source") == "pace_segment"]
     distance_intervals = segment_intervals if segment_intervals else intervals
     non_walking_distance = sum(
@@ -763,6 +765,13 @@ def enrich_activity(conn, activity_id: int, config: dict,
         for i in distance_intervals
         if not i.get("is_walking")
     )
+    if segment_intervals:
+        stride_distance = sum(
+            i.get("gps_measured_distance_mi") or 0
+            for i in intervals
+            if i.get("is_stride") and i.get("source") != "pace_segment"
+        )
+        non_walking_distance += stride_distance
     adjusted_distance = round(non_walking_distance, 2) if distance_intervals else activity["distance_mi"]
 
     # --- Store VDOT + adjusted distance on activity ---
