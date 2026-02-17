@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS intervals (
     is_stride               BOOLEAN DEFAULT FALSE,
     is_race                 BOOLEAN DEFAULT FALSE,
     location_type           TEXT,
+    set_number              INTEGER,
     start_timestamp_s       REAL,
     end_timestamp_s         REAL,
     source                  TEXT
@@ -218,6 +219,8 @@ def _migrate_schema(conn):
         ("intervals", "end_timestamp_s", "REAL"),
         ("intervals", "source", "TEXT"),
         ("intervals", "is_race", "BOOLEAN DEFAULT FALSE"),
+        # Phase 5+: workout tagging
+        ("intervals", "set_number", "INTEGER"),
         # Phase 5: activity enrichment columns
         ("activities", "adjusted_distance_mi", "REAL"),
         ("activities", "vdot", "REAL"),

@@ -452,10 +452,13 @@ def _fetch_and_insert_laps(client, conn, strava_id: str, activity_id: int,
     # Hook into rate limiter via the session
     _update_rate_limiter(client, rate_limiter)
 
+    cumulative_s = 0.0
     count = 0
     for i, lap in enumerate(laps, start=1):
         dist_mi = float(lap.distance) / METERS_PER_MILE if lap.distance else None
-        dur_s = float(int(lap.moving_time)) if lap.moving_time else None
+        elapsed_s = float(int(lap.elapsed_time)) if lap.elapsed_time else None
+        moving_s = float(int(lap.moving_time)) if lap.moving_time else None
+        dur_s = moving_s  # use moving time for pace
 
         pace = None
         pace_display = None
@@ -466,13 +469,20 @@ def _fetch_and_insert_laps(client, conn, strava_id: str, activity_id: int,
         avg_hr = round(float(lap.average_heartrate), 1) if lap.average_heartrate else None
         avg_cadence = round(float(lap.average_cadence) * 2, 1) if lap.average_cadence else None
 
+        start_ts = cumulative_s
+        end_ts = cumulative_s + (elapsed_s or 0)
+        cumulative_s = end_ts
+
         conn.execute(
             """INSERT INTO intervals
                (activity_id, rep_number, gps_measured_distance_mi, duration_s,
-                avg_pace_s_per_mi, avg_pace_display, avg_hr, avg_cadence, is_recovery)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (activity_id, i, round(dist_mi, 3) if dist_mi else None, round(dur_s, 1) if dur_s else None,
-             pace, pace_display, avg_hr, avg_cadence, False),
+                avg_pace_s_per_mi, avg_pace_display, avg_hr, avg_cadence,
+                is_recovery, start_timestamp_s, end_timestamp_s, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (activity_id, i, round(dist_mi, 3) if dist_mi else None,
+             round(dur_s, 1) if dur_s else None,
+             pace, pace_display, avg_hr, avg_cadence, False,
+             round(start_ts, 1), round(end_ts, 1), "strava_lap"),
         )
         count += 1
 

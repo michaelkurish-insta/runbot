@@ -196,7 +196,8 @@ def _load_intervals(conn, activity_id: int) -> list[dict]:
     rows = conn.execute(
         """SELECT id, rep_number, gps_measured_distance_mi, canonical_distance_mi,
                   duration_s, avg_pace_s_per_mi, avg_pace_display, avg_hr, avg_cadence,
-                  is_recovery, start_timestamp_s, end_timestamp_s, source, is_race
+                  is_recovery, start_timestamp_s, end_timestamp_s, source, is_race,
+                  set_number
            FROM intervals WHERE activity_id = ? ORDER BY rep_number""",
         (activity_id,),
     ).fetchall()
@@ -208,6 +209,7 @@ def _load_intervals(conn, activity_id: int) -> list[dict]:
             "avg_hr": r[7], "avg_cadence": r[8], "is_recovery": bool(r[9]),
             "start_timestamp_s": r[10], "end_timestamp_s": r[11], "source": r[12],
             "is_race": bool(r[13]) if r[13] else False,
+            "set_number": r[14],
         }
         for r in rows
     ]
@@ -459,6 +461,8 @@ def enrich_activity(conn, activity_id: int, config: dict,
         "activity_id": activity_id,
         "track_intervals": 0,
         "measured_intervals": 0,
+        "recovery_intervals": 0,
+        "sets_tagged": 0,
         "walking_intervals": 0,
         "stride_intervals": 0,
         "zones_assigned": 0,
@@ -690,6 +694,17 @@ def enrich_activity(conn, activity_id: int, config: dict,
                         print(f"    Interval {raw_m}m → {round(snap_m)}m"
                               f" ({course.get('name', 'measured')})")
 
+    # --- Workout tagging: recovery + set grouping (Step 2b) ---
+    if is_structured_activity and boundaries:
+        from runbase.analysis.workout_tagger import tag_workout_intervals
+        tag_workout_intervals(intervals, boundaries)
+        recovery_count = sum(1 for iv in intervals if iv.get("is_recovery"))
+        set_count = len({iv.get("set_number") for iv in intervals if iv.get("set_number") is not None})
+        summary["recovery_intervals"] = recovery_count
+        summary["sets_tagged"] = set_count
+        if verbose and (recovery_count or set_count):
+            print(f"    Tagged {recovery_count} recoveries, {set_count} sets")
+
     # --- Walking scrub (Step 3) ---
     for interval in intervals:
         pace = interval.get("avg_pace_s_per_mi")
@@ -724,7 +739,8 @@ def enrich_activity(conn, activity_id: int, config: dict,
             """UPDATE intervals
                SET pace_zone = ?, is_walking = ?, is_stride = ?,
                    is_race = ?, location_type = ?, canonical_distance_mi = ?,
-                   avg_pace_s_per_mi = ?, avg_pace_display = ?
+                   avg_pace_s_per_mi = ?, avg_pace_display = ?,
+                   is_recovery = ?, set_number = ?
                WHERE id = ?""",
             (interval.get("pace_zone"), interval.get("is_walking", False),
              interval.get("is_stride", False), interval.get("is_race", False),
@@ -732,6 +748,8 @@ def enrich_activity(conn, activity_id: int, config: dict,
              interval.get("canonical_distance_mi"),
              interval.get("avg_pace_s_per_mi"),
              interval.get("avg_pace_display"),
+             interval.get("is_recovery", False),
+             interval.get("set_number"),
              interval["id"]),
         )
 
@@ -761,6 +779,10 @@ def enrich_activity(conn, activity_id: int, config: dict,
             parts.append(f"{summary['track_intervals']} track")
         if summary["measured_intervals"]:
             parts.append(f"{summary['measured_intervals']} measured")
+        if summary["recovery_intervals"]:
+            parts.append(f"{summary['recovery_intervals']} recov")
+        if summary["sets_tagged"]:
+            parts.append(f"{summary['sets_tagged']} sets")
         if summary["walking_intervals"]:
             parts.append(f"{summary['walking_intervals']} walk")
         if summary["stride_intervals"]:
@@ -790,6 +812,8 @@ def enrich_batch(conn, config: dict, dry_run: bool = False,
         "skipped": 0,
         "track_intervals": 0,
         "measured_intervals": 0,
+        "recovery_intervals": 0,
+        "sets_tagged": 0,
         "walking_intervals": 0,
         "stride_intervals": 0,
         "zones_assigned": 0,
@@ -812,6 +836,8 @@ def enrich_batch(conn, config: dict, dry_run: bool = False,
             result["enriched"] += 1
             result["track_intervals"] += summary["track_intervals"]
             result["measured_intervals"] += summary["measured_intervals"]
+            result["recovery_intervals"] += summary["recovery_intervals"]
+            result["sets_tagged"] += summary["sets_tagged"]
             result["walking_intervals"] += summary["walking_intervals"]
             result["stride_intervals"] += summary["stride_intervals"]
             result["zones_assigned"] += summary["zones_assigned"]
