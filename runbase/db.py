@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS intervals (
     pace_zone               TEXT,
     is_walking              BOOLEAN DEFAULT FALSE,
     is_stride               BOOLEAN DEFAULT FALSE,
+    elapsed_pace_zone       TEXT,
     is_race                 BOOLEAN DEFAULT FALSE,
     location_type           TEXT,
     set_number              INTEGER,
@@ -221,6 +222,8 @@ def _migrate_schema(conn):
         ("intervals", "is_race", "BOOLEAN DEFAULT FALSE"),
         # Phase 5+: workout tagging
         ("intervals", "set_number", "INTEGER"),
+        # Phase 5+: elapsed pace zone for pace segments
+        ("intervals", "elapsed_pace_zone", "TEXT"),
         # Phase 5: activity enrichment columns
         ("activities", "adjusted_distance_mi", "REAL"),
         ("activities", "vdot", "REAL"),

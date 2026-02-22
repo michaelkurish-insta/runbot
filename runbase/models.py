@@ -70,6 +70,7 @@ class Interval:
     pace_zone: Optional[str] = None
     is_walking: bool = False
     is_stride: bool = False
+    elapsed_pace_zone: Optional[str] = None
     location_type: Optional[str] = None
     start_timestamp_s: Optional[float] = None
     end_timestamp_s: Optional[float] = None

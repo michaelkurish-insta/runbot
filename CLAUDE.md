@@ -78,6 +78,13 @@ See `runbase_build_plan.md` for the full phased build plan.
 - Phase 4 (Reconciliation — FIT↔Strava matching + enrichment): Complete
 - Phase 5 (Interval enrichment — VDOT, pace zones, track detection, walking scrub): Complete
 
+## XLSX Cutoff Date
+
+The `xlsx.cutoff_date` config setting (default: `2024-12-15`) causes the XLSX import to
+skip any rows after that date. Post-cutoff activities come from Strava/FIT sources instead,
+avoiding false matches where an XLSX workout name (e.g. "8x200m") gets paired with a
+different Strava activity that just happened to match on date + distance.
+
 ## Key Patterns
 
 - CLI uses lazy imports inside command handlers (keeps startup fast)
@@ -87,7 +94,26 @@ See `runbase_build_plan.md` for the full phased build plan.
 - Strava sync matches existing activities by date + distance tolerance, fills missing fields
 - XLSX note parsing uses a 5-pattern regex cascade (splits/full/pace+HR/pace-only/@pattern/fallback)
 - FIT and Strava cadence for running is per-foot (half strides) — double for full strides/min
-- Enrichment waterfall: track detection → measured course → walking scrub → stride detection → pace zones
+- Enrichment waterfall: track detection → measured course → workout tagging → walking scrub → stride detection → pace zones → elapsed pace zone
 - VDOT stored in `vdot_history` table; current VDOT = most recent entry on or before activity date
 - Unstructured runs (easy/long/recovery) get pace segments from stream data; structured workouts keep FIT laps
 - Auto-enrichment runs on new FIT imports if a VDOT is set
+
+### Enrichment by Interval Type
+
+Enrichment features apply differently to manual intervals vs auto-generated pace segments:
+
+| Feature | Manual Intervals (fit_lap, strava_lap, xlsx_split) | Pace Segments (auto-generated) |
+|---|---|---|
+| Walking filter | Yes | No — instantaneous pace is unreliable due to hills, GPS noise, wind |
+| Pace zone (per-segment) | Yes | Yes (assigned at creation) |
+| Elapsed pace zone | No | Yes — overall activity pace (total dist / total time) classified by VDOT |
+| Stride detection | Yes | No |
+| Workout tagging | Yes (structured only) | No |
+| Measured course snap | Yes (structured only) | No |
+| Track detection | Yes | No |
+
+The **elapsed pace zone** provides a more accurate effort score for unstructured runs.
+Individual pace segments can appear more or less intense than the actual effort due to
+terrain (hills, wind), so the elapsed pace zone uses the overall activity pace as a
+complementary measure of true exertion.

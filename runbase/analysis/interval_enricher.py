@@ -179,7 +179,7 @@ def _get_paces_config(config: dict) -> dict:
 def _load_activity(conn, activity_id: int) -> dict | None:
     """Load activity row as a dict."""
     row = conn.execute(
-        """SELECT id, date, distance_mi, workout_category, workout_name
+        """SELECT id, date, distance_mi, duration_s, workout_category, workout_name
            FROM activities WHERE id = ?""",
         (activity_id,),
     ).fetchone()
@@ -187,7 +187,7 @@ def _load_activity(conn, activity_id: int) -> dict | None:
         return None
     return {
         "id": row[0], "date": row[1], "distance_mi": row[2],
-        "workout_category": row[3], "workout_name": row[4],
+        "duration_s": row[3], "workout_category": row[4], "workout_name": row[5],
     }
 
 
@@ -197,7 +197,7 @@ def _load_intervals(conn, activity_id: int) -> list[dict]:
         """SELECT id, rep_number, gps_measured_distance_mi, canonical_distance_mi,
                   duration_s, avg_pace_s_per_mi, avg_pace_display, avg_hr, avg_cadence,
                   is_recovery, start_timestamp_s, end_timestamp_s, source, is_race,
-                  set_number
+                  set_number, elapsed_pace_zone
            FROM intervals WHERE activity_id = ? ORDER BY rep_number""",
         (activity_id,),
     ).fetchall()
@@ -210,6 +210,7 @@ def _load_intervals(conn, activity_id: int) -> list[dict]:
             "start_timestamp_s": r[10], "end_timestamp_s": r[11], "source": r[12],
             "is_race": bool(r[13]) if r[13] else False,
             "set_number": r[14],
+            "elapsed_pace_zone": r[15],
         }
         for r in rows
     ]
@@ -706,7 +707,11 @@ def enrich_activity(conn, activity_id: int, config: dict,
             print(f"    Tagged {recovery_count} recoveries, {set_count} sets")
 
     # --- Walking scrub (Step 3) ---
+    # Skip pace segments — instantaneous pace is unreliable for walking detection
+    # due to hills, GPS noise, etc.  Use elapsed_pace_zone instead.
     for interval in intervals:
+        if interval.get("source") == "pace_segment":
+            continue
         pace = interval.get("avg_pace_s_per_mi")
         if pace and pace >= walking_threshold:
             interval["is_walking"] = True
@@ -733,6 +738,20 @@ def enrich_activity(conn, activity_id: int, config: dict,
                 interval["pace_zone"] = zone
                 summary["zones_assigned"] += 1
 
+    # --- Elapsed pace zone for pace segments (Step 5b) ---
+    # Compute overall elapsed pace (total distance / total time) and classify it.
+    # This gives a more accurate effort score for pace segments than instantaneous
+    # pace, which can be distorted by hills, GPS noise, wind, etc.
+    if boundaries:
+        total_dist = activity.get("distance_mi")
+        total_dur = activity.get("duration_s")
+        if total_dist and total_dur and total_dist > 0:
+            elapsed_pace = total_dur / total_dist
+            elapsed_zone = classify_pace(elapsed_pace, boundaries)
+            for interval in intervals:
+                if interval.get("source") == "pace_segment":
+                    interval["elapsed_pace_zone"] = elapsed_zone
+
     # --- Update intervals in DB ---
     for interval in intervals:
         conn.execute(
@@ -740,7 +759,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
                SET pace_zone = ?, is_walking = ?, is_stride = ?,
                    is_race = ?, location_type = ?, canonical_distance_mi = ?,
                    avg_pace_s_per_mi = ?, avg_pace_display = ?,
-                   is_recovery = ?, set_number = ?
+                   is_recovery = ?, set_number = ?, elapsed_pace_zone = ?
                WHERE id = ?""",
             (interval.get("pace_zone"), interval.get("is_walking", False),
              interval.get("is_stride", False), interval.get("is_race", False),
@@ -750,6 +769,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
              interval.get("avg_pace_display"),
              interval.get("is_recovery", False),
              interval.get("set_number"),
+             interval.get("elapsed_pace_zone"),
              interval["id"]),
         )
 

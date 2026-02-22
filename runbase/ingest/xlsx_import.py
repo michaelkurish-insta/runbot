@@ -75,6 +75,8 @@ def import_xlsx(config: dict, dry_run: bool = False, verbose: bool = False) -> d
     if not Path(xlsx_path).exists():
         raise FileNotFoundError(f"XLSX file not found: {xlsx_path}")
 
+    cutoff_date = (config.get("xlsx") or {}).get("cutoff_date")
+
     conn = get_connection(config)
 
     # Check if already processed
@@ -88,19 +90,31 @@ def import_xlsx(config: dict, dry_run: bool = False, verbose: bool = False) -> d
             print(f"XLSX already imported (hash match). Skipping.")
         conn.close()
         return {"new": 0, "skipped": 0, "errors": 0, "skipped_non_running": 0,
-                "parse_stats": {}, "already_imported": True}
+                "skipped_cutoff": 0, "parse_stats": {}, "already_imported": True}
 
     raw_rows = _read_xlsx(xlsx_path)
     if verbose:
         print(f"Read {len(raw_rows)} data rows from {xlsx_path}")
 
     parsed_rows, skipped_non_running, parse_stats = _parse_rows(raw_rows, verbose)
+
+    # Apply cutoff date filter
+    skipped_cutoff = 0
+    if cutoff_date:
+        before = len(parsed_rows)
+        parsed_rows = [r for r in parsed_rows if r.date <= cutoff_date]
+        skipped_cutoff = before - len(parsed_rows)
+        if verbose and skipped_cutoff:
+            print(f"Skipped {skipped_cutoff} rows after cutoff date {cutoff_date}")
+
     if verbose:
         print(f"Parsed {len(parsed_rows)} running rows, skipped {skipped_non_running} non-running")
         print(f"Parse methods: {parse_stats}")
 
     result = {"new": 0, "skipped": 0, "errors": 0,
-              "skipped_non_running": skipped_non_running, "parse_stats": parse_stats}
+              "skipped_non_running": skipped_non_running,
+              "skipped_cutoff": skipped_cutoff,
+              "parse_stats": parse_stats}
 
     for row in parsed_rows:
         try:

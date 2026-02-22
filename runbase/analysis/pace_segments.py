@@ -115,7 +115,6 @@ def segment_by_pace(streams: list[dict], boundaries: dict,
             avg_pace_display = f"{minutes}:{secs:04.1f}"
 
         zone = seg["zone"]
-        is_walking = zone == "walk"
         is_recovery = zone in ("walk", "E") and i > 0 and i < len(merged) - 1
 
         intervals.append(Interval(
@@ -128,7 +127,7 @@ def segment_by_pace(streams: list[dict], boundaries: dict,
             avg_cadence=avg_cad,
             is_recovery=is_recovery,
             pace_zone=zone if zone != "unknown" else None,
-            is_walking=is_walking,
+            is_walking=False,
             is_stride=False,
             start_timestamp_s=start_ts,
             end_timestamp_s=end_ts,
