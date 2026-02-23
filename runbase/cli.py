@@ -580,6 +580,16 @@ def cmd_pipeline(args):
           f"{strava_result['matched']} Strava matched")
 
 
+def cmd_review(args):
+    from runbase.config import load_config
+    from runbase.review.app import create_app
+
+    config = load_config()
+    app = create_app(config)
+    print(f"RunBase Review UI: http://localhost:{args.port}")
+    app.run(host="127.0.0.1", port=args.port, debug=args.debug)
+
+
 def cmd_stub(name):
     def handler(args):
         print(f"'{name}' is not yet implemented.")
@@ -673,7 +683,9 @@ def main():
     pipeline_parser.set_defaults(func=cmd_pipeline)
 
     review_parser = subparsers.add_parser("review", help="Launch the review UI")
-    review_parser.set_defaults(func=cmd_stub("review"))
+    review_parser.add_argument("-p", "--port", type=int, default=5050, help="Port (default 5050)")
+    review_parser.add_argument("--debug", action="store_true", help="Enable Flask debug mode")
+    review_parser.set_defaults(func=cmd_review)
 
     status_parser = subparsers.add_parser("status", help="Show pipeline status")
     status_parser.set_defaults(func=cmd_stub("status"))

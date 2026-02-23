@@ -159,3 +159,12 @@ class ProcessedFile:
     source: Optional[str] = None
     processed_at: Optional[str] = None
     activity_id: Optional[int] = None
+
+
+@dataclass
+class ActivityOverride:
+    id: Optional[int] = None
+    activity_id: Optional[int] = None
+    field_name: str = ""
+    override_value: str = ""
+    created_at: Optional[str] = None

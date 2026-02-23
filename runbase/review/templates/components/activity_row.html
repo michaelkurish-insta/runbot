@@ -1,0 +1,25 @@
+<tr class="activity-row month-{{ a.month_num }} week-{{ a.week_of_month }}"
+    data-id="{{ a.id }}"
+    data-activity-ids="{{ a.activity_ids | join(',') }}"
+    data-has-streams="{{ 'true' if a.has_streams else 'false' }}">
+    <td class="col-7d {{ 'ma-saturday' if a.is_saturday else 'ma-dim' }}">{{ a.seven_day_ma }}</td>
+    <td class="col-date date-cell">
+        <span class="day-name">{{ a.day_of_week }}</span>
+        <span class="date-num">{{ a.date_short }}</span>
+    </td>
+    <td class="col-dist {{ 'overridden' if 'distance_mi' in a.overridden_fields }}">{{ a.display_distance }}</td>
+    <td class="col-name {{ 'overridden' if 'workout_name' in a.overridden_fields }}">{{ a.workout_name or '' }}</td>
+    <td class="col-strides {{ 'overridden' if 'strides' in a.overridden_fields }}">{{ a.strides if a.strides else '' }}</td>
+    <td class="col-dur {{ 'overridden' if 'duration_s' in a.overridden_fields }}">{{ a.display_duration }}</td>
+    <td class="col-pace {{ 'overridden' if 'avg_pace_s_per_mi' in a.overridden_fields }}">{{ a.display_pace }}</td>
+    <td class="col-hr">{{ a.display_hr }}</td>
+    <td class="col-cad">{{ a.display_cadence }}</td>
+    <td class="col-shoe {{ 'overridden' if 'shoe_id' in a.overridden_fields }}">{{ a.shoe_name or '' }}</td>
+    <td class="col-notes {{ 'overridden' if 'notes' in a.overridden_fields }}" title="{{ a.notes or '' }}">{{ a.notes or '' }}</td>
+    <td class="col-vdot">{{ '%.1f' % a.vdot if a.vdot else '' }}</td>
+</tr>
+<tr class="detail-row" data-id="{{ a.id }}" style="display: none;">
+    <td colspan="12">
+        {% include "components/detail_panel.html" %}
+    </td>
+</tr>

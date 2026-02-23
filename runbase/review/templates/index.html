@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RunBase {{ year }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+</head>
+<body>
+    <header>
+        <h1 class="header-title">RunBase</h1>
+        <button id="btn-import" class="btn-import" title="Run import pipeline">Import</button>
+        <span id="import-status" class="import-status"></span>
+    </header>
+
+    <div class="layout">
+        <!-- ── Sidebar ──────────────────────────────────────── -->
+        <aside class="sidebar">
+            <!-- Year calendar nav -->
+            <div class="calendar-nav">
+                <a href="?year={{ year - 1 }}" class="cal-arrow">&larr;</a>
+                <span class="cal-year">{{ year }}</span>
+                <a href="?year={{ year + 1 }}" class="cal-arrow">&rarr;</a>
+            </div>
+            <div class="month-grid">
+                {% for m in range(1, 13) %}
+                <a href="#month-{{ m }}"
+                   class="month-cell {% if m in months_with_data %}has-data{% endif %}"
+                   data-month="{{ m }}">{{ month_names[m][:3] }}</a>
+                {% endfor %}
+            </div>
+
+            <!-- Year jump -->
+            <div class="year-jump">
+                {% for y in range(max_year, min_year - 1, -1) %}
+                <a href="?year={{ y }}" class="year-link {% if y == year %}active{% endif %}">{{ y }}</a>
+                {% endfor %}
+            </div>
+
+            <!-- Weekly mileage chart (prior 6 months) -->
+            <div class="weekly-chart-section">
+                <h3>Weekly Mileage</h3>
+                <canvas id="weekly-mileage-chart" height="160"></canvas>
+            </div>
+        </aside>
+
+        <!-- ── Main content ─────────────────────────────────── -->
+        <div class="main-content">
+            {% for m in range(1, 13) %}
+                {% set cal = month_calendars.get(m, []) %}
+                <div class="month-section" id="month-{{ m }}">
+                    <div class="month-header month-hdr-{{ m }}">{{ month_names[m] }}</div>
+                    <table class="grid">
+                        <thead>
+                            <tr>
+                                <th class="col-7d">7d</th>
+                                <th class="col-date">Date</th>
+                                <th class="col-dist">Dist</th>
+                                <th class="col-name">Name</th>
+                                <th class="col-strides">Str</th>
+                                <th class="col-dur">Duration</th>
+                                <th class="col-pace">Pace</th>
+                                <th class="col-hr">HR</th>
+                                <th class="col-cad">Cad</th>
+                                <th class="col-shoe">Shoe</th>
+                                <th class="col-notes">Notes</th>
+                                <th class="col-vdot">VDOT</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for day in cal %}
+                                {% if not day.blank %}
+                                    {% set a = day.activity %}
+                                    {% include "components/activity_row.html" %}
+                                {% else %}
+                                    <tr class="blank-row month-{{ m }} week-{{ day.week_of_month }}">
+                                        <td class="col-7d {{ 'ma-saturday' if day.is_saturday else 'ma-dim' }}">{{ day.seven_day_ma }}</td>
+                                        <td class="col-date date-cell">
+                                            <span class="day-name">{{ day.day_of_week }}</span>
+                                            <span class="date-num">{{ day.date_short }}</span>
+                                        </td>
+                                        <td colspan="10"></td>
+                                    </tr>
+                                {% endif %}
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <!-- ── Bottom Stats Panel ───────────────────────────────── -->
+    <footer class="stats-panel">
+        <div class="stats-inner">
+            <!-- Yearly summary cards -->
+            <div class="stats-cards">
+                <div class="stat-card">
+                    <div class="stat-value">{{ "%.1f" | format(yearly_distance) }}</div>
+                    <div class="stat-label">Miles</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{{ yearly_count }}</div>
+                    <div class="stat-label">Runs</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{{ yearly_display_duration }}</div>
+                    <div class="stat-label">Time</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{{ yearly_avg_pace }}</div>
+                    <div class="stat-label">Avg Pace</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{{ "%.1f" | format(longest_run) }}</div>
+                    <div class="stat-label">Longest</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value">{{ "%.1f" | format(max_week_dist) }}</div>
+                    <div class="stat-label">Peak Week</div>
+                </div>
+            </div>
+
+            <!-- Monthly mileage chart -->
+            <div class="monthly-chart">
+                <h3>Monthly Mileage</h3>
+                <div class="chart-bars">
+                    {% for s in monthly_stats %}
+                    <div class="chart-col">
+                        <div class="chart-value">{{ s.display_distance }}</div>
+                        <div class="chart-bar-wrap">
+                            <div class="chart-bar month-bar-{{ s.month }}"
+                                 style="height: {{ (s.distance / max_month_dist * 100) if max_month_dist else 0 }}%"></div>
+                        </div>
+                        <div class="chart-label">{{ s.name }}</div>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+
+            <!-- Monthly breakdown table -->
+            <div class="monthly-table-wrap">
+                <h3>Monthly Breakdown</h3>
+                <table class="monthly-table">
+                    <thead>
+                        <tr>
+                            <th>Month</th><th>Runs</th><th>Miles</th><th>Mi/Wk</th><th>Time</th><th>Pace</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for s in monthly_stats %}
+                        {% if s.count > 0 %}
+                        <tr>
+                            <td>{{ month_names[s.month] }}</td>
+                            <td>{{ s.count }}</td>
+                            <td>{{ s.display_distance }}</td>
+                            <td>{{ s.avg_weekly }}</td>
+                            <td>{{ s.display_duration }}</td>
+                            <td>{{ s.display_pace }}</td>
+                        </tr>
+                        {% endif %}
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </footer>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const SHOES = {{ shoes | tojson }};
+        const WEEKLY_CHART_DATA = {{ weekly_chart_data | tojson }};
+    </script>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

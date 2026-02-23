@@ -177,6 +177,16 @@ CREATE TABLE IF NOT EXISTS detected_tracks (
     created_at              TEXT DEFAULT (datetime('now'))
 );
 
+-- Manual overrides from review UI
+CREATE TABLE IF NOT EXISTS activity_overrides (
+    id              INTEGER PRIMARY KEY,
+    activity_id     INTEGER NOT NULL REFERENCES activities(id),
+    field_name      TEXT NOT NULL,
+    override_value  TEXT NOT NULL,
+    created_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(activity_id, field_name)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(date);
 CREATE INDEX IF NOT EXISTS idx_activity_sources_activity ON activity_sources(activity_id);
@@ -260,6 +270,14 @@ def _migrate_schema(conn):
             fit_score               REAL,
             detected_by_activity_id INTEGER REFERENCES activities(id),
             created_at              TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS activity_overrides (
+            id              INTEGER PRIMARY KEY,
+            activity_id     INTEGER NOT NULL REFERENCES activities(id),
+            field_name      TEXT NOT NULL,
+            override_value  TEXT NOT NULL,
+            created_at      TEXT DEFAULT (datetime('now')),
+            UNIQUE(activity_id, field_name)
         );
     """)
 
