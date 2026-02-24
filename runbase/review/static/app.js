@@ -31,6 +31,165 @@
         });
     });
 
+    // ── Double-click to edit workout name ──────────────────────
+
+    document.querySelectorAll(".activity-row .col-name").forEach(cell => {
+        cell.addEventListener("dblclick", (e) => {
+            e.stopPropagation();
+            if (cell.querySelector(".inline-edit-name")) return;
+
+            const row = cell.closest(".activity-row");
+            const id = row.dataset.id;
+            const currentValue = cell.textContent.trim();
+
+            const input = document.createElement("input");
+            input.type = "text";
+            input.className = "inline-edit-name";
+            input.value = currentValue;
+
+            cell.textContent = "";
+            cell.appendChild(input);
+            input.focus();
+            input.select();
+
+            function finish(save) {
+                const newValue = input.value.trim();
+                input.remove();
+                if (save && newValue !== currentValue) {
+                    cell.textContent = newValue;
+                    saveOverride(id, "workout_name", newValue).then(ok => {
+                        if (ok) cell.classList.add("overridden");
+                    });
+                } else {
+                    cell.textContent = currentValue;
+                }
+            }
+
+            input.addEventListener("keydown", (ev) => {
+                ev.stopPropagation();
+                if (ev.key === "Enter") finish(true);
+                if (ev.key === "Escape") finish(false);
+            });
+            input.addEventListener("blur", () => finish(true));
+        });
+    });
+
+    // ── Click future blank row → planned activity entry ────────
+
+    document.querySelectorAll(".future-row, .planned-row").forEach(row => {
+        row.addEventListener("click", (e) => {
+            if (row.querySelector(".planned-input")) return;
+            const dateStr = row.dataset.date;
+            if (!dateStr) return;
+
+            // Read existing planned values if any
+            const existingDist = row.querySelector(".planned-dist");
+            const existingName = row.querySelector(".planned-name");
+            const oldDist = existingDist ? existingDist.textContent.trim() : "";
+            const oldName = existingName ? existingName.textContent.trim() : "";
+
+            // Find the blank colspan cell or replace planned cells
+            const cells = row.querySelectorAll("td");
+            // Remove all cells after date (index 2+)
+            while (cells.length > 2 && row.children.length > 2) {
+                row.removeChild(row.lastChild);
+            }
+
+            // Create dist input cell
+            const distTd = document.createElement("td");
+            distTd.className = "col-dist";
+            const distInput = document.createElement("input");
+            distInput.type = "number";
+            distInput.step = "0.1";
+            distInput.className = "planned-input";
+            distInput.placeholder = "mi";
+            distInput.value = oldDist;
+            distTd.appendChild(distInput);
+            row.appendChild(distTd);
+
+            // Create name input cell
+            const nameTd = document.createElement("td");
+            nameTd.className = "col-name";
+            const nameInput = document.createElement("input");
+            nameInput.type = "text";
+            nameInput.className = "planned-input";
+            nameInput.placeholder = "Workout name";
+            nameInput.value = oldName;
+            nameTd.appendChild(nameInput);
+            row.appendChild(nameTd);
+
+            // Remaining colspan
+            const restTd = document.createElement("td");
+            restTd.colSpan = 9;
+            row.appendChild(restTd);
+
+            distInput.focus();
+
+            function savePlanned() {
+                const dist = distInput.value.trim();
+                const name = nameInput.value.trim();
+                if (!dist && !name) {
+                    if (oldDist || oldName) {
+                        fetch(`/api/planned/${dateStr}`, { method: "DELETE" })
+                            .then(r => r.json())
+                            .then(() => reloadToDate(dateStr));
+                    } else {
+                        restoreBlanks();
+                    }
+                    return;
+                }
+                fetch(`/api/planned/${dateStr}`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        distance_mi: dist ? parseFloat(dist) : null,
+                        workout_name: name,
+                    }),
+                }).then(r => r.json()).then(d => {
+                    if (d.ok) reloadToDate(dateStr);
+                });
+            }
+
+            function restoreBlanks() {
+                while (row.children.length > 2) row.removeChild(row.lastChild);
+                const td = document.createElement("td");
+                td.colSpan = 11;
+                row.appendChild(td);
+                row.classList.remove("planned-row");
+                if (!row.classList.contains("future-row")) row.classList.add("future-row");
+            }
+
+            [distInput, nameInput].forEach(input => {
+                input.addEventListener("keydown", (ev) => {
+                    ev.stopPropagation();
+                    if (ev.key === "Enter") savePlanned();
+                    if (ev.key === "Escape") restoreBlanks();
+                    if (ev.key === "Tab" && input === distInput) {
+                        ev.preventDefault();
+                        nameInput.focus();
+                    }
+                });
+                input.addEventListener("click", (ev) => ev.stopPropagation());
+            });
+
+            nameInput.addEventListener("blur", (ev) => {
+                // Only save on blur if focus isn't moving to the other input
+                setTimeout(() => {
+                    if (!row.contains(document.activeElement) || !document.activeElement.classList.contains("planned-input")) {
+                        savePlanned();
+                    }
+                }, 100);
+            });
+            distInput.addEventListener("blur", (ev) => {
+                setTimeout(() => {
+                    if (!row.contains(document.activeElement) || !document.activeElement.classList.contains("planned-input")) {
+                        savePlanned();
+                    }
+                }, 100);
+            });
+        });
+    });
+
     // ── Scroll spy ──────────────────────────────────────────────
 
     function updateActiveMonth() {
@@ -222,6 +381,8 @@
 
     // ── Render charts (canvas) ──────────────────────────────────
 
+    const chartRegistry = {};
+
     function renderCharts(id, paceData, hrData) {
         const section = document.getElementById(`chart-${id}`);
         if (!section) return;
@@ -233,6 +394,7 @@
                 fillColor: "rgba(74,122,181,0.15)",
                 formatY: v => { const m = Math.floor(v / 60); const s = Math.round(v % 60); return `${m}:${s < 10 ? "0" : ""}${s}`; },
                 invertY: true, // lower pace = faster = top
+                partnerId: `hr-chart-${id}`,
             });
         }
 
@@ -242,8 +404,12 @@
                 fillColor: "rgba(192,80,80,0.15)",
                 formatY: v => Math.round(v).toString(),
                 invertY: false,
+                partnerId: `pace-chart-${id}`,
             });
         }
+
+        wireChartCrosshair(`pace-chart-${id}`);
+        wireChartCrosshair(`hr-chart-${id}`);
     }
 
     function drawChart(canvasId, data, opts) {
@@ -270,7 +436,6 @@
         const values = data.map(d => d.v);
         let vMin = Math.min(...values);
         let vMax = Math.max(...values);
-        // Add 5% padding
         const vPad = (vMax - vMin) * 0.05 || 1;
         vMin -= vPad;
         vMax += vPad;
@@ -279,10 +444,9 @@
         function xPos(t) { return pad.left + ((t - tMin) / tRange) * cw; }
         function yPos(v) {
             const norm = (v - vMin) / vRange;
-            return opts.invertY
-                ? pad.top + norm * ch       // higher value (slower) at bottom
-                : pad.top + (1 - norm) * ch;
+            return opts.invertY ? pad.top + norm * ch : pad.top + (1 - norm) * ch;
         }
+        function tFromX(x) { return tMin + ((x - pad.left) / cw) * tRange; }
 
         // Fill
         ctx.beginPath();
@@ -315,7 +479,6 @@
             const v = vMin + (vRange * i) / ySteps;
             const y = yPos(v);
             ctx.fillText(opts.formatY(v), pad.left - 4, y + 3);
-            // Grid line
             ctx.beginPath();
             ctx.moveTo(pad.left, y);
             ctx.lineTo(w - pad.right, y);
@@ -334,6 +497,160 @@
             const x = xPos(t);
             ctx.fillText(`${min}m`, x, h - 4);
         }
+
+        // Save clean image and metadata for crosshair overlay
+        const cleanImage = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        chartRegistry[canvasId] = {
+            data, opts, canvas, cleanImage, dpr,
+            xPos, yPos, tFromX,
+            pad, w, h, tMin, tMax, tRange,
+        };
+    }
+
+    function drawCrosshair(canvasId, time, frozen) {
+        const reg = chartRegistry[canvasId];
+        if (!reg) return;
+        const { data, opts, canvas, cleanImage, dpr, xPos, yPos, pad, w, h } = reg;
+        const ctx = canvas.getContext("2d");
+
+        // Restore clean chart (putImageData ignores transform, writes raw pixels)
+        ctx.putImageData(cleanImage, 0, 0);
+        // Set transform absolutely to DPR scale (don't stack on existing)
+        ctx.save();
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        // Find nearest data point to time
+        let nearest = data[0];
+        let minDiff = Infinity;
+        for (const d of data) {
+            const diff = Math.abs(d.t - time);
+            if (diff < minDiff) { minDiff = diff; nearest = d; }
+        }
+
+        const x = xPos(nearest.t);
+        const y = yPos(nearest.v);
+
+        // Vertical time line
+        ctx.beginPath();
+        ctx.moveTo(x, pad.top);
+        ctx.lineTo(x, h - pad.bottom);
+        ctx.strokeStyle = "rgba(0,0,0,0.2)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Dot on curve
+        ctx.beginPath();
+        ctx.arc(x, y, frozen ? 5 : 4, 0, Math.PI * 2);
+        ctx.fillStyle = opts.color;
+        ctx.fill();
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        // Value + time label (only when frozen)
+        if (frozen) {
+            const min = Math.floor((nearest.t - data[0].t) / 60);
+            const sec = Math.round((nearest.t - data[0].t) % 60);
+            const label = `${opts.formatY(nearest.v)}  ${min}:${sec < 10 ? "0" : ""}${sec}`;
+
+            ctx.font = "bold 10px -apple-system, sans-serif";
+            const metrics = ctx.measureText(label);
+            const lw = metrics.width + 8;
+            const lh = 16;
+            let lx = x + 8;
+            if (lx + lw > w - pad.right) lx = x - lw - 8;
+            let ly = y - lh - 4;
+            if (ly < pad.top) ly = y + 8;
+
+            ctx.fillStyle = "rgba(255,255,255,0.92)";
+            ctx.strokeStyle = "rgba(0,0,0,0.15)";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            if (ctx.roundRect) {
+                ctx.roundRect(lx, ly, lw, lh, 3);
+            } else {
+                ctx.rect(lx, ly, lw, lh);
+            }
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle = "#333";
+            ctx.textAlign = "left";
+            ctx.fillText(label, lx + 4, ly + 12);
+        }
+
+        ctx.restore();
+    }
+
+    function wireChartCrosshair(canvasId) {
+        const reg = chartRegistry[canvasId];
+        if (!reg) return;
+        const { canvas, tFromX } = reg;
+        let tracking = false;
+        let frozenTime = null;
+
+        function getTime(e) {
+            const rect = canvas.getBoundingClientRect();
+            return tFromX(e.clientX - rect.left);
+        }
+
+        canvas.addEventListener("mousedown", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (frozenTime !== null) {
+                // Clear existing frozen crosshair, start fresh
+                frozenTime = null;
+            }
+            tracking = true;
+            const time = getTime(e);
+            drawCrosshair(canvasId, time, false);
+            syncPartner(canvasId, time, false);
+        });
+
+        canvas.addEventListener("mousemove", (e) => {
+            if (!tracking) return;
+            const time = getTime(e);
+            drawCrosshair(canvasId, time, false);
+            syncPartner(canvasId, time, false);
+        });
+
+        canvas.addEventListener("mouseup", (e) => {
+            if (!tracking) return;
+            tracking = false;
+            const time = getTime(e);
+            frozenTime = time;
+            drawCrosshair(canvasId, time, true);
+            syncPartner(canvasId, time, true);
+        });
+
+        // If mouse leaves during drag, freeze at last position
+        canvas.addEventListener("mouseleave", (e) => {
+            if (tracking) {
+                tracking = false;
+                const time = getTime(e);
+                frozenTime = time;
+                drawCrosshair(canvasId, time, true);
+                syncPartner(canvasId, time, true);
+            }
+        });
+    }
+
+    function syncPartner(canvasId, time, frozen) {
+        const reg = chartRegistry[canvasId];
+        if (!reg || !reg.opts.partnerId) return;
+        const partnerId = reg.opts.partnerId;
+        if (chartRegistry[partnerId]) {
+            drawCrosshair(partnerId, time, frozen);
+        }
+    }
+
+    function clearCrosshair(canvasId) {
+        const reg = chartRegistry[canvasId];
+        if (!reg) return;
+        const ctx = reg.canvas.getContext("2d");
+        ctx.putImageData(reg.cleanImage, 0, 0);
     }
 
     // ── Render map ──────────────────────────────────────────────
@@ -606,9 +923,17 @@
                                 importBtn.disabled = false;
                                 importBtn.textContent = "Import";
                                 if (s.success) {
-                                    importStatus.textContent = "Done!";
-                                    importStatus.className = "import-status success";
-                                    setTimeout(() => location.reload(), 1500);
+                                    // Parse "Pipeline complete: N new activities" from output
+                                    const match = s.output.match(/(\d+) new activit/);
+                                    const newCount = match ? parseInt(match[1], 10) : 0;
+                                    if (newCount > 0) {
+                                        importStatus.textContent = `Done! ${newCount} new`;
+                                        importStatus.className = "import-status success";
+                                        setTimeout(() => location.reload(), 1500);
+                                    } else {
+                                        importStatus.textContent = "No new activities";
+                                        importStatus.className = "import-status success";
+                                    }
                                 } else {
                                     importStatus.textContent = "Failed";
                                     importStatus.className = "import-status error";
@@ -624,6 +949,40 @@
                     importStatus.textContent = "Error";
                 });
         });
+    }
+
+    // ── Scroll helpers ─────────────────────────────────────────
+
+    function scrollToDate(targetDate) {
+        if (!mainContent) return;
+        const allRows = mainContent.querySelectorAll("[data-date]");
+        let best = null;
+        let bestDiff = Infinity;
+        for (const row of allRows) {
+            const d = row.dataset.date;
+            if (!d) continue;
+            const diff = Math.abs(Date.parse(d) - Date.parse(targetDate));
+            if (diff < bestDiff) { bestDiff = diff; best = row; }
+        }
+        if (best) best.scrollIntoView({ block: "center" });
+    }
+
+    function reloadToDate(dateStr) {
+        // Preserve scroll position by storing target date, then reload
+        sessionStorage.setItem("runbase_scroll_to", dateStr);
+        location.reload();
+    }
+
+    // On load: scroll to stored date (from reload) or current week
+    const scrollTarget = sessionStorage.getItem("runbase_scroll_to");
+    if (scrollTarget) {
+        sessionStorage.removeItem("runbase_scroll_to");
+        scrollToDate(scrollTarget);
+    } else if (mainContent) {
+        const today = new Date();
+        const weekAgo = new Date(today);
+        weekAgo.setDate(weekAgo.getDate() - 7);
+        scrollToDate(weekAgo.toISOString().slice(0, 10));
     }
 
 })();

@@ -187,6 +187,15 @@ CREATE TABLE IF NOT EXISTS activity_overrides (
     UNIQUE(activity_id, field_name)
 );
 
+-- Planned activities (future dates)
+CREATE TABLE IF NOT EXISTS planned_activities (
+    id              INTEGER PRIMARY KEY,
+    date            TEXT NOT NULL UNIQUE,
+    distance_mi     REAL,
+    workout_name    TEXT,
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(date);
 CREATE INDEX IF NOT EXISTS idx_activity_sources_activity ON activity_sources(activity_id);
@@ -278,6 +287,13 @@ def _migrate_schema(conn):
             override_value  TEXT NOT NULL,
             created_at      TEXT DEFAULT (datetime('now')),
             UNIQUE(activity_id, field_name)
+        );
+        CREATE TABLE IF NOT EXISTS planned_activities (
+            id              INTEGER PRIMARY KEY,
+            date            TEXT NOT NULL UNIQUE,
+            distance_mi     REAL,
+            workout_name    TEXT,
+            created_at      TEXT DEFAULT (datetime('now'))
         );
     """)
 

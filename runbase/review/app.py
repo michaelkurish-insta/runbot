@@ -95,7 +95,34 @@ def create_app(config=None):
         first_day_offset = (first.weekday() + 1) % 7  # Mon=0..Sun=6 → Sun=0..Sat=6
         return ((dt.day - 1 + first_day_offset) // 7) + 1
 
-    def _build_activity(r, overrides_map, shoes, has_streams_set):
+    ZONE_PRIORITY = {"FR": 6, "R": 5, "I": 4, "T": 3, "M": 2, "E": 1}
+
+    def _get_workout_types(conn, activity_ids):
+        """Get predominant pace zone per activity from qualifying intervals."""
+        if not activity_ids:
+            return {}
+        placeholders = ",".join("?" * len(activity_ids))
+        rows = conn.execute(
+            f"""SELECT activity_id, pace_zone
+                FROM intervals
+                WHERE activity_id IN ({placeholders})
+                  AND pace_zone IS NOT NULL
+                  AND NOT is_recovery
+                  AND NOT is_walking
+                  AND (source IS NULL OR source != 'pace_segment')""",
+            activity_ids,
+        ).fetchall()
+        # Pick highest-priority zone per activity
+        result = {}
+        for r in rows:
+            aid = r["activity_id"]
+            zone = r["pace_zone"]
+            prio = ZONE_PRIORITY.get(zone, 0)
+            if prio > ZONE_PRIORITY.get(result.get(aid, ""), 0):
+                result[aid] = zone
+        return result
+
+    def _build_activity(r, overrides_map, shoes, has_streams_set, workout_types):
         a = dict(r)
         ovr = overrides_map.get(a["id"], {})
         overridden = _apply_overrides(a, ovr)
@@ -109,6 +136,7 @@ def create_app(config=None):
         a["shoe_name"] = shoes.get(a.get("shoe_id"), "")
         a["has_streams"] = a["id"] in has_streams_set
         a["overridden_fields"] = list(overridden)
+        a["workout_type_zone"] = workout_types.get(a["id"], "")
 
         dt = datetime.strptime(a["date"], "%Y-%m-%d")
         a["day_of_week"] = dt.strftime("%a")
@@ -149,6 +177,14 @@ def create_app(config=None):
         merged["has_streams"] = any(a["has_streams"] for a in day_acts)
         merged["overridden_fields"] = list(set().union(*(a["overridden_fields"] for a in day_acts)))
 
+        # Pick highest-priority workout type zone across all activities
+        best_zone = ""
+        for a in day_acts:
+            z = a.get("workout_type_zone", "")
+            if ZONE_PRIORITY.get(z, 0) > ZONE_PRIORITY.get(best_zone, 0):
+                best_zone = z
+        merged["workout_type_zone"] = best_zone
+
         # Collect names if multiple
         names = [a.get("workout_name") or "" for a in day_acts if a.get("workout_name")]
         if len(names) > 1:
@@ -172,6 +208,7 @@ def create_app(config=None):
     def index():
         year = request.args.get("year", type=int, default=date.today().year)
         conn = get_db()
+        today = date.today()
 
         start = f"{year}-01-01"
         end = f"{year}-12-31"
@@ -211,18 +248,33 @@ def create_app(config=None):
             ).fetchall()
             has_streams = {r["activity_id"] for r in stream_rows}
 
+        workout_types = _get_workout_types(conn, activity_ids)
+
+        # Fetch planned activities for the year (used in blank calendar rows + 7d MA)
+        planned_rows = conn.execute(
+            "SELECT date, distance_mi, workout_name FROM planned_activities "
+            "WHERE date BETWEEN ? AND ?",
+            (start, end),
+        ).fetchall()
+        planned_map = {r["date"]: dict(r) for r in planned_rows}
+
         # Build activities grouped by date
         activities = []
         months_with_data = set()
         by_date = {}
         for r in rows:
-            a = _build_activity(r, overrides_map, shoes, has_streams)
+            a = _build_activity(r, overrides_map, shoes, has_streams, workout_types)
             activities.append(a)
             months_with_data.add(a["month_num"])
             by_date.setdefault(a["date"], []).append(a)
             # Accumulate daily distances for 7d MA
             dist = a.get("adjusted_distance_mi") or a.get("distance_mi") or 0
             daily_dist[a["date"]] = daily_dist.get(a["date"], 0) + dist
+
+        # Add planned distances to daily_dist for 7d MA (only for dates without real activities)
+        for p_date, p_data in planned_map.items():
+            if p_date not in by_date and p_data.get("distance_mi"):
+                daily_dist[p_date] = daily_dist.get(p_date, 0) + p_data["distance_mi"]
 
         # Build full calendar: one row per day (merged if multiple activities)
         month_calendars = {}
@@ -250,14 +302,18 @@ def create_app(config=None):
                     merged["is_saturday"] = is_saturday
                     cal.append({"blank": False, "activity": merged})
                 else:
+                    planned = planned_map.get(date_str)
                     cal.append({
                         "blank": True,
+                        "date_str": date_str,
                         "day_of_week": dt.strftime("%a"),
                         "date_short": dt.strftime("%-m/%-d"),
                         "month_num": m,
                         "week_of_month": wom,
                         "seven_day_ma": ma_display,
                         "is_saturday": is_saturday,
+                        "planned": planned,
+                        "is_future": dt >= today,
                     })
             month_calendars[m] = cal
 
@@ -294,7 +350,6 @@ def create_app(config=None):
         longest_run = 0.0
         max_week_dist = 0.0
 
-        today = date.today()
         for m in range(1, 13):
             month_acts = [day["activity"] for day in month_calendars.get(m, []) if not day["blank"]]
             dist = sum((a.get("adjusted_distance_mi") or a.get("distance_mi") or 0) for a in month_acts)
@@ -345,7 +400,6 @@ def create_app(config=None):
         yearly_avg_pace = (yearly_duration / yearly_distance) if yearly_distance > 0 else None
 
         # ── Weekly mileage chart data (prior 6 months) ──────────────
-        today = date.today()
         chart_start = (today - timedelta(days=180)).isoformat()
         chart_end = today.isoformat()
         chart_rows = conn.execute(
@@ -638,6 +692,41 @@ def create_app(config=None):
         conn.commit()
         conn.close()
         return jsonify({"ok": True, "interval_id": interval_id, "is_walking": is_walking})
+
+    # ── Planned activities ─────────────────────────────────────────
+
+    @app.route("/api/planned/<date_str>", methods=["POST"])
+    def api_save_planned(date_str):
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+        distance_mi = data.get("distance_mi")
+        workout_name = data.get("workout_name", "")
+        if distance_mi is not None:
+            try:
+                distance_mi = float(distance_mi)
+            except (ValueError, TypeError):
+                distance_mi = None
+        conn = get_db()
+        conn.execute(
+            """INSERT INTO planned_activities (date, distance_mi, workout_name)
+               VALUES (?, ?, ?)
+               ON CONFLICT(date) DO UPDATE SET
+                   distance_mi = excluded.distance_mi,
+                   workout_name = excluded.workout_name""",
+            (date_str, distance_mi, workout_name),
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "date": date_str, "distance_mi": distance_mi, "workout_name": workout_name})
+
+    @app.route("/api/planned/<date_str>", methods=["DELETE"])
+    def api_delete_planned(date_str):
+        conn = get_db()
+        conn.execute("DELETE FROM planned_activities WHERE date = ?", (date_str,))
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "date": date_str})
 
     # ── Import pipeline ─────────────────────────────────────────────
 

@@ -236,6 +236,7 @@ header {
 .col-date    { width: 75px; }
 .col-dist    { width: 58px; text-align: right; }
 .col-name    { width: 130px; }
+.col-type    { width: 32px; text-align: center; font-weight: 700; font-size: 11px; }
 .col-strides { width: 35px; text-align: right; }
 .col-dur     { width: 62px; text-align: right; }
 .col-pace    { width: 55px; text-align: right; }
@@ -290,6 +291,41 @@ header {
 
 .blank-row .date-cell .day-name { color: #ccc; }
 .blank-row .date-cell .date-num { color: #ccc; }
+
+/* Planned activity rows — keep date cell normal, tint the rest */
+.planned-row td:not(.col-7d):not(.col-date) { background: #fefdf5 !important; }
+.planned-dist { color: #b8960a; font-style: italic; }
+.planned-name { color: #b8960a; font-style: italic; }
+
+/* Future blank rows are clickable */
+.future-row { cursor: pointer; }
+.future-row:hover td { background: #f5f3e8 !important; }
+
+/* Inline inputs for planned entry */
+.planned-input {
+    width: 100%;
+    border: 1px solid #d4c880;
+    border-radius: 2px;
+    padding: 1px 4px;
+    font-size: 12px;
+    font-family: inherit;
+    background: #fefdf5;
+    outline: none;
+}
+.planned-input:focus { border-color: #b8960a; box-shadow: 0 0 0 2px rgba(184,150,10,0.15); }
+
+/* Inline edit for workout name */
+.inline-edit-name {
+    width: 100%;
+    border: 1px solid #4a7ab5;
+    border-radius: 2px;
+    padding: 1px 4px;
+    font-size: 13px;
+    font-family: inherit;
+    background: #fff;
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(74,122,181,0.2);
+}
 
 /* Override indicator */
 .overridden { font-style: italic; position: relative; }
@@ -535,6 +571,7 @@ header {
     background: #fff;
     border: 1px solid #ddd;
     border-radius: 4px;
+    cursor: crosshair;
 }
 
 /* Notes display */

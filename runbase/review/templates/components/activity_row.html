@@ -1,5 +1,6 @@
 <tr class="activity-row month-{{ a.month_num }} week-{{ a.week_of_month }}"
     data-id="{{ a.id }}"
+    data-date="{{ a.date }}"
     data-activity-ids="{{ a.activity_ids | join(',') }}"
     data-has-streams="{{ 'true' if a.has_streams else 'false' }}">
     <td class="col-7d {{ 'ma-saturday' if a.is_saturday else 'ma-dim' }}">{{ a.seven_day_ma }}</td>
@@ -9,6 +10,7 @@
     </td>
     <td class="col-dist {{ 'overridden' if 'distance_mi' in a.overridden_fields }}">{{ a.display_distance }}</td>
     <td class="col-name {{ 'overridden' if 'workout_name' in a.overridden_fields }}">{{ a.workout_name or '' }}</td>
+    <td class="col-type {{ 'zone-' + a.workout_type_zone if a.workout_type_zone }}">{{ a.workout_type_zone or '' }}</td>
     <td class="col-strides {{ 'overridden' if 'strides' in a.overridden_fields }}">{{ a.strides if a.strides else '' }}</td>
     <td class="col-dur {{ 'overridden' if 'duration_s' in a.overridden_fields }}">{{ a.display_duration }}</td>
     <td class="col-pace {{ 'overridden' if 'avg_pace_s_per_mi' in a.overridden_fields }}">{{ a.display_pace }}</td>
@@ -19,7 +21,7 @@
     <td class="col-vdot">{{ '%.1f' % a.vdot if a.vdot else '' }}</td>
 </tr>
 <tr class="detail-row" data-id="{{ a.id }}" style="display: none;">
-    <td colspan="12">
+    <td colspan="13">
         {% include "components/detail_panel.html" %}
     </td>
 </tr>
