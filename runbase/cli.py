@@ -561,23 +561,61 @@ def cmd_pipeline(args):
     if verbose or strava_result["matched"]:
         print(f"  {strava_result['matched']} matched, {strava_result['fields_filled']} fields filled")
 
-    # Step 3: Enrich new activities
-    if new_activity_ids:
+    # Step 2b: Lightweight reconcile — link orphaned Strava sources to activities
+    if verbose:
+        print("\n=== Reconcile ===")
+    from runbase.reconcile.matcher import find_strava_match
+    from runbase.reconcile.enricher import enrich_from_strava
+
+    conn = get_connection(config)
+    _migrate_schema(conn)
+    rows = conn.execute(
+        """SELECT a.id, a.date, a.distance_mi
+           FROM activities a
+           WHERE NOT EXISTS (
+               SELECT 1 FROM activity_sources s
+               WHERE s.activity_id = a.id AND s.source = 'strava'
+           )
+           ORDER BY a.date"""
+    ).fetchall()
+
+    reconciled_ids = []
+    for r in rows:
+        activity_id, date, distance_mi = r
+        match = find_strava_match(conn, date, distance_mi)
+        if not match:
+            continue
+        result = enrich_from_strava(conn, activity_id, match, verbose=verbose)
+        conn.commit()
+        reconciled_ids.append(activity_id)
         if verbose:
-            print(f"\n=== Enriching {len(new_activity_ids)} new activities ===")
-        conn = get_connection(config)
-        _migrate_schema(conn)
+            strava_name = match.get("strava_name", "")
+            print(f"  MATCH activity #{activity_id} ({date}, {distance_mi:.2f}mi) "
+                  f'← Strava "{strava_name}"')
+
+    if verbose or reconciled_ids:
+        print(f"  {len(reconciled_ids)} reconciled from {len(rows)} unlinked")
+
+    # Include reconciled activities in the enrichment pass
+    enrich_ids = list(set(new_activity_ids + reconciled_ids))
+
+    # Step 3: Enrich new + reconciled activities
+    if enrich_ids:
+        if verbose:
+            print(f"\n=== Enriching {len(enrich_ids)} activities ===")
         from runbase.analysis.interval_enricher import enrich_activity
 
-        for aid in new_activity_ids:
+        for aid in enrich_ids:
             enrich_activity(conn, aid, config, verbose=verbose)
-        conn.close()
     elif verbose:
         print("\n  No new activities to enrich.")
 
+    conn.close()
+
     # Summary
-    print(f"\nPipeline complete: {icloud_result['new']} new activities, "
-          f"{strava_result['matched']} Strava matched")
+    print(f"\nPipeline complete: {icloud_result['new']} new, "
+          f"{strava_result['matched']} Strava matched, "
+          f"{len(reconciled_ids)} reconciled")
 
 
 def cmd_review(args):
