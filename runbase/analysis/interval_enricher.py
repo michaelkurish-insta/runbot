@@ -824,22 +824,32 @@ def enrich_activity(conn, activity_id: int, config: dict,
     # When both NULL-source (FIT) and strava_lap intervals exist for the same
     # reps, prefer strava_lap to avoid double-counting.
     segment_intervals = [i for i in intervals if i.get("source") == "pace_segment"]
-    if segment_intervals:
+    seg_total = sum(i.get("gps_measured_distance_mi") or 0 for i in segment_intervals)
+    act_dist = activity.get("distance_mi") or 0
+    # Only use pace_segments for adjusted distance when they cover most of the
+    # activity.  Group-matched activities may have streams (and thus pace
+    # segments) for only some sub-activities, producing a fraction of the real
+    # distance.  In that case fall back to strava_laps / original distance.
+    seg_ratio = (seg_total / act_dist) if act_dist > 0 else 0
+    if segment_intervals and 0.7 <= seg_ratio <= 1.15:
         distance_intervals = segment_intervals
     else:
+        # Exclude pace_segments — they only cover part of the activity
+        non_seg = [i for i in intervals if i.get("source") != "pace_segment"]
         # Deduplicate: if both NULL-source and strava_lap exist, use strava_lap
-        has_null = any(i.get("source") is None for i in intervals)
-        has_strava = any(i.get("source") == "strava_lap" for i in intervals)
+        has_null = any(i.get("source") is None for i in non_seg)
+        has_strava = any(i.get("source") == "strava_lap" for i in non_seg)
         if has_null and has_strava:
-            distance_intervals = [i for i in intervals if i.get("source") == "strava_lap"]
+            distance_intervals = [i for i in non_seg if i.get("source") == "strava_lap"]
         else:
-            distance_intervals = intervals
+            distance_intervals = non_seg if non_seg else intervals
     non_walking_distance = sum(
         i.get("gps_measured_distance_mi") or 0
         for i in distance_intervals
         if not i.get("is_walking")
     )
-    if segment_intervals:
+    used_segments = distance_intervals is segment_intervals
+    if used_segments:
         stride_distance = sum(
             i.get("gps_measured_distance_mi") or 0
             for i in intervals
@@ -848,7 +858,32 @@ def enrich_activity(conn, activity_id: int, config: dict,
         non_walking_distance += stride_distance
     adjusted_distance = round(non_walking_distance, 2) if distance_intervals else activity["distance_mi"]
 
-    # --- Store VDOT + adjusted distance on activity ---
+    # --- Fix duration for multi-source activities (Step 6b) ---
+    # Group-matched activities may have duration_s from only one sub-activity.
+    # Recompute as the sum of all Strava source durations when that sum exceeds
+    # the stored value (i.e. the stored value is partial or zero).
+    src_dur_row = conn.execute(
+        """SELECT SUM(duration_s) FROM activity_sources
+           WHERE activity_id = ? AND source = 'strava' AND duration_s > 0""",
+        (activity_id,),
+    ).fetchone()
+    src_dur_sum = src_dur_row[0] if src_dur_row and src_dur_row[0] else 0
+    act_dur = activity.get("duration_s") or 0
+    if src_dur_sum > act_dur * 1.1:
+        act_dur = src_dur_sum
+
+    # Recompute avg pace from (possibly corrected) duration and adjusted distance
+    if adjusted_distance and adjusted_distance > 0 and act_dur > 0:
+        avg_pace = act_dur / adjusted_distance
+        # Round to 1 decimal before formatting to avoid :60.0 from rounding 59.9x
+        tenths = round(avg_pace * 10)
+        mins, secs_tenths = divmod(tenths, 600)
+        avg_pace_display = f"{mins}:{secs_tenths / 10:04.1f}"
+    else:
+        avg_pace = activity.get("avg_pace_s_per_mi")
+        avg_pace_display = None
+
+    # --- Store VDOT + adjusted distance + pace on activity ---
     # Respect manual distance overrides from the GUI — they are canonical.
     has_dist_override = conn.execute(
         "SELECT 1 FROM activity_overrides WHERE activity_id = ? AND field_name = 'distance_mi'",
@@ -856,13 +891,16 @@ def enrich_activity(conn, activity_id: int, config: dict,
     ).fetchone()
     if has_dist_override:
         conn.execute(
-            "UPDATE activities SET vdot = ? WHERE id = ?",
-            (vdot, activity_id),
+            "UPDATE activities SET vdot = ?, duration_s = ?, "
+            "avg_pace_s_per_mi = ?, avg_pace_display = ? WHERE id = ?",
+            (vdot, act_dur or activity.get("duration_s"), avg_pace, avg_pace_display, activity_id),
         )
     else:
         conn.execute(
-            "UPDATE activities SET adjusted_distance_mi = ?, vdot = ? WHERE id = ?",
-            (adjusted_distance, vdot, activity_id),
+            "UPDATE activities SET adjusted_distance_mi = ?, vdot = ?, duration_s = ?, "
+            "avg_pace_s_per_mi = ?, avg_pace_display = ? WHERE id = ?",
+            (adjusted_distance, vdot, act_dur or activity.get("duration_s"),
+             avg_pace, avg_pace_display, activity_id),
         )
 
     conn.commit()
