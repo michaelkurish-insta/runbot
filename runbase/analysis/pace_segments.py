@@ -20,6 +20,7 @@ def is_structured(activity: dict) -> bool:
     - workout_category is a structured type
     - It has intervals from XLSX splits (source='xlsx_split')
     - Strava workout_type = 3
+    - FIT/Strava laps show a workout-like bimodal pace pattern (fast reps + slow recovery)
     """
     category = (activity.get("workout_category") or "").lower()
     if category in STRUCTURED_CATEGORIES:
@@ -29,6 +30,9 @@ def is_structured(activity: dict) -> bool:
         return True
 
     if activity.get("strava_workout_type") == 3:
+        return True
+
+    if activity.get("has_workout_fit_laps"):
         return True
 
     return False

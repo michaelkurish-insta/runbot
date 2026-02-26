@@ -32,7 +32,7 @@ def create_app(config=None):
 
     OVERRIDABLE_FIELDS = {
         "distance_mi", "duration_s", "avg_pace_s_per_mi", "workout_name",
-        "workout_category", "shoe_id", "notes", "strides",
+        "workout_category", "shoe_id", "notes", "strides", "workout_type_zone",
     }
 
     MONTH_NAMES = [
@@ -57,10 +57,23 @@ def create_app(config=None):
         m, s = divmod(total, 60)
         return f"{m}:{s:02d}"
 
+    def _format_duration_precise(seconds):
+        """Format duration with tenths of a second (for interval detail)."""
+        if seconds is None:
+            return ""
+        total = int(seconds)
+        tenths = round((seconds - total) * 10) % 10
+        if total >= 3600:
+            h, rem = divmod(total, 3600)
+            m, s = divmod(rem, 60)
+            return f"{h}:{m:02d}:{s:02d}.{tenths}"
+        m, s = divmod(total, 60)
+        return f"{m}:{s:02d}.{tenths}"
+
     def _apply_overrides(activity_dict, overrides):
         overridden = set()
         for field_name, value in overrides.items():
-            if field_name in activity_dict:
+            if field_name in activity_dict or field_name in OVERRIDABLE_FIELDS:
                 overridden.add(field_name)
                 if field_name in ("distance_mi", "duration_s", "avg_pace_s_per_mi"):
                     activity_dict[field_name] = float(value)
@@ -136,7 +149,7 @@ def create_app(config=None):
         a["shoe_name"] = shoes.get(a.get("shoe_id"), "")
         a["has_streams"] = a["id"] in has_streams_set
         a["overridden_fields"] = list(overridden)
-        a["workout_type_zone"] = workout_types.get(a["id"], "")
+        a["workout_type_zone"] = ovr.get("workout_type_zone", workout_types.get(a["id"], ""))
 
         dt = datetime.strptime(a["date"], "%Y-%m-%d")
         a["day_of_week"] = dt.strftime("%a")
@@ -440,6 +453,10 @@ def create_app(config=None):
 
         conn.close()
 
+        # Cache bust key: max mtime of static files
+        static_dir = Path(__file__).parent / "static"
+        cache_bust = int(max(f.stat().st_mtime for f in static_dir.iterdir() if f.is_file()))
+
         return render_template(
             "index.html",
             activities=activities,
@@ -461,6 +478,7 @@ def create_app(config=None):
             max_year=max_year,
             shoes=shoes,
             weekly_chart_data=weekly_chart_data,
+            cache_bust=cache_bust,
         )
 
     @app.route("/api/activities")
@@ -491,7 +509,7 @@ def create_app(config=None):
             iv["display_distance"] = f"{dist:.2f}mi"
         else:
             iv["display_distance"] = ""
-        iv["display_duration"] = _format_duration(iv.get("duration_s"))
+        iv["display_duration"] = _format_duration_precise(iv.get("duration_s"))
         iv["display_pace"] = _format_pace(iv.get("avg_pace_s_per_mi"))
         iv["display_hr"] = f"{iv['avg_hr']:.0f}" if iv.get("avg_hr") else ""
         iv["display_cadence"] = f"{iv['avg_cadence']:.0f}" if iv.get("avg_cadence") else ""
@@ -551,7 +569,7 @@ def create_app(config=None):
             summary.append({
                 "distance": label,
                 "count": len(ivs),
-                "avg_duration": _format_duration(sum(durations) / len(durations)) if durations else "",
+                "avg_duration": _format_duration_precise(sum(durations) / len(durations)) if durations else "",
                 "avg_pace": _format_pace(sum(paces) / len(paces)) if paces else "",
                 "avg_hr": f"{sum(hrs) / len(hrs):.0f}" if hrs else "",
             })
@@ -653,9 +671,22 @@ def create_app(config=None):
                              created_at = datetime('now')""",
             (activity_id, field, str(value)),
         )
+        # Sync distance override to activities table so aggregates reflect it
+        if field == "distance_mi":
+            dist = float(value)
+            conn.execute(
+                "UPDATE activities SET distance_mi = ?, adjusted_distance_mi = ? WHERE id = ?",
+                (dist, dist, activity_id),
+            )
         conn.commit()
+
+        # Return the activity date so JS can refresh aggregates
+        row = conn.execute("SELECT date FROM activities WHERE id = ?", (activity_id,)).fetchone()
         conn.close()
-        return jsonify({"ok": True, "activity_id": activity_id, "field": field, "value": value})
+        return jsonify({
+            "ok": True, "activity_id": activity_id, "field": field, "value": value,
+            "date": row["date"] if row else None,
+        })
 
     @app.route("/api/interval/<int:interval_id>/walking", methods=["PUT"])
     def api_toggle_walking(interval_id):
@@ -675,14 +706,26 @@ def create_app(config=None):
         ).fetchone()
         if row:
             aid = row["activity_id"]
-            # Sum non-walking interval distances
+            # Sum non-walking interval distances, avoiding double-count
+            # when both NULL-source (FIT) and strava_lap exist
+            has_both = conn.execute(
+                """SELECT COUNT(DISTINCT CASE WHEN source IS NULL THEN 1 END) as has_null,
+                          COUNT(DISTINCT CASE WHEN source = 'strava_lap' THEN 1 END) as has_strava
+                   FROM intervals WHERE activity_id = ?
+                     AND (source IS NULL OR source = 'strava_lap')""",
+                (aid,),
+            ).fetchone()
+            if has_both["has_null"] and has_both["has_strava"]:
+                source_filter = "AND source = 'strava_lap'"
+            else:
+                source_filter = "AND (source IS NULL OR source != 'pace_segment')"
             total = conn.execute(
-                """SELECT COALESCE(SUM(
+                f"""SELECT COALESCE(SUM(
                        COALESCE(canonical_distance_mi, gps_measured_distance_mi, prescribed_distance_mi, 0)
                    ), 0) as total
                    FROM intervals
                    WHERE activity_id = ? AND NOT is_walking
-                     AND (source IS NULL OR source != 'pace_segment')""",
+                     {source_filter}""",
                 (aid,),
             ).fetchone()["total"]
             conn.execute(
@@ -727,6 +770,123 @@ def create_app(config=None):
         conn.commit()
         conn.close()
         return jsonify({"ok": True, "date": date_str})
+
+    @app.route("/api/seven_day_ma")
+    def api_seven_day_ma():
+        """Return 7d trailing mileage for a date range, including planned."""
+        start = request.args.get("start")
+        end = request.args.get("end")
+        if not start or not end:
+            return jsonify({"error": "start and end required"}), 400
+
+        # Fetch 7 days before start for trailing window
+        window_start = (date.fromisoformat(start) - timedelta(days=7)).isoformat()
+        conn = get_db()
+
+        # Real activity distances
+        rows = conn.execute(
+            """SELECT date, COALESCE(adjusted_distance_mi, distance_mi, 0) as dist
+               FROM activities WHERE date BETWEEN ? AND ?""",
+            (window_start, end),
+        ).fetchall()
+        daily = {}
+        for r in rows:
+            daily[r["date"]] = daily.get(r["date"], 0) + r["dist"]
+
+        # Planned distances (only for dates without real activities)
+        planned = conn.execute(
+            "SELECT date, distance_mi FROM planned_activities WHERE date BETWEEN ? AND ?",
+            (window_start, end),
+        ).fetchall()
+        act_dates = set(daily.keys())
+        for r in planned:
+            if r["date"] not in act_dates and r["distance_mi"]:
+                daily[r["date"]] = daily.get(r["date"], 0) + r["distance_mi"]
+        conn.close()
+
+        # Compute 7d MA for each day in requested range
+        result = {}
+        d = date.fromisoformat(start)
+        end_d = date.fromisoformat(end)
+        while d <= end_d:
+            total = 0.0
+            for offset in range(7):
+                dd = (d - timedelta(days=offset)).isoformat()
+                total += daily.get(dd, 0)
+            result[d.isoformat()] = round(total, 1)
+            d += timedelta(days=1)
+
+        return jsonify(result)
+
+    @app.route("/api/footer_stats")
+    def api_footer_stats():
+        """Return yearly + monthly stats for live footer updates."""
+        year = request.args.get("year", type=int, default=date.today().year)
+        conn = get_db()
+        today_d = date.today()
+
+        rows = conn.execute(
+            """SELECT date,
+                      COALESCE(adjusted_distance_mi, distance_mi, 0) as dist,
+                      COALESCE(duration_s, 0) as dur
+               FROM activities
+               WHERE date BETWEEN ? AND ?""",
+            (f"{year}-01-01", f"{year}-12-31"),
+        ).fetchall()
+        conn.close()
+
+        # Monthly buckets
+        monthly = {m: {"distance": 0.0, "duration": 0.0, "count": 0, "longest": 0.0} for m in range(1, 13)}
+        for r in rows:
+            m = int(r["date"][5:7])
+            monthly[m]["distance"] += r["dist"]
+            monthly[m]["duration"] += r["dur"]
+            monthly[m]["count"] += 1
+            if r["dist"] > monthly[m]["longest"]:
+                monthly[m]["longest"] = r["dist"]
+
+        yearly_distance = sum(monthly[m]["distance"] for m in range(1, 13))
+        yearly_duration = sum(monthly[m]["duration"] for m in range(1, 13))
+        yearly_count = sum(monthly[m]["count"] for m in range(1, 13))
+        longest_run = max(monthly[m]["longest"] for m in range(1, 13))
+        yearly_avg_pace = (yearly_duration / yearly_distance) if yearly_distance > 0 else None
+
+        stats = []
+        for m in range(1, 13):
+            s = monthly[m]
+            days_in_m = monthrange(year, m)[1]
+            if year == today_d.year and m == today_d.month:
+                elapsed_days = today_d.day
+            elif year < today_d.year or (year == today_d.year and m < today_d.month):
+                elapsed_days = days_in_m
+            else:
+                elapsed_days = 0
+            elapsed_weeks = elapsed_days / 7.0 if elapsed_days > 0 else 0
+            avg_weekly = (s["distance"] / elapsed_weeks) if elapsed_weeks > 0 else 0
+            avg_pace = (s["duration"] / s["distance"]) if s["distance"] > 0 else None
+
+            stats.append({
+                "month": m,
+                "name": MONTH_NAMES[m][:3],
+                "distance": round(s["distance"], 1),
+                "count": s["count"],
+                "display_distance": f"{s['distance']:.1f}",
+                "display_duration": _format_duration(s["duration"]),
+                "display_pace": _format_pace(avg_pace),
+                "avg_weekly": f"{avg_weekly:.1f}",
+            })
+
+        max_month_dist = max((s["distance"] for s in stats), default=1) or 1
+
+        return jsonify({
+            "monthly": stats,
+            "max_month_dist": max_month_dist,
+            "yearly_distance": round(yearly_distance, 1),
+            "yearly_count": yearly_count,
+            "yearly_duration": _format_duration(yearly_duration),
+            "yearly_avg_pace": _format_pace(yearly_avg_pace),
+            "longest_run": round(longest_run, 1),
+        })
 
     # ── Import pipeline ─────────────────────────────────────────────
 

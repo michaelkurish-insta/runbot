@@ -74,6 +74,58 @@
         });
     });
 
+    // ── Double-click to edit workout type zone ─────────────────
+
+    const ZONE_OPTIONS = ["", "E", "M", "T", "I", "R", "FR"];
+
+    document.querySelectorAll(".activity-row .col-type").forEach(cell => {
+        cell.addEventListener("dblclick", (e) => {
+            e.stopPropagation();
+            if (cell.querySelector("select")) return;
+
+            const row = cell.closest(".activity-row");
+            const id = row.dataset.id;
+            const currentValue = cell.textContent.trim();
+
+            const select = document.createElement("select");
+            select.className = "inline-edit-name";
+            for (const z of ZONE_OPTIONS) {
+                const opt = document.createElement("option");
+                opt.value = z;
+                opt.textContent = z || "--";
+                if (z === currentValue) opt.selected = true;
+                select.appendChild(opt);
+            }
+
+            cell.textContent = "";
+            cell.appendChild(select);
+            select.focus();
+
+            function finish(save) {
+                const newValue = select.value;
+                select.remove();
+                if (save && newValue !== currentValue) {
+                    cell.textContent = newValue;
+                    cell.className = "col-type" + (newValue ? ` zone-${newValue}` : "");
+                    if (newValue) {
+                        saveOverride(id, "workout_type_zone", newValue);
+                    } else {
+                        clearOverride(id, "workout_type_zone");
+                    }
+                } else {
+                    cell.textContent = currentValue;
+                }
+            }
+
+            select.addEventListener("change", () => finish(true));
+            select.addEventListener("keydown", (ev) => {
+                ev.stopPropagation();
+                if (ev.key === "Escape") finish(false);
+            });
+            select.addEventListener("blur", () => finish(true));
+        });
+    });
+
     // ── Click future blank row → planned activity entry ────────
 
     document.querySelectorAll(".future-row, .planned-row").forEach(row => {
@@ -132,7 +184,12 @@
                     if (oldDist || oldName) {
                         fetch(`/api/planned/${dateStr}`, { method: "DELETE" })
                             .then(r => r.json())
-                            .then(() => reloadToDate(dateStr));
+                            .then(() => {
+                                restoreBlanks();
+                                row.classList.remove("planned-row");
+                                if (!row.classList.contains("future-row")) row.classList.add("future-row");
+                                refreshSevenDayMA(dateStr);
+                            });
                     } else {
                         restoreBlanks();
                     }
@@ -146,7 +203,24 @@
                         workout_name: name,
                     }),
                 }).then(r => r.json()).then(d => {
-                    if (d.ok) reloadToDate(dateStr);
+                    if (d.ok) {
+                        // Update row in place
+                        while (row.children.length > 2) row.removeChild(row.lastChild);
+                        const dTd = document.createElement("td");
+                        dTd.className = "col-dist planned-dist";
+                        dTd.textContent = dist ? parseFloat(dist).toFixed(1) : "";
+                        row.appendChild(dTd);
+                        const nTd = document.createElement("td");
+                        nTd.className = "col-name planned-name";
+                        nTd.textContent = name;
+                        row.appendChild(nTd);
+                        const rTd = document.createElement("td");
+                        rTd.colSpan = 9;
+                        row.appendChild(rTd);
+                        row.classList.add("planned-row");
+                        row.classList.remove("future-row");
+                        refreshSevenDayMA(dateStr);
+                    }
                 });
             }
 
@@ -295,9 +369,9 @@
             html += `<tr class="${rowClass} ${bgClass}" data-interval-id="${iv.id}">
                 <td>${iv.rep_number || ""}</td>
                 <td>${iv.display_distance}${locLabel}</td>
-                <td>${iv.display_duration}</td>
-                <td>${iv.display_pace}</td>
-                <td>${iv.display_hr}</td>
+                <td>${iv.is_recovery ? "" : iv.display_duration}</td>
+                <td>${iv.is_recovery ? "" : iv.display_pace}</td>
+                <td>${iv.is_recovery ? "" : iv.display_hr}</td>
                 <td class="${zoneClass}">${zone}${setLabel}</td>`;
             if (showSource) html += `<td>${iv.source || ""}</td>`;
             html += `<td class="walk-toggle-cell">${walkBtn}</td>`;
@@ -680,8 +754,15 @@
     // ── Shoe dropdown ───────────────────────────────────────────
 
     function populateShoeDropdown(id) {
-        const select = document.querySelector(`#edit-${id} select[data-field="shoe_id"]`);
+        // Try both the primary id and query by detail panel
+        let select = document.querySelector(`#edit-${id} select[data-field="shoe_id"]`);
+        if (!select) {
+            // Fallback: find within the detail row
+            const detailRow = document.querySelector(`.detail-row[data-id="${id}"]`);
+            if (detailRow) select = detailRow.querySelector(`select[data-field="shoe_id"]`);
+        }
         if (!select || !window.SHOES) return;
+        if (select.options.length > 1) return; // already populated
 
         for (const [shoeId, name] of Object.entries(SHOES)) {
             const opt = document.createElement("option");
@@ -691,7 +772,7 @@
         }
 
         const row = document.querySelector(`.activity-row[data-id="${id}"]`);
-        const shoeCell = row.querySelector(".col-shoe");
+        const shoeCell = row ? row.querySelector(".col-shoe") : null;
         if (shoeCell) {
             const currentShoe = shoeCell.textContent.trim();
             for (const opt of select.options) {
@@ -714,15 +795,24 @@
                 const value = input.value;
                 if (value === "" || value === undefined) return;
 
-                saveOverride(id, field, value).then(ok => {
-                    if (ok) {
+                saveOverride(id, field, value).then(result => {
+                    if (result) {
                         btn.textContent = "Saved!";
                         setTimeout(() => btn.textContent = "Save", 1500);
                         const clearBtn = form.querySelector(`.btn-clear[data-field="${field}"]`);
                         if (clearBtn) clearBtn.style.display = "";
                         const row = document.querySelector(`.activity-row[data-id="${id}"]`);
-                        const cell = row.querySelector(`.col-${fieldToColClass(field)}`);
-                        if (cell) cell.classList.add("overridden");
+                        const colClass = fieldToColClass(field);
+                        const cell = row ? row.querySelector(`.col-${colClass}`) : null;
+                        if (cell) {
+                            cell.classList.add("overridden");
+                            updateCellDisplay(cell, field, value);
+                        }
+                        // Refresh aggregates when distance changes
+                        if (field === "distance_mi" && result.date) {
+                            refreshSevenDayMA(result.date);
+                            refreshFooterStats();
+                        }
                     }
                 });
             });
@@ -751,8 +841,35 @@
             distance_mi: "dist", duration_s: "dur", avg_pace_s_per_mi: "pace",
             workout_name: "name", workout_category: "name",
             shoe_id: "shoe", notes: "notes", strides: "strides",
+            workout_type_zone: "type",
         };
         return map[field] || field;
+    }
+
+    function updateCellDisplay(cell, field, value) {
+        if (field === "distance_mi") {
+            cell.textContent = parseFloat(value).toFixed(1);
+        } else if (field === "workout_name") {
+            cell.textContent = value;
+        } else if (field === "strides") {
+            cell.textContent = value;
+        } else if (field === "notes") {
+            cell.textContent = value;
+            cell.title = value;
+        } else if (field === "shoe_id" && window.SHOES) {
+            cell.textContent = SHOES[value] || "";
+        } else if (field === "duration_s") {
+            const s = parseInt(value, 10);
+            const h = Math.floor(s / 3600);
+            const m = Math.floor((s % 3600) / 60);
+            const sec = s % 60;
+            cell.textContent = h ? `${h}h ${m}m` : `${m}:${sec < 10 ? "0" : ""}${sec}`;
+        } else if (field === "avg_pace_s_per_mi") {
+            const s = parseFloat(value);
+            const m = Math.floor(s / 60);
+            const sec = Math.round(s % 60);
+            cell.textContent = `${m}:${sec < 10 ? "0" : ""}${sec}`;
+        }
     }
 
     // ── API ─────────────────────────────────────────────────────
@@ -762,7 +879,7 @@
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ field_name: field, override_value: value }),
-        }).then(r => r.json()).then(d => d.ok).catch(() => false);
+        }).then(r => r.json()).then(d => d.ok ? d : false).catch(() => false);
     }
 
     function clearOverride(activityId, field) {
@@ -949,6 +1066,84 @@
                     importStatus.textContent = "Error";
                 });
         });
+    }
+
+    // ── Refresh 7d MA after planned activity change ────────────
+
+    function refreshSevenDayMA(changedDate) {
+        // The changed date affects 7d MA for itself and the next 6 days
+        const d = new Date(changedDate + "T00:00:00");
+        const start = changedDate;
+        const endD = new Date(d);
+        endD.setDate(endD.getDate() + 6);
+        const end = endD.toISOString().slice(0, 10);
+
+        fetch(`/api/seven_day_ma?start=${start}&end=${end}`)
+            .then(r => r.json())
+            .then(maData => {
+                // Patch all matching rows in the DOM
+                for (const [dateStr, maValue] of Object.entries(maData)) {
+                    const rows = mainContent.querySelectorAll(`[data-date="${dateStr}"]`);
+                    for (const row of rows) {
+                        const maCell = row.querySelector(".col-7d");
+                        if (maCell) maCell.textContent = maValue.toFixed(1);
+                    }
+                }
+            });
+    }
+
+    function refreshFooterStats() {
+        // Extract current year from the page
+        const yearEl = document.querySelector(".cal-year");
+        const year = yearEl ? yearEl.textContent.trim() : new Date().getFullYear();
+
+        fetch(`/api/footer_stats?year=${year}`)
+            .then(r => r.json())
+            .then(data => {
+                // Update stat cards
+                const cards = document.querySelectorAll(".stat-card");
+                const cardMap = {};
+                cards.forEach(card => {
+                    const label = card.querySelector(".stat-label").textContent.trim();
+                    cardMap[label] = card.querySelector(".stat-value");
+                });
+                if (cardMap["Miles"]) cardMap["Miles"].textContent = data.yearly_distance.toFixed(1);
+                if (cardMap["Runs"]) cardMap["Runs"].textContent = data.yearly_count;
+                if (cardMap["Time"]) cardMap["Time"].textContent = data.yearly_duration;
+                if (cardMap["Avg Pace"]) cardMap["Avg Pace"].textContent = data.yearly_avg_pace;
+                if (cardMap["Longest"]) cardMap["Longest"].textContent = data.longest_run.toFixed(1);
+
+                // Update monthly table
+                const monthRows = document.querySelectorAll(".monthly-table tbody tr");
+                const monthByName = {};
+                data.monthly.forEach(s => { monthByName[s.name] = s; });
+                monthRows.forEach(tr => {
+                    const cells = tr.querySelectorAll("td");
+                    if (cells.length < 6) return;
+                    const name = cells[0].textContent.trim().slice(0, 3);
+                    const s = monthByName[name];
+                    if (!s) return;
+                    cells[1].textContent = s.count;
+                    cells[2].textContent = s.display_distance;
+                    cells[3].textContent = s.avg_weekly;
+                    cells[4].textContent = s.display_duration;
+                    cells[5].textContent = s.display_pace;
+                });
+
+                // Update monthly bar chart
+                const bars = document.querySelectorAll(".chart-col");
+                bars.forEach(col => {
+                    const label = col.querySelector(".chart-label");
+                    if (!label) return;
+                    const name = label.textContent.trim();
+                    const s = monthByName[name];
+                    if (!s) return;
+                    const val = col.querySelector(".chart-value");
+                    const bar = col.querySelector(".chart-bar");
+                    if (val) val.textContent = s.display_distance;
+                    if (bar) bar.style.height = `${(s.distance / data.max_month_dist * 100)}%`;
+                });
+            });
     }
 
     // ── Scroll helpers ─────────────────────────────────────────

@@ -327,16 +327,8 @@ header {
     box-shadow: 0 0 0 2px rgba(74,122,181,0.2);
 }
 
-/* Override indicator */
-.overridden { font-style: italic; position: relative; }
-.overridden::after {
-    content: "";
-    position: absolute;
-    top: 2px; right: 2px;
-    width: 4px; height: 4px;
-    background: #e8a000;
-    border-radius: 50%;
-}
+/* Override indicator — subtle dot only, no italic */
+.overridden { position: relative; }
 
 /* ── Monthly Color Scheme — date cells ───────────────────────── */
 /* Light theme: lighter pastel backgrounds with dark text */
