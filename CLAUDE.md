@@ -29,10 +29,13 @@ RunBase is a personal running data pipeline that ingests workout data from multi
 - `python -m runbase enrich -v` — batch enrich all activities (pace zones, track detection, etc.)
 - `python -m runbase enrich --activity <id> -v` — enrich a single activity
 - `python -m runbase analyze locations -v` — show workout location clusters
-- `python -m runbase review` — launch the Flask review UI (not yet implemented)
+- `python -m runbase review` — launch the Flask review UI at http://localhost:5050
+- `python -m runbase review --debug` — launch with Flask debug mode (auto-reload on code changes)
 - `python -m runbase status` — show pipeline status (not yet implemented)
 - `python scripts/setup_strava_auth.py` — set up Strava OAuth tokens
 - `python scripts/backfill_xlsx_fields.py -v` — one-time migration for strides + workout_category
+- `python scripts/split_group_matched.py -v` — one-time: split group-matched activities into individual rows
+- `python scripts/split_group_matched.py --dry-run -v` — preview split without writing
 
 ## Architecture
 
@@ -56,7 +59,14 @@ runbase/
 │   ├── pace_segments.py   # Stream-based pace segmentation for unstructured runs
 │   ├── locations.py       # Workout location clustering, measured course detection
 │   └── interval_enricher.py # Enrichment waterfall orchestrator
-└── review/                # Flask app for conflict resolution and data browsing (planned)
+└── review/
+    ├── app.py             # Flask routes, API endpoints, override logic
+    ├── static/
+    │   ├── app.js         # UI: grid interactions, detail panels, inline editing, charts
+    │   └── style.css      # Styling: grid, detail panels, zone colors
+    └── templates/
+        ├── index.html     # Main page: calendar grid, sidebar, stats footer
+        └── components/    # activity_row.html, detail_panel.html
 ```
 
 ## Configuration
@@ -74,9 +84,10 @@ See `runbase_build_plan.md` for the full phased build plan.
 - Phase 1 (FIT parser + iCloud sync): Complete
 - Phase 2a (XLSX import): Complete
 - Phase 3 (Strava API sync): Complete
-- Phase 2b (XLSX backfill — strides + workout_category): Code done, pending migration run
+- Phase 2b (XLSX backfill — strides + workout_category): Complete
 - Phase 4 (Reconciliation — FIT↔Strava matching + enrichment): Complete
 - Phase 5 (Interval enrichment — VDOT, pace zones, track detection, walking scrub): Complete
+- Phase 6 (Review UI): Complete — Flask UI with activity grid, detail panels, inline editing
 
 ## XLSX Cutoff Date
 
@@ -117,3 +128,24 @@ The **elapsed pace zone** provides a more accurate effort score for unstructured
 Individual pace segments can appear more or less intense than the actual effort due to
 terrain (hills, wind), so the elapsed pace zone uses the overall activity pace as a
 complementary measure of true exertion.
+
+### Review UI
+
+The Flask review UI (`python -m runbase review`) provides:
+
+- **Activity grid**: Year calendar with color-coded date cells, 7-day trailing mileage, monthly sections
+- **Detail panels**: Click a row to expand — shows intervals/laps, pace/HR charts, GPS map, edit form
+- **Same-day merging**: Multiple activities on one day display as a single merged grid row; the detail panel shows each activity separately with its own edit form
+- **Inline editing**: Double-click grid cells (name, type zone) or interval cells (distance, duration, HR, zone) to edit in place
+- **Override system**: Activity edits go through `activity_overrides` table and sync to `activities` table, making them canonical (won't be overwritten by future imports)
+- **Interval editing**: Double-click interval cells to edit; sets `source='manual'`; auto-recalculates pace; does NOT update parent activity aggregates
+- **Nullable fields**: HR, cadence, pace, duration can be set to NULL by saving an empty value
+- **Planned activities**: Click future blank rows to enter planned distance/workout
+- **Import button**: Triggers the full pipeline from the UI
+
+### Group-Matched Activity Split
+
+Group-matched activities (where multiple Strava sub-activities were stored as one combined row)
+have been split into individual activity rows via `scripts/split_group_matched.py`. The review
+UI's `_merge_day()` handles same-day display merging in the grid. New orphan promotions via
+`promote_orphans()` also create one activity per orphan (not one per day-group).

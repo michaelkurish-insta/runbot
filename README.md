@@ -94,11 +94,27 @@ python -m runbase vdot
 python -m runbase vdot --set 50
 ```
 
+### Review UI
+
+```bash
+# Launch the review UI at http://localhost:5050
+python -m runbase review
+
+# With auto-reload for development
+python -m runbase review --debug
+```
+
+The review UI provides a year calendar grid, detail panels with interval tables and pace/HR charts, inline editing via double-click (activity fields, interval distance/duration/HR/zone), planned activity entry for future dates, and a one-click import pipeline trigger.
+
 ### One-time migrations
 
 ```bash
 # Backfill strides + workout_category for existing XLSX rows
 python scripts/backfill_xlsx_fields.py -v
+
+# Split group-matched activities into individual rows (preview first)
+python scripts/split_group_matched.py --dry-run -v
+python scripts/split_group_matched.py -v
 ```
 
 ## Architecture
@@ -117,20 +133,25 @@ runbase/
 ├── reconcile/
 │   ├── matcher.py         # Match activities to orphaned Strava sources
 │   └── enricher.py        # Apply shoe/name/category from matched sources
-└── analysis/
-    ├── interval_enricher.py # Enrichment waterfall orchestrator
-    ├── vdot.py            # VDOT calculator (Daniels-Gilbert), pace zones
-    ├── track_detect.py    # Oval template matching for track detection
-    ├── pace_segments.py   # Stream-based pace segmentation
-    └── locations.py       # Workout location clustering, measured course matching
+├── analysis/
+│   ├── interval_enricher.py # Enrichment waterfall orchestrator
+│   ├── vdot.py            # VDOT calculator (Daniels-Gilbert), pace zones
+│   ├── track_detect.py    # Oval template matching for track detection
+│   ├── pace_segments.py   # Stream-based pace segmentation
+│   └── locations.py       # Workout location clustering, measured course matching
+└── review/
+    ├── app.py             # Flask routes and API endpoints
+    ├── static/            # app.js (UI logic), style.css
+    └── templates/         # Jinja2 templates (index.html, components/)
 
 config/
 ├── config.example.yaml    # Template config (check into git)
 └── config.yaml            # Your config (gitignored)
 
 scripts/
-├── setup_strava_auth.py   # Strava OAuth token setup
-└── backfill_xlsx_fields.py # Migration: strides + workout_category
+├── setup_strava_auth.py        # Strava OAuth token setup
+├── backfill_xlsx_fields.py     # Migration: strides + workout_category
+└── split_group_matched.py      # Migration: split group-matched activities
 ```
 
 ## Database
@@ -138,12 +159,60 @@ scripts/
 SQLite with WAL mode at `~/runbase/data/runbase.db`. Key tables:
 
 - **activities** — canonical activity records (one per real-world run)
-- **activity_sources** — per-source raw data for audit trail
-- **intervals** — interval/rep-level splits
-- **streams** — per-second time series from .fit files and Strava
+- **activity_sources** — per-source raw data for audit trail (one per import source per activity)
+- **intervals** — interval/rep-level splits (FIT laps, Strava laps, XLSX splits, pace segments)
+- **streams** — per-second time series from .fit files and Strava (lat/lon, HR, cadence, pace)
 - **shoes** — shoe tracking (populated from Strava gear)
 - **processed_files** — dedup manifest to avoid re-importing
 - **detected_tracks** — cached track locations for fast lookup
+- **activity_overrides** — manual field-level overrides from the review UI (synced to activities table)
+- **planned_activities** — future planned runs entered via the review UI
+- **vdot_history** — VDOT values over time (current = most recent entry on or before activity date)
+
+## Reconciliation & Linking
+
+Activities arrive from multiple sources (FIT files via iCloud, Strava API, historical XLSX spreadsheet). The reconciliation system links these sources together into canonical activity records.
+
+### How Sources Become Activities
+
+Each import source creates an `activity_sources` row. The reconciliation process matches these to `activities`:
+
+1. **FIT import** (`sync --icloud`): Creates a new `activities` row + `activity_sources` row with `source='healthfit'`. The activity has GPS streams, HR, cadence, and laps, but may have a generic name like "Outdoor Running".
+
+2. **Strava sync** (`sync --strava`): Fetches activities from the Strava API. If a Strava activity matches an existing activity by date (±1 day) and distance (±5%), it links as a new `activity_sources` row and fills missing fields (name, shoe, HR). If no match, it becomes an **orphaned source** — stored but not yet linked.
+
+3. **XLSX import** (`import --xlsx`): Creates `activities` rows from the spreadsheet with `source='master_xlsx'`. These have hand-entered distances, workout names, interval splits, and shoe assignments.
+
+### Matching Strategies
+
+The reconcile command (`reconcile -v`) runs three matching passes:
+
+**1:1 Matching**: For each activity without a Strava link, search orphaned Strava sources for a single match on date (±1 day) + distance (±5%). The pipeline's lightweight reconcile pass uses this strategy.
+
+**Group Matching**: When no single orphan matches, check if multiple same-day orphans sum to the activity's distance (±10%). This handles days where a single logged run was actually recorded as separate Strava activities (e.g., warm-up + main workout + cool-down). All orphans in the group link to the same activity.
+
+**Orphan Promotion**: Strava sources that can't match any existing activity (post-XLSX-cutoff dates) get promoted to standalone activities. Each orphan becomes its own activity row. The review UI's same-day merging handles display grouping.
+
+### After Matching
+
+When an orphan links to an activity, enrichment applies:
+- **Shoe**: Strava `gear_id` maps to the `shoes` table
+- **Name**: Replaces generic FIT names ("Outdoor Running") with Strava activity names
+- **Category**: Inferred from Strava `workout_type` (race/long/workout) and name patterns ("tempo", "intervals", "easy")
+- **Streams + Laps**: Fetched from the Strava API for GPS, pace, and HR data
+
+### The Pipeline
+
+`python -m runbase pipeline -v` runs the full automated flow:
+
+1. **iCloud sync** — import new .fit files
+2. **Strava sync** — fetch new Strava activities, match to existing
+3. **Lightweight reconcile** — 1:1 match any remaining unlinked activities
+4. **Enrich** — run the enrichment waterfall on new + reconciled activities
+
+### Manual Overrides
+
+The review UI allows manual edits to activity fields (distance, duration, pace, HR, cadence, shoe, name, notes) and interval fields (distance, duration, HR, zone). Activity edits are stored in `activity_overrides` and synced to the `activities` table, making them canonical — future imports will not overwrite them. Interval edits set the interval's `source` to `'manual'`.
 
 ## Enrichment Pipeline
 
