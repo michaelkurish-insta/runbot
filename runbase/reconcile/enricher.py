@@ -202,8 +202,9 @@ def promote_orphans(conn, groups: list[list[dict]],
                     verbose: bool = False) -> list[dict]:
     """Create activities from groups of orphaned Strava sources.
 
-    Each group is a list of orphan dicts for the same date. Multiple orphans
-    on the same date are combined into a single activity (sums distances/durations).
+    Each group is a list of orphan dicts for the same date. Each orphan
+    becomes its own activity (the review UI's _merge_day() handles
+    same-day display merging).
 
     Returns list of dicts with keys: activity_id, pairs (for stream fetch).
     """
@@ -212,94 +213,54 @@ def promote_orphans(conn, groups: list[list[dict]],
     promoted = []
 
     for group in groups:
-        primary = _pick_primary(group)
-        meta = primary.get("metadata", {})
-        date = primary["start_date"]
-
-        # Combine distances and durations across group
-        total_dist = sum(o["distance_mi"] or 0 for o in group)
-        total_dur = sum(o["duration_s"] or 0 for o in group)
-        avg_pace = total_dur / total_dist if total_dist > 0 else None
-        avg_pace_display = format_pace(avg_pace) if avg_pace else None
-
-        # Weighted-average HR and cadence
-        total_hr_weight = 0
-        total_hr_sum = 0
-        total_cad_weight = 0
-        total_cad_sum = 0
-        max_hr_all = None
-        total_ascent = 0
-        total_calories = 0
-
-        for o in group:
-            dur = o["duration_s"] or 0
-            if o.get("avg_hr") and dur > 0:
-                total_hr_sum += o["avg_hr"] * dur
-                total_hr_weight += dur
-            if o.get("avg_cadence") and dur > 0:
-                total_cad_sum += o["avg_cadence"] * dur
-                total_cad_weight += dur
-            if o.get("max_hr"):
-                max_hr_all = max(max_hr_all or 0, o["max_hr"])
-            if o.get("total_ascent_ft"):
-                total_ascent += o["total_ascent_ft"]
-            if o.get("calories"):
-                total_calories += o["calories"]
-
-        avg_hr = total_hr_sum / total_hr_weight if total_hr_weight > 0 else None
-        avg_cadence = total_cad_sum / total_cad_weight if total_cad_weight > 0 else None
-
-        # Name, category, shoe from primary
-        workout_name = primary.get("strava_name") or primary.get("workout_name")
-        workout_type = _map_workout_type(meta.get("workout_type"))
-        workout_category = _infer_category(primary)
-        shoe_id = _lookup_shoe_id(conn, primary.get("gear_id"))
-        start_time = meta.get("start_time")
-
-        if verbose:
-            names = [o.get("strava_name") or o.get("workout_name") or "?" for o in group]
-            if len(group) == 1:
-                print(f"  PROMOTE {date} {total_dist:.2f}mi \"{names[0]}\"")
-            else:
-                dists = [f"{o['distance_mi']:.2f}" for o in group]
-                print(f"  PROMOTE {date} {' + '.join(dists)} = {total_dist:.2f}mi "
-                      f"({', '.join(names)})")
-
-        # Insert activity
-        cursor = conn.execute(
-            """INSERT INTO activities
-               (date, start_time, distance_mi, duration_s,
-                avg_pace_s_per_mi, avg_pace_display,
-                avg_hr, max_hr, avg_cadence, total_ascent_ft, calories,
-                workout_name, workout_type, workout_category, shoe_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (date, start_time, total_dist, total_dur,
-             avg_pace, avg_pace_display,
-             avg_hr, max_hr_all, avg_cadence,
-             total_ascent or None, total_calories or None,
-             workout_name, workout_type, workout_category, shoe_id),
-        )
-        activity_id = cursor.lastrowid
-
-        # Link all sources to the new activity
-        pairs = []
         for orphan in group:
+            meta = orphan.get("metadata", {})
+            date = orphan["start_date"]
+            dist = orphan["distance_mi"] or 0
+            dur = orphan["duration_s"] or 0
+            avg_pace = dur / dist if dist > 0 else None
+            avg_pace_display = format_pace(avg_pace) if avg_pace else None
+
+            workout_name = orphan.get("strava_name") or orphan.get("workout_name")
+            workout_type = _map_workout_type(meta.get("workout_type"))
+            workout_category = _infer_category(orphan)
+            shoe_id = _lookup_shoe_id(conn, orphan.get("gear_id"))
+            start_time = meta.get("start_time")
+
+            if verbose:
+                print(f"  PROMOTE {date} {dist:.2f}mi \"{workout_name or '?'}\"")
+
+            cursor = conn.execute(
+                """INSERT INTO activities
+                   (date, start_time, distance_mi, duration_s,
+                    avg_pace_s_per_mi, avg_pace_display,
+                    avg_hr, max_hr, avg_cadence, total_ascent_ft, calories,
+                    workout_name, workout_type, workout_category, shoe_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (date, start_time, dist, dur,
+                 avg_pace, avg_pace_display,
+                 orphan.get("avg_hr"), orphan.get("max_hr"),
+                 orphan.get("avg_cadence"),
+                 orphan.get("total_ascent_ft") or None,
+                 orphan.get("calories") or None,
+                 workout_name, workout_type, workout_category, shoe_id),
+            )
+            activity_id = cursor.lastrowid
+
             conn.execute(
                 "UPDATE activity_sources SET activity_id = ? WHERE id = ?",
                 (activity_id, orphan["id"]),
             )
-            pairs.append((orphan["source_id"], activity_id, orphan["id"]))
+            conn.commit()
 
-        conn.commit()
+            if verbose:
+                print(f"    → activity #{activity_id}")
 
-        if verbose:
-            print(f"    → activity #{activity_id}")
-
-        promoted.append({
-            "activity_id": activity_id,
-            "date": date,
-            "distance_mi": total_dist,
-            "pairs": pairs,
-        })
+            promoted.append({
+                "activity_id": activity_id,
+                "date": date,
+                "distance_mi": dist,
+                "pairs": [(orphan["source_id"], activity_id, orphan["id"])],
+            })
 
     return promoted

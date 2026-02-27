@@ -29,60 +29,6 @@
             <h3>Map</h3>
             <div class="map-container" id="map-{{ a.id }}"></div>
             {% endif %}
-
-            <h3>Edit</h3>
-            <div class="edit-form" id="edit-{{ a.id }}">
-                <div class="edit-row">
-                    <label>Name</label>
-                    <input type="text" data-field="workout_name"
-                           placeholder="{{ a.workout_name or '' }}"
-                           value="{{ a.workout_name or '' }}">
-                    <button class="btn-save" data-field="workout_name">Save</button>
-                    <button class="btn-clear" data-field="workout_name" {% if 'workout_name' not in a.overridden_fields %}style="display:none"{% endif %}>Clear</button>
-                </div>
-                <div class="edit-row">
-                    <label>Category</label>
-                    <select data-field="workout_category">
-                        <option value="">--</option>
-                        {% for cat in ['easy', 'long', 'tempo', 'interval', 'race', 'recovery', 'other'] %}
-                        <option value="{{ cat }}" {{ 'selected' if a.workout_category == cat }}>{{ cat }}</option>
-                        {% endfor %}
-                    </select>
-                    <button class="btn-save" data-field="workout_category">Save</button>
-                    <button class="btn-clear" data-field="workout_category" {% if 'workout_category' not in a.overridden_fields %}style="display:none"{% endif %}>Clear</button>
-                </div>
-                <div class="edit-row">
-                    <label>Distance (mi)</label>
-                    <input type="number" step="0.01" data-field="distance_mi"
-                           placeholder="{{ '%.2f' % a.distance_mi if a.distance_mi else '' }}"
-                           value="{{ '%.2f' % a.distance_mi if a.distance_mi else '' }}">
-                    <button class="btn-save" data-field="distance_mi">Save</button>
-                    <button class="btn-clear" data-field="distance_mi" {% if 'distance_mi' not in a.overridden_fields %}style="display:none"{% endif %}>Clear</button>
-                </div>
-                <div class="edit-row">
-                    <label>Shoe</label>
-                    <select data-field="shoe_id">
-                        <option value="">--</option>
-                    </select>
-                    <button class="btn-save" data-field="shoe_id">Save</button>
-                    <button class="btn-clear" data-field="shoe_id" {% if 'shoe_id' not in a.overridden_fields %}style="display:none"{% endif %}>Clear</button>
-                </div>
-                <div class="edit-row">
-                    <label>Strides</label>
-                    <input type="number" step="1" data-field="strides"
-                           placeholder="{{ a.strides if a.strides else '' }}"
-                           value="{{ a.strides if a.strides else '' }}">
-                    <button class="btn-save" data-field="strides">Save</button>
-                    <button class="btn-clear" data-field="strides" {% if 'strides' not in a.overridden_fields %}style="display:none"{% endif %}>Clear</button>
-                </div>
-                <div class="edit-row">
-                    <label>Notes</label>
-                    <textarea data-field="notes" rows="2"
-                              placeholder="{{ a.notes or '' }}">{{ a.notes or '' }}</textarea>
-                    <button class="btn-save" data-field="notes">Save</button>
-                    <button class="btn-clear" data-field="notes" {% if 'notes' not in a.overridden_fields %}style="display:none"{% endif %}>Clear</button>
-                </div>
-            </div>
         </div>
     </div>
 </div>

@@ -183,8 +183,8 @@
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
-        const SHOES = {{ shoes | tojson }};
-        const WEEKLY_CHART_DATA = {{ weekly_chart_data | tojson }};
+        window.SHOES = {{ shoes | tojson }};
+        window.WEEKLY_CHART_DATA = {{ weekly_chart_data | tojson }};
     </script>
     <script src="{{ url_for('static', filename='app.js') }}?v={{ cache_bust }}"></script>
 </body>

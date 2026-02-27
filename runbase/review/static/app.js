@@ -298,18 +298,25 @@
     // ── Load detail ─────────────────────────────────────────────
 
     function loadDetail(id, activityIds, hasStreams) {
-        // Fetch intervals from all activities
+        const isMulti = activityIds.length > 1;
+
+        // Fetch intervals + metadata from all activities
         Promise.all(activityIds.map(aid =>
-            fetch(`/api/activity/${aid}/intervals`).then(r => r.json())
+            Promise.all([
+                fetch(`/api/activity/${aid}/intervals`).then(r => r.json()),
+                fetch(`/api/activity/${aid}/meta`).then(r => r.json()),
+            ]).then(([intervals, meta]) => ({ aid: parseInt(aid), meta, ...intervals }))
         )).then(results => {
-            // Merge intervals and laps from all activities
-            const allIntervals = results.flatMap(r => r.intervals || []);
-            const allLaps = results.flatMap(r => r.laps || []);
-            const allSummary = results.flatMap(r => r.summary || []);
-            renderIntervals(id, allIntervals, allLaps, allSummary);
+            if (isMulti) {
+                renderMultiActivityIntervals(id, results);
+            } else {
+                // Single activity — render as before
+                const r = results[0];
+                renderIntervals(id, r.intervals || [], r.laps || [], r.summary || [], r.meta);
+            }
         });
 
-        // Fetch chart data from all activities
+        // Fetch chart data from all activities (merged)
         Promise.all(activityIds.map(aid =>
             fetch(`/api/activity/${aid}/chart`).then(r => r.json())
         )).then(results => {
@@ -320,7 +327,7 @@
             }
         });
 
-        // Fetch streams for map
+        // Fetch streams for map (merged)
         if (hasStreams) {
             Promise.all(activityIds.map(aid =>
                 fetch(`/api/activity/${aid}/streams`).then(r => r.json())
@@ -328,9 +335,6 @@
                 renderMap(id, results.flat());
             });
         }
-
-        populateShoeDropdown(id);
-        wireEditButtons(id);
     }
 
     // ── Render intervals + laps ─────────────────────────────────
@@ -358,6 +362,9 @@
             const setLabel = iv.set_number ? ` S${iv.set_number}` : "";
             const locLabel = iv.location_type ? ` [${iv.location_type}]` : "";
 
+            // Raw distance in miles for editing
+            const rawDist = iv.canonical_distance_mi || iv.gps_measured_distance_mi || iv.prescribed_distance_mi || 0;
+
             // Walking toggle button
             let walkBtn = "";
             if (iv.is_walking) {
@@ -368,12 +375,12 @@
 
             html += `<tr class="${rowClass} ${bgClass}" data-interval-id="${iv.id}">
                 <td>${iv.rep_number || ""}</td>
-                <td>${iv.display_distance}${locLabel}</td>
-                <td>${iv.is_recovery ? "" : iv.display_duration}</td>
-                <td>${iv.is_recovery ? "" : iv.display_pace}</td>
-                <td>${iv.is_recovery ? "" : iv.display_hr}</td>
-                <td class="${zoneClass}">${zone}${setLabel}</td>`;
-            if (showSource) html += `<td>${iv.source || ""}</td>`;
+                <td class="iv-editable" data-field="distance" data-raw="${rawDist}">${iv.display_distance}${locLabel}</td>
+                <td class="iv-editable" data-field="duration_s" data-raw="${iv.duration_s || ""}">${iv.display_duration}</td>
+                <td>${iv.display_pace}</td>
+                <td class="iv-editable" data-field="avg_hr" data-raw="${iv.avg_hr || ""}">${iv.display_hr}</td>
+                <td class="iv-editable ${zoneClass}" data-field="pace_zone" data-raw="${zone}">${zone}${setLabel}</td>`;
+            if (showSource) html += `<td class="iv-source">${iv.source || ""}</td>`;
             html += `<td class="walk-toggle-cell">${walkBtn}</td>`;
             html += `</tr>`;
         }
@@ -401,10 +408,14 @@
         return html;
     }
 
-    function renderIntervals(id, intervals, laps, summary) {
+    function renderIntervals(id, intervals, laps, summary, meta) {
         const container = document.getElementById(`intervals-${id}`);
         if (!intervals.length && !laps.length) {
             container.innerHTML = "<p class='loading'>No intervals.</p>";
+            if (meta) {
+                container.innerHTML += buildEditForm(meta);
+                wireEditForm(container, meta);
+            }
             return;
         }
 
@@ -425,9 +436,67 @@
             html += renderSummary(summary);
         }
 
-        container.innerHTML = html;
+        if (meta) {
+            html += buildEditForm(meta);
+        }
 
-        // Wire walking toggle buttons
+        container.innerHTML = html;
+        wireWalkingButtons(container);
+        wireIntervalEditing(container);
+        if (meta) wireEditForm(container, meta);
+    }
+
+    function renderMultiActivityIntervals(id, results) {
+        const container = document.getElementById(`intervals-${id}`);
+        let html = "";
+
+        for (let i = 0; i < results.length; i++) {
+            const r = results[i];
+            const meta = r.meta;
+            const intervals = r.intervals || [];
+            const laps = r.laps || [];
+            const summary = r.summary || [];
+
+            if (i > 0) html += `<hr class="activity-divider">`;
+
+            html += `<div class="activity-section" data-activity-id="${r.aid}">`;
+            html += `<div class="activity-section-header">`;
+            html += `<span class="activity-title">${escapeHtml(meta.workout_name || `Activity #${r.aid}`)}</span>`;
+            const hrPart = meta.display_hr ? ` &middot; ${meta.display_hr}bpm` : "";
+            html += `<span class="activity-meta">${meta.display_distance}mi &middot; ${meta.display_pace}/mi &middot; ${meta.display_duration}${hrPart}</span>`;
+            html += `</div>`;
+
+            if (intervals.length) {
+                html += `<h3>Intervals</h3>`;
+                html += buildTable(intervals, true);
+            }
+
+            if (laps.length) {
+                html += `<h3 style="margin-top:10px">Laps</h3>`;
+                html += buildTable(laps, false);
+            }
+
+            if (summary && summary.length) {
+                html += `<h3 style="margin-top:10px">Summary</h3>`;
+                html += renderSummary(summary);
+            }
+
+            html += buildEditForm(meta);
+            html += `</div>`;
+        }
+
+        container.innerHTML = html;
+        wireWalkingButtons(container);
+        wireIntervalEditing(container);
+
+        // Wire edit forms for each activity
+        for (const r of results) {
+            const section = container.querySelector(`.activity-section[data-activity-id="${r.aid}"]`);
+            if (section) wireEditForm(section, r.meta);
+        }
+    }
+
+    function wireWalkingButtons(container) {
         container.querySelectorAll(".btn-unscrub, .btn-scrub").forEach(btn => {
             btn.addEventListener("click", (e) => {
                 e.stopPropagation();
@@ -451,6 +520,217 @@
                 });
             });
         });
+    }
+
+    const IV_ZONE_OPTIONS = ["", "E", "M", "T", "I", "R", "FR"];
+
+    function wireIntervalEditing(container) {
+        container.querySelectorAll(".iv-editable").forEach(cell => {
+            cell.addEventListener("dblclick", (e) => {
+                e.stopPropagation();
+                if (cell.querySelector("input, select")) return;
+
+                const tr = cell.closest("tr");
+                const intervalId = tr.dataset.intervalId;
+                const field = cell.dataset.field;
+                const rawValue = cell.dataset.raw;
+                const originalHtml = cell.innerHTML;
+
+                if (field === "pace_zone") {
+                    // Zone dropdown
+                    const select = document.createElement("select");
+                    select.className = "iv-inline-edit";
+                    for (const z of IV_ZONE_OPTIONS) {
+                        const opt = document.createElement("option");
+                        opt.value = z;
+                        opt.textContent = z || "--";
+                        if (z === rawValue) opt.selected = true;
+                        select.appendChild(opt);
+                    }
+                    cell.textContent = "";
+                    cell.appendChild(select);
+                    select.focus();
+
+                    function finish(save) {
+                        const newVal = select.value;
+                        select.remove();
+                        if (save && newVal !== rawValue) {
+                            saveIntervalEdit(intervalId, field, newVal).then(result => {
+                                if (result) {
+                                    const iv = result.interval;
+                                    const z = iv.pace_zone || "";
+                                    const setLabel = iv.set_number ? ` S${iv.set_number}` : "";
+                                    cell.className = "iv-editable" + (z ? ` zone-${z}` : "");
+                                    cell.textContent = z + setLabel;
+                                    cell.dataset.raw = z;
+                                    // Update zone bg on row
+                                    tr.className = tr.className.replace(/zone-bg-\w+/g, "");
+                                    if (z) tr.classList.add(`zone-bg-${z}`);
+                                    updateSourceCell(tr, "manual");
+                                } else {
+                                    cell.innerHTML = originalHtml;
+                                }
+                            });
+                        } else {
+                            cell.innerHTML = originalHtml;
+                        }
+                    }
+
+                    select.addEventListener("change", () => finish(true));
+                    select.addEventListener("keydown", (ev) => {
+                        ev.stopPropagation();
+                        if (ev.key === "Escape") finish(false);
+                    });
+                    select.addEventListener("blur", () => finish(true));
+
+                } else {
+                    // Text/number input for distance, duration, HR
+                    const input = document.createElement("input");
+                    input.className = "iv-inline-edit";
+
+                    if (field === "distance") {
+                        const dist = parseFloat(rawValue);
+                        if (dist && dist < 1.0) {
+                            input.type = "number";
+                            input.step = "1";
+                            input.value = Math.round(dist * 1609.344);
+                            input.dataset.unit = "m";
+                        } else {
+                            input.type = "number";
+                            input.step = "0.01";
+                            input.value = dist ? dist.toFixed(2) : "";
+                            input.dataset.unit = "mi";
+                        }
+                    } else if (field === "duration_s") {
+                        input.type = "text";
+                        const dur = parseFloat(rawValue);
+                        if (dur) {
+                            // Format with tenths: m:ss.t
+                            const total = Math.floor(dur);
+                            const tenths = Math.round((dur - total) * 10) % 10;
+                            const m = Math.floor(total / 60);
+                            const s = total % 60;
+                            input.value = `${m}:${s < 10 ? "0" : ""}${s}.${tenths}`;
+                        } else {
+                            input.value = "";
+                        }
+                        input.placeholder = "m:ss.t";
+                    } else if (field === "avg_hr") {
+                        input.type = "number";
+                        input.step = "1";
+                        input.value = rawValue ? Math.round(parseFloat(rawValue)) : "";
+                    }
+
+                    cell.textContent = "";
+                    cell.appendChild(input);
+                    input.focus();
+                    input.select();
+
+                    function finish(save) {
+                        const val = input.value.trim();
+                        input.remove();
+                        if (save && val !== "") {
+                            let sendValue;
+                            if (field === "distance") {
+                                if (input.dataset.unit === "m") {
+                                    sendValue = parseFloat(val) / 1609.344;
+                                } else {
+                                    sendValue = parseFloat(val);
+                                }
+                                if (isNaN(sendValue) || sendValue <= 0) {
+                                    cell.innerHTML = originalHtml;
+                                    return;
+                                }
+                            } else if (field === "duration_s") {
+                                // Parse m:ss or m:ss.t
+                                sendValue = parseDurationPrecise(val);
+                                if (sendValue === null) {
+                                    cell.innerHTML = originalHtml;
+                                    return;
+                                }
+                            } else if (field === "avg_hr") {
+                                sendValue = parseFloat(val);
+                                if (isNaN(sendValue)) {
+                                    cell.innerHTML = originalHtml;
+                                    return;
+                                }
+                            }
+
+                            saveIntervalEdit(intervalId, field, sendValue).then(result => {
+                                if (result) {
+                                    const iv = result.interval;
+                                    if (field === "distance") {
+                                        cell.textContent = iv.display_distance;
+                                        cell.dataset.raw = iv.canonical_distance_mi || iv.gps_measured_distance_mi || iv.prescribed_distance_mi || 0;
+                                        // Update pace cell
+                                        const paceCell = tr.children[3];
+                                        if (paceCell) paceCell.textContent = iv.display_pace;
+                                    } else if (field === "duration_s") {
+                                        cell.textContent = iv.display_duration;
+                                        cell.dataset.raw = iv.duration_s || "";
+                                        const paceCell = tr.children[3];
+                                        if (paceCell) paceCell.textContent = iv.display_pace;
+                                    } else if (field === "avg_hr") {
+                                        cell.textContent = iv.display_hr;
+                                        cell.dataset.raw = iv.avg_hr || "";
+                                    }
+                                    updateSourceCell(tr, "manual");
+                                } else {
+                                    cell.innerHTML = originalHtml;
+                                }
+                            });
+                        } else {
+                            cell.innerHTML = originalHtml;
+                        }
+                    }
+
+                    input.addEventListener("keydown", (ev) => {
+                        ev.stopPropagation();
+                        if (ev.key === "Enter") finish(true);
+                        if (ev.key === "Escape") finish(false);
+                    });
+                    input.addEventListener("blur", () => finish(true));
+                }
+            });
+        });
+    }
+
+    function parseDurationPrecise(str) {
+        if (!str) return null;
+        // Accept m:ss, m:ss.t, h:mm:ss, h:mm:ss.t
+        const match = str.match(/^(\d+):(\d{1,2})(?::(\d{1,2}))?(?:\.(\d))?$/);
+        if (!match) return null;
+        let result;
+        if (match[3] !== undefined) {
+            // h:mm:ss.t
+            result = parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseInt(match[3]);
+        } else {
+            // m:ss.t
+            result = parseInt(match[1]) * 60 + parseInt(match[2]);
+        }
+        if (match[4] !== undefined) {
+            result += parseInt(match[4]) / 10;
+        }
+        return result;
+    }
+
+    function updateSourceCell(tr, source) {
+        const sourceCell = tr.querySelector(".iv-source");
+        if (sourceCell) sourceCell.textContent = source;
+    }
+
+    function saveIntervalEdit(intervalId, field, value) {
+        return fetch(`/api/interval/${intervalId}/edit`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ field, value }),
+        }).then(r => r.json()).then(d => d.ok ? d : false).catch(() => false);
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement("div");
+        div.textContent = text;
+        return div.innerHTML;
     }
 
     // ── Render charts (canvas) ──────────────────────────────────
@@ -623,8 +903,8 @@
         ctx.lineWidth = 1.5;
         ctx.stroke();
 
-        // Value + time label (only when frozen)
-        if (frozen) {
+        // Value + time label
+        {
             const min = Math.floor((nearest.t - data[0].t) / 60);
             const sec = Math.round((nearest.t - data[0].t) % 60);
             const label = `${opts.formatY(nearest.v)}  ${min}:${sec < 10 ? "0" : ""}${sec}`;
@@ -751,40 +1031,126 @@
         }, 100);
     }
 
-    // ── Shoe dropdown ───────────────────────────────────────────
+    // ── Per-activity edit form builder ─────────────────────────
 
-    function populateShoeDropdown(id) {
-        // Try both the primary id and query by detail panel
-        let select = document.querySelector(`#edit-${id} select[data-field="shoe_id"]`);
-        if (!select) {
-            // Fallback: find within the detail row
-            const detailRow = document.querySelector(`.detail-row[data-id="${id}"]`);
-            if (detailRow) select = detailRow.querySelector(`select[data-field="shoe_id"]`);
-        }
-        if (!select || !window.SHOES) return;
-        if (select.options.length > 1) return; // already populated
-
-        for (const [shoeId, name] of Object.entries(SHOES)) {
-            const opt = document.createElement("option");
-            opt.value = shoeId;
-            opt.textContent = name;
-            select.appendChild(opt);
-        }
-
-        const row = document.querySelector(`.activity-row[data-id="${id}"]`);
-        const shoeCell = row ? row.querySelector(".col-shoe") : null;
-        if (shoeCell) {
-            const currentShoe = shoeCell.textContent.trim();
-            for (const opt of select.options) {
-                if (opt.textContent === currentShoe) { opt.selected = true; break; }
-            }
-        }
+    function formatDurationInput(seconds) {
+        if (seconds == null) return "";
+        const s = Math.round(seconds);
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = s % 60;
+        if (h > 0) return `${h}:${m < 10 ? "0" : ""}${m}:${sec < 10 ? "0" : ""}${sec}`;
+        return `${m}:${sec < 10 ? "0" : ""}${sec}`;
     }
 
-    // ── Edit buttons ────────────────────────────────────────────
+    function formatPaceInput(secPerMile) {
+        if (secPerMile == null) return "";
+        const s = Math.round(secPerMile);
+        const m = Math.floor(s / 60);
+        const sec = s % 60;
+        return `${m}:${sec < 10 ? "0" : ""}${sec}`;
+    }
 
-    function wireEditButtons(id) {
-        const form = document.getElementById(`edit-${id}`);
+    function parseDuration(str) {
+        if (!str) return null;
+        const parts = str.split(":").map(Number);
+        if (parts.some(isNaN)) return null;
+        if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+        if (parts.length === 2) return parts[0] * 60 + parts[1];
+        return null;
+    }
+
+    function buildEditForm(meta) {
+        const aid = meta.id;
+        const ov = meta.overridden_fields || [];
+        const cats = ["", "easy", "long", "tempo", "interval", "race", "recovery", "other"];
+
+        let shoeOptions = '<option value="">--</option>';
+        if (window.SHOES) {
+            for (const [shoeId, name] of Object.entries(window.SHOES)) {
+                const sel = meta.shoe_id && parseInt(shoeId) === meta.shoe_id ? " selected" : "";
+                shoeOptions += `<option value="${shoeId}"${sel}>${escapeHtml(name)}</option>`;
+            }
+        }
+
+        let catOptions = "";
+        for (const cat of cats) {
+            const sel = meta.workout_category === cat ? " selected" : "";
+            catOptions += `<option value="${cat}"${sel}>${cat || "--"}</option>`;
+        }
+
+        const durVal = formatDurationInput(meta.duration_s);
+        const paceVal = formatPaceInput(meta.avg_pace_s_per_mi);
+
+        return `
+        <h3 style="margin-top:10px">Edit</h3>
+        <div class="edit-form" data-edit-aid="${aid}">
+            <div class="edit-row">
+                <label>Name</label>
+                <input type="text" data-field="workout_name" value="${escapeHtml(meta.workout_name)}" placeholder="${escapeHtml(meta.workout_name)}">
+                <button class="btn-save" data-field="workout_name">Save</button>
+                <button class="btn-clear" data-field="workout_name" ${ov.includes("workout_name") ? "" : 'style="display:none"'}>Clear</button>
+            </div>
+            <div class="edit-row">
+                <label>Category</label>
+                <select data-field="workout_category">${catOptions}</select>
+                <button class="btn-save" data-field="workout_category">Save</button>
+                <button class="btn-clear" data-field="workout_category" ${ov.includes("workout_category") ? "" : 'style="display:none"'}>Clear</button>
+            </div>
+            <div class="edit-row">
+                <label>Distance (mi)</label>
+                <input type="number" step="0.01" data-field="distance_mi" value="${meta.adjusted_distance_mi != null ? parseFloat(meta.adjusted_distance_mi).toFixed(2) : (meta.distance_mi != null ? parseFloat(meta.distance_mi).toFixed(2) : "")}" placeholder="${meta.display_distance || ""}">
+                <button class="btn-save" data-field="distance_mi">Save</button>
+                <button class="btn-clear" data-field="distance_mi" ${ov.includes("distance_mi") ? "" : 'style="display:none"'}>Clear</button>
+            </div>
+            <div class="edit-row">
+                <label>Duration</label>
+                <input type="text" data-field="duration_s" data-type="duration" value="${durVal}" placeholder="${durVal || "m:ss"}">
+                <button class="btn-save" data-field="duration_s">Save</button>
+                <button class="btn-clear" data-field="duration_s" ${ov.includes("duration_s") ? "" : 'style="display:none"'}>Clear</button>
+            </div>
+            <div class="edit-row">
+                <label>Pace (/mi)</label>
+                <input type="text" data-field="avg_pace_s_per_mi" data-type="pace" value="${paceVal}" placeholder="${paceVal || "m:ss"}">
+                <button class="btn-save" data-field="avg_pace_s_per_mi">Save</button>
+                <button class="btn-clear" data-field="avg_pace_s_per_mi" ${ov.includes("avg_pace_s_per_mi") ? "" : 'style="display:none"'}>Clear</button>
+            </div>
+            <div class="edit-row">
+                <label>Avg HR</label>
+                <input type="number" step="1" data-field="avg_hr" value="${meta.avg_hr != null ? Math.round(meta.avg_hr) : ""}" placeholder="${meta.avg_hr != null ? Math.round(meta.avg_hr) : ""}">
+                <button class="btn-save" data-field="avg_hr">Save</button>
+                <button class="btn-clear" data-field="avg_hr" ${ov.includes("avg_hr") ? "" : 'style="display:none"'}>Clear</button>
+            </div>
+            <div class="edit-row">
+                <label>Cadence</label>
+                <input type="number" step="1" data-field="avg_cadence" value="${meta.avg_cadence != null ? Math.round(meta.avg_cadence) : ""}" placeholder="${meta.avg_cadence != null ? Math.round(meta.avg_cadence) : ""}">
+                <button class="btn-save" data-field="avg_cadence">Save</button>
+                <button class="btn-clear" data-field="avg_cadence" ${ov.includes("avg_cadence") ? "" : 'style="display:none"'}>Clear</button>
+            </div>
+            <div class="edit-row">
+                <label>Shoe</label>
+                <select data-field="shoe_id">${shoeOptions}</select>
+                <button class="btn-save" data-field="shoe_id">Save</button>
+                <button class="btn-clear" data-field="shoe_id" ${ov.includes("shoe_id") ? "" : 'style="display:none"'}>Clear</button>
+            </div>
+            <div class="edit-row">
+                <label>Strides</label>
+                <input type="number" step="1" data-field="strides" value="${meta.strides || ""}" placeholder="${meta.strides || ""}">
+                <button class="btn-save" data-field="strides">Save</button>
+                <button class="btn-clear" data-field="strides" ${ov.includes("strides") ? "" : 'style="display:none"'}>Clear</button>
+            </div>
+            <div class="edit-row">
+                <label>Notes</label>
+                <textarea data-field="notes" rows="2" placeholder="${escapeHtml(meta.notes)}">${escapeHtml(meta.notes)}</textarea>
+                <button class="btn-save" data-field="notes">Save</button>
+                <button class="btn-clear" data-field="notes" ${ov.includes("notes") ? "" : 'style="display:none"'}>Clear</button>
+            </div>
+        </div>`;
+    }
+
+    function wireEditForm(container, meta) {
+        const aid = meta.id;
+        const form = container.querySelector(`[data-edit-aid="${aid}"]`);
         if (!form) return;
 
         form.querySelectorAll(".btn-save").forEach(btn => {
@@ -792,23 +1158,43 @@
                 e.stopPropagation();
                 const field = btn.dataset.field;
                 const input = form.querySelector(`[data-field="${field}"]`);
-                const value = input.value;
-                if (value === "" || value === undefined) return;
+                let value = input.value;
 
-                saveOverride(id, field, value).then(result => {
+                // Nullable numeric fields: allow saving empty to clear the value
+                const NULLABLE_FIELDS = new Set(["avg_hr", "max_hr", "avg_cadence", "avg_pace_s_per_mi", "duration_s"]);
+                if (value === "" || value === undefined) {
+                    if (NULLABLE_FIELDS.has(field)) {
+                        value = "";  // will be sent as empty string, backend stores NULL
+                    } else {
+                        return;
+                    }
+                }
+
+                // Parse m:ss format for duration/pace fields
+                if (value !== "" && (input.dataset.type === "duration" || input.dataset.type === "pace")) {
+                    const parsed = parseDuration(value);
+                    if (parsed === null) { input.style.borderColor = "#c00"; return; }
+                    input.style.borderColor = "";
+                    value = parsed;
+                }
+
+                saveOverride(aid, field, value).then(result => {
                     if (result) {
                         btn.textContent = "Saved!";
                         setTimeout(() => btn.textContent = "Save", 1500);
                         const clearBtn = form.querySelector(`.btn-clear[data-field="${field}"]`);
                         if (clearBtn) clearBtn.style.display = "";
-                        const row = document.querySelector(`.activity-row[data-id="${id}"]`);
-                        const colClass = fieldToColClass(field);
-                        const cell = row ? row.querySelector(`.col-${colClass}`) : null;
-                        if (cell) {
-                            cell.classList.add("overridden");
-                            updateCellDisplay(cell, field, value);
+                        // Update the grid row (uses primary activity id from the row)
+                        const row = document.querySelector(`.activity-row[data-id="${aid}"]`)
+                                 || document.querySelector(`.activity-row[data-activity-ids*="${aid}"]`);
+                        if (row) {
+                            const colClass = fieldToColClass(field);
+                            const cell = row.querySelector(`.col-${colClass}`);
+                            if (cell) {
+                                cell.classList.add("overridden");
+                                updateCellDisplay(cell, field, value);
+                            }
                         }
-                        // Refresh aggregates when distance changes
                         if (field === "distance_mi" && result.date) {
                             refreshSevenDayMA(result.date);
                             refreshFooterStats();
@@ -822,12 +1208,15 @@
             btn.addEventListener("click", (e) => {
                 e.stopPropagation();
                 const field = btn.dataset.field;
-                clearOverride(id, field).then(ok => {
+                clearOverride(aid, field).then(ok => {
                     if (ok) {
                         btn.style.display = "none";
-                        const row = document.querySelector(`.activity-row[data-id="${id}"]`);
-                        const cell = row.querySelector(`.col-${fieldToColClass(field)}`);
-                        if (cell) cell.classList.remove("overridden");
+                        const row = document.querySelector(`.activity-row[data-id="${aid}"]`)
+                                 || document.querySelector(`.activity-row[data-activity-ids*="${aid}"]`);
+                        if (row) {
+                            const cell = row.querySelector(`.col-${fieldToColClass(field)}`);
+                            if (cell) cell.classList.remove("overridden");
+                        }
                     }
                 });
             });
@@ -841,34 +1230,40 @@
             distance_mi: "dist", duration_s: "dur", avg_pace_s_per_mi: "pace",
             workout_name: "name", workout_category: "name",
             shoe_id: "shoe", notes: "notes", strides: "strides",
-            workout_type_zone: "type",
+            workout_type_zone: "type", avg_hr: "hr", max_hr: "hr",
+            avg_cadence: "cad",
         };
         return map[field] || field;
     }
 
     function updateCellDisplay(cell, field, value) {
+        const empty = value === "" || value === null || value === undefined;
         if (field === "distance_mi") {
-            cell.textContent = parseFloat(value).toFixed(1);
+            cell.textContent = empty ? "" : parseFloat(value).toFixed(1);
         } else if (field === "workout_name") {
-            cell.textContent = value;
+            cell.textContent = value || "";
         } else if (field === "strides") {
-            cell.textContent = value;
+            cell.textContent = value || "";
         } else if (field === "notes") {
-            cell.textContent = value;
-            cell.title = value;
+            cell.textContent = value || "";
+            cell.title = value || "";
         } else if (field === "shoe_id" && window.SHOES) {
-            cell.textContent = SHOES[value] || "";
+            cell.textContent = window.SHOES[value] || "";
         } else if (field === "duration_s") {
+            if (empty) { cell.textContent = ""; return; }
             const s = parseInt(value, 10);
             const h = Math.floor(s / 3600);
             const m = Math.floor((s % 3600) / 60);
             const sec = s % 60;
-            cell.textContent = h ? `${h}h ${m}m` : `${m}:${sec < 10 ? "0" : ""}${sec}`;
+            cell.textContent = h ? `${h}:${m < 10 ? "0" : ""}${m}:${sec < 10 ? "0" : ""}${sec}` : `${m}:${sec < 10 ? "0" : ""}${sec}`;
         } else if (field === "avg_pace_s_per_mi") {
+            if (empty) { cell.textContent = ""; return; }
             const s = parseFloat(value);
             const m = Math.floor(s / 60);
             const sec = Math.round(s % 60);
             cell.textContent = `${m}:${sec < 10 ? "0" : ""}${sec}`;
+        } else if (field === "avg_hr" || field === "max_hr" || field === "avg_cadence") {
+            cell.textContent = empty ? "" : Math.round(parseFloat(value));
         }
     }
 
@@ -910,9 +1305,9 @@
 
     function drawWeeklyMileageChart() {
         const canvas = document.getElementById("weekly-mileage-chart");
-        if (!canvas || !window.WEEKLY_CHART_DATA || !WEEKLY_CHART_DATA.length) return;
+        if (!canvas || !window.WEEKLY_CHART_DATA || !window.WEEKLY_CHART_DATA.length) return;
 
-        const data = WEEKLY_CHART_DATA;
+        const data = window.WEEKLY_CHART_DATA;
         const ctx = canvas.getContext("2d");
         const dpr = window.devicePixelRatio || 1;
         const rect = canvas.getBoundingClientRect();

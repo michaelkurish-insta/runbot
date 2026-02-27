@@ -33,6 +33,7 @@ def create_app(config=None):
     OVERRIDABLE_FIELDS = {
         "distance_mi", "duration_s", "avg_pace_s_per_mi", "workout_name",
         "workout_category", "shoe_id", "notes", "strides", "workout_type_zone",
+        "avg_hr", "max_hr", "avg_cadence",
     }
 
     MONTH_NAMES = [
@@ -75,7 +76,8 @@ def create_app(config=None):
         for field_name, value in overrides.items():
             if field_name in activity_dict or field_name in OVERRIDABLE_FIELDS:
                 overridden.add(field_name)
-                if field_name in ("distance_mi", "duration_s", "avg_pace_s_per_mi"):
+                if field_name in ("distance_mi", "duration_s", "avg_pace_s_per_mi",
+                                  "avg_hr", "max_hr", "avg_cadence"):
                     activity_dict[field_name] = float(value)
                 elif field_name in ("shoe_id", "strides"):
                     activity_dict[field_name] = int(value)
@@ -650,6 +652,47 @@ def create_app(config=None):
         conn.close()
         return jsonify(points)
 
+    @app.route("/api/activity/<int:activity_id>/meta")
+    def api_activity_meta(activity_id):
+        conn = get_db()
+        row = conn.execute(
+            """SELECT a.*, s.name as shoe_name
+               FROM activities a
+               LEFT JOIN shoes s ON a.shoe_id = s.id
+               WHERE a.id = ?""",
+            (activity_id,),
+        ).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "not found"}), 404
+        a = dict(row)
+        ovr = _get_overrides_for_activities(conn, [activity_id]).get(activity_id, {})
+        overridden = list(_apply_overrides(a, ovr))
+        conn.close()
+
+        display_dist = a.get("adjusted_distance_mi") or a.get("distance_mi")
+        return jsonify({
+            "id": a["id"],
+            "workout_name": a.get("workout_name") or "",
+            "shoe_id": a.get("shoe_id"),
+            "shoe_name": a.get("shoe_name") or "",
+            "workout_category": a.get("workout_category") or "",
+            "distance_mi": a.get("distance_mi"),
+            "adjusted_distance_mi": a.get("adjusted_distance_mi"),
+            "display_distance": f"{display_dist:.2f}" if display_dist else "",
+            "duration_s": a.get("duration_s"),
+            "display_duration": _format_duration(a.get("duration_s")),
+            "avg_pace_s_per_mi": a.get("avg_pace_s_per_mi"),
+            "display_pace": _format_pace(a.get("avg_pace_s_per_mi")),
+            "avg_hr": a.get("avg_hr"),
+            "display_hr": f"{a['avg_hr']:.0f}" if a.get("avg_hr") else "",
+            "max_hr": a.get("max_hr"),
+            "avg_cadence": a.get("avg_cadence"),
+            "strides": a.get("strides"),
+            "notes": a.get("notes") or "",
+            "overridden_fields": overridden,
+        })
+
     @app.route("/api/activity/<int:activity_id>/override", methods=["POST"])
     def api_override(activity_id):
         data = request.get_json()
@@ -662,22 +705,78 @@ def create_app(config=None):
         if field not in OVERRIDABLE_FIELDS:
             return jsonify({"error": f"field '{field}' is not overridable"}), 400
 
+        # Nullable numeric fields: empty string means NULL
+        NULLABLE_NUMERIC = {"avg_hr", "max_hr", "avg_cadence", "avg_pace_s_per_mi", "duration_s"}
+        is_null = field in NULLABLE_NUMERIC and str(value).strip() == ""
+
         conn = get_db()
-        conn.execute(
-            """INSERT INTO activity_overrides (activity_id, field_name, override_value)
-               VALUES (?, ?, ?)
-               ON CONFLICT(activity_id, field_name)
-               DO UPDATE SET override_value = excluded.override_value,
-                             created_at = datetime('now')""",
-            (activity_id, field, str(value)),
-        )
-        # Sync distance override to activities table so aggregates reflect it
-        if field == "distance_mi":
-            dist = float(value)
+
+        if is_null:
+            # Delete the override and set the activity field to NULL
             conn.execute(
-                "UPDATE activities SET distance_mi = ?, adjusted_distance_mi = ? WHERE id = ?",
-                (dist, dist, activity_id),
+                "DELETE FROM activity_overrides WHERE activity_id = ? AND field_name = ?",
+                (activity_id, field),
             )
+            conn.execute(
+                f"UPDATE activities SET {field} = NULL, updated_at = datetime('now') WHERE id = ?",
+                (activity_id,),
+            )
+            if field in ("duration_s", "avg_pace_s_per_mi"):
+                conn.execute(
+                    "UPDATE activities SET avg_pace_display = NULL WHERE id = ?",
+                    (activity_id,),
+                )
+        else:
+            conn.execute(
+                """INSERT INTO activity_overrides (activity_id, field_name, override_value)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(activity_id, field_name)
+                   DO UPDATE SET override_value = excluded.override_value,
+                                 created_at = datetime('now')""",
+                (activity_id, field, str(value)),
+            )
+            # Sync overrides to activities table so they become canonical
+            # and won't be overridden by future imports
+            SYNC_FIELDS = {
+                "distance_mi", "duration_s", "avg_pace_s_per_mi",
+                "avg_hr", "max_hr", "avg_cadence",
+                "workout_name", "workout_category", "shoe_id", "strides", "notes",
+            }
+            if field in SYNC_FIELDS:
+                if field == "distance_mi":
+                    dist = float(value)
+                    conn.execute(
+                        "UPDATE activities SET distance_mi = ?, adjusted_distance_mi = ?, "
+                        "updated_at = datetime('now') WHERE id = ?",
+                        (dist, dist, activity_id),
+                    )
+                elif field in ("duration_s", "avg_pace_s_per_mi", "avg_hr", "max_hr", "avg_cadence"):
+                    conn.execute(
+                        f"UPDATE activities SET {field} = ?, updated_at = datetime('now') WHERE id = ?",
+                        (float(value), activity_id),
+                    )
+                    # Recompute pace display if duration or pace changed
+                    if field in ("duration_s", "avg_pace_s_per_mi"):
+                        row = conn.execute(
+                            "SELECT duration_s, distance_mi, avg_pace_s_per_mi FROM activities WHERE id = ?",
+                            (activity_id,),
+                        ).fetchone()
+                        if row:
+                            pace = row["avg_pace_s_per_mi"]
+                            conn.execute(
+                                "UPDATE activities SET avg_pace_display = ? WHERE id = ?",
+                                (_format_pace(pace), activity_id),
+                            )
+                elif field in ("shoe_id", "strides"):
+                    conn.execute(
+                        f"UPDATE activities SET {field} = ?, updated_at = datetime('now') WHERE id = ?",
+                        (int(value), activity_id),
+                    )
+                else:
+                    conn.execute(
+                        f"UPDATE activities SET {field} = ?, updated_at = datetime('now') WHERE id = ?",
+                        (value, activity_id),
+                    )
         conn.commit()
 
         # Return the activity date so JS can refresh aggregates
@@ -735,6 +834,87 @@ def create_app(config=None):
         conn.commit()
         conn.close()
         return jsonify({"ok": True, "interval_id": interval_id, "is_walking": is_walking})
+
+    # ── Interval editing ──────────────────────────────────────────
+
+    INTERVAL_EDITABLE = {"distance", "duration_s", "avg_hr", "pace_zone"}
+
+    @app.route("/api/interval/<int:interval_id>/edit", methods=["PUT"])
+    def api_edit_interval(interval_id):
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        field = data.get("field")
+        value = data.get("value")
+        if field not in INTERVAL_EDITABLE:
+            return jsonify({"error": f"field '{field}' is not editable"}), 400
+
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM intervals WHERE id = ?", (interval_id,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "interval not found"}), 404
+
+        iv = dict(row)
+
+        if field == "distance":
+            # Value is in miles
+            dist = float(value)
+            conn.execute(
+                "UPDATE intervals SET canonical_distance_mi = ?, source = 'manual' WHERE id = ?",
+                (dist, interval_id),
+            )
+            # Recalculate pace if duration exists
+            dur = iv.get("duration_s")
+            if dur and dist > 0:
+                pace = dur / dist
+                conn.execute(
+                    "UPDATE intervals SET avg_pace_s_per_mi = ?, avg_pace_display = ? WHERE id = ?",
+                    (pace, _format_pace(pace), interval_id),
+                )
+
+        elif field == "duration_s":
+            dur = float(value)
+            conn.execute(
+                "UPDATE intervals SET duration_s = ?, source = 'manual' WHERE id = ?",
+                (dur, interval_id),
+            )
+            # Recalculate pace if distance exists
+            dist = iv.get("canonical_distance_mi") or iv.get("gps_measured_distance_mi") or iv.get("prescribed_distance_mi")
+            if dist and dist > 0:
+                pace = dur / dist
+                conn.execute(
+                    "UPDATE intervals SET avg_pace_s_per_mi = ?, avg_pace_display = ? WHERE id = ?",
+                    (pace, _format_pace(pace), interval_id),
+                )
+
+        elif field == "avg_hr":
+            hr = float(value) if value else None
+            conn.execute(
+                "UPDATE intervals SET avg_hr = ?, source = 'manual' WHERE id = ?",
+                (hr, interval_id),
+            )
+
+        elif field == "pace_zone":
+            zone = value if value else None
+            conn.execute(
+                "UPDATE intervals SET pace_zone = ?, source = 'manual' WHERE id = ?",
+                (zone, interval_id),
+            )
+
+        conn.commit()
+
+        # Fetch updated interval for response
+        updated = conn.execute(
+            "SELECT * FROM intervals WHERE id = ?", (interval_id,)
+        ).fetchone()
+        conn.close()
+
+        result = _format_interval(updated)
+        return jsonify({"ok": True, "interval": result})
 
     # ── Planned activities ─────────────────────────────────────────
 

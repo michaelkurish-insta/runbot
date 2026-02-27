@@ -484,6 +484,49 @@ header {
 .intervals-table .is-walking td { color: #ccc; text-decoration: line-through; }
 .intervals-table .is-stride td { color: #E65100; font-weight: 600; }
 
+/* Editable interval cells */
+.iv-editable { cursor: pointer; }
+.iv-editable:hover { background: rgba(74,122,181,0.08); }
+
+.iv-inline-edit {
+    width: 100%;
+    border: 1px solid #4a7ab5;
+    border-radius: 2px;
+    padding: 1px 3px;
+    font-size: 12px;
+    font-family: inherit;
+    background: #fff;
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(74,122,181,0.2);
+}
+
+/* Activity section headers (multi-activity days) */
+.activity-section { margin-bottom: 8px; }
+
+.activity-section-header {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 6px;
+}
+
+.activity-section-header .activity-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #333;
+}
+
+.activity-section-header .activity-meta {
+    font-size: 11px;
+    color: #888;
+}
+
+.activity-divider {
+    border: none;
+    border-top: 1px solid #ddd;
+    margin: 10px 0;
+}
+
 /* Rep summary */
 .rep-summary {
     margin-top: 4px;

@@ -261,17 +261,12 @@ def cmd_reconcile(args):
 
             if args.dry_run:
                 for group in groups:
-                    primary = group[0]
-                    total_dist = sum(o["distance_mi"] or 0 for o in group)
-                    names = [o.get("strava_name") or o.get("workout_name") or "?" for o in group]
-                    if len(group) == 1:
-                        print(f"  [DRY RUN] Would promote {primary['start_date']} "
-                              f"{total_dist:.2f}mi \"{names[0]}\"")
-                    else:
-                        dists = [f"{o['distance_mi']:.2f}" for o in group]
-                        print(f"  [DRY RUN] Would promote {primary['start_date']} "
-                              f"{' + '.join(dists)} = {total_dist:.2f}mi ({', '.join(names)})")
-                promoted_count = len(groups)
+                    for o in group:
+                        name = o.get("strava_name") or o.get("workout_name") or "?"
+                        dist = o["distance_mi"] or 0
+                        print(f"  [DRY RUN] Would promote {o['start_date']} "
+                              f"{dist:.2f}mi \"{name}\"")
+                promoted_count = total_orphans
             else:
                 promoted_activities = promote_orphans(conn, groups, verbose=args.verbose)
                 promoted_count = len(promoted_activities)
