@@ -284,11 +284,8 @@ def _has_workout_fit_laps(conn, activity_id: int) -> bool:
     """Check if an activity has FIT/Strava laps with a workout-like pace pattern.
 
     Detects structured workouts by looking for bimodal pace distribution
-    (alternating fast reps + slow recoveries). Walking-pace laps are excluded
-    from the pace ratio check (recoveries can be walking) but the activity
-    must have >=4 total laps to qualify.
-
-    Returns True if non-walking laps show slowest >= 1.5x fastest pace.
+    (alternating fast reps + slow recoveries, or fast reps + walking).
+    Requires >=4 laps and slowest >= 1.5x fastest pace.
     """
     rows = conn.execute(
         """SELECT avg_pace_s_per_mi FROM intervals
@@ -300,11 +297,8 @@ def _has_workout_fit_laps(conn, activity_id: int) -> bool:
     ).fetchall()
     if len(rows) < 4:
         return False
-    # Exclude walking-pace laps from ratio check
-    running_paces = [r[0] for r in rows if r[0] < 720]
-    if len(running_paces) < 4:
-        return False
-    return max(running_paces) >= min(running_paces) * 1.5
+    paces = [r[0] for r in rows]
+    return max(paces) >= min(paces) * 1.5
 
 
 def _compute_centroid(streams: list[dict]) -> tuple[float, float] | None:
@@ -555,13 +549,17 @@ def enrich_activity(conn, activity_id: int, config: dict,
     # Refresh in-memory intervals after reset
     intervals = _load_intervals(conn, activity_id)
 
+    # Always clean up stale pace segments before deciding whether to regenerate.
+    # A previous run may have classified this activity as unstructured, but a
+    # code change (e.g. improved workout detection) may now classify it as
+    # structured — stale segments must not linger.
+    conn.execute(
+        "DELETE FROM intervals WHERE activity_id = ? AND source = 'pace_segment'",
+        (activity_id,),
+    )
+
     if not is_structured(activity_info) and streams and boundaries:
         # Unstructured: create pace segments from streams
-        # Delete old pace_segment intervals first
-        conn.execute(
-            "DELETE FROM intervals WHERE activity_id = ? AND source = 'pace_segment'",
-            (activity_id,),
-        )
 
         segments = segment_by_pace(streams, boundaries, paces_cfg)
         if segments:
@@ -761,12 +759,29 @@ def enrich_activity(conn, activity_id: int, config: dict,
             summary["walking_intervals"] += 1
 
     # --- Stride detection (Step 4) ---
-    # Only flag manually entered intervals (FIT/Strava laps, XLSX splits),
-    # not auto-generated pace segments whose short duration is just a
-    # transition between pace changes.
-    for interval in intervals:
-        if interval.get("source") == "pace_segment":
-            continue
+    # Only flag manually lapped intervals, not pace segments or auto-lap
+    # trailing runts.  Deduplicate: if both null-source (FIT) and strava_lap
+    # exist for the same laps, prefer FIT — its higher GPS resolution gives
+    # more accurate pace for very short intervals like strides.
+    non_seg = [i for i in intervals if i.get("source") != "pace_segment"]
+    has_null_src = any(i.get("source") is None for i in non_seg)
+    has_strava_src = any(i.get("source") == "strava_lap" for i in non_seg)
+    if has_null_src and has_strava_src:
+        stride_candidates = [i for i in non_seg if i.get("source") is None]
+    else:
+        stride_candidates = non_seg
+
+    # Exclude auto-lap trailing runts: if the non-last laps have uniform
+    # distance (> 0.5 mi median), the final short segment is an artifact.
+    if len(stride_candidates) >= 3:
+        by_time = sorted(stride_candidates, key=lambda i: i.get("start_timestamp_s") or 0)
+        other_dists = [i.get("gps_measured_distance_mi") or 0 for i in by_time[:-1]]
+        median_dist = sorted(other_dists)[len(other_dists) // 2]
+        last_dist = by_time[-1].get("gps_measured_distance_mi") or 0
+        if median_dist > 0.5 and last_dist < median_dist * 0.5:
+            stride_candidates = [i for i in stride_candidates if i is not by_time[-1]]
+
+    for interval in stride_candidates:
         duration = interval.get("duration_s")
         if duration and duration < stride_max and not interval["is_recovery"]:
             interval["is_stride"] = True
@@ -817,10 +832,8 @@ def enrich_activity(conn, activity_id: int, config: dict,
         )
 
     # --- Compute adjusted_distance_mi (Step 6) ---
-    # Use pace_segment intervals if they exist, otherwise use original intervals.
-    # This avoids double-counting when both FIT laps and pace segments exist.
-    # Strides always count (even when their distance is absorbed into walking
-    # pace_segments), so add stride distance from FIT/Strava laps separately.
+    # Use pace_segment intervals if they exist and cover most of the activity,
+    # otherwise fall back to FIT/Strava laps.
     # When both NULL-source (FIT) and strava_lap intervals exist for the same
     # reps, prefer strava_lap to avoid double-counting.
     segment_intervals = [i for i in intervals if i.get("source") == "pace_segment"]
@@ -848,14 +861,6 @@ def enrich_activity(conn, activity_id: int, config: dict,
         for i in distance_intervals
         if not i.get("is_walking")
     )
-    used_segments = distance_intervals is segment_intervals
-    if used_segments:
-        stride_distance = sum(
-            i.get("gps_measured_distance_mi") or 0
-            for i in intervals
-            if i.get("is_stride") and i.get("source") != "pace_segment"
-        )
-        non_walking_distance += stride_distance
     adjusted_distance = round(non_walking_distance, 2) if distance_intervals else activity["distance_mi"]
 
     # --- Fix duration for multi-source activities (Step 6b) ---
@@ -884,6 +889,10 @@ def enrich_activity(conn, activity_id: int, config: dict,
         avg_pace_display = None
 
     # --- Store VDOT + adjusted distance + pace on activity ---
+    # --- Update activity strides count from detected stride intervals ---
+    stride_count = sum(1 for i in intervals if i.get("is_stride") and i.get("source") != "pace_segment")
+    stride_count = stride_count or None  # store NULL if zero
+
     # Respect manual distance overrides from the GUI — they are canonical.
     has_dist_override = conn.execute(
         "SELECT 1 FROM activity_overrides WHERE activity_id = ? AND field_name = 'distance_mi'",
@@ -892,15 +901,16 @@ def enrich_activity(conn, activity_id: int, config: dict,
     if has_dist_override:
         conn.execute(
             "UPDATE activities SET vdot = ?, duration_s = ?, "
-            "avg_pace_s_per_mi = ?, avg_pace_display = ? WHERE id = ?",
-            (vdot, act_dur or activity.get("duration_s"), avg_pace, avg_pace_display, activity_id),
+            "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ? WHERE id = ?",
+            (vdot, act_dur or activity.get("duration_s"), avg_pace, avg_pace_display,
+             stride_count, activity_id),
         )
     else:
         conn.execute(
             "UPDATE activities SET adjusted_distance_mi = ?, vdot = ?, duration_s = ?, "
-            "avg_pace_s_per_mi = ?, avg_pace_display = ? WHERE id = ?",
+            "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ? WHERE id = ?",
             (adjusted_distance, vdot, act_dur or activity.get("duration_s"),
-             avg_pace, avg_pace_display, activity_id),
+             avg_pace, avg_pace_display, stride_count, activity_id),
         )
 
     conn.commit()
