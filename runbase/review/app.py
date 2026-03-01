@@ -62,8 +62,11 @@ def create_app(config=None):
         """Format duration with tenths of a second (for interval detail)."""
         if seconds is None:
             return ""
-        total = int(seconds)
-        tenths = round((seconds - total) * 10) % 10
+        # Round to tenths first, then decompose — avoids truncation bugs
+        # where e.g. 76.968 would show as 1:16.0 instead of 1:17.0
+        rounded = round(seconds, 1)
+        total = int(rounded)
+        tenths = round((rounded - total) * 10)
         if total >= 3600:
             h, rem = divmod(total, 3600)
             m, s = divmod(rem, 60)

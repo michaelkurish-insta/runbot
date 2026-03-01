@@ -37,7 +37,7 @@ reconcile:
     - "runalyze"
 
 paces:
-  walking_threshold_s_per_mi: 660   # 11:00/mi — anything slower is walking
+  walking_threshold_s_per_mi: 840   # 14:00/mi — anything slower is walking
   stride_max_duration_s: 30         # intervals shorter than this are strides
   track_detection:
     max_bbox_m: 300                 # pre-filter: skip window if bbox exceeds this

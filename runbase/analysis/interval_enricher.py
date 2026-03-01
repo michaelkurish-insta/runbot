@@ -169,7 +169,7 @@ def _get_paces_config(config: dict) -> dict:
     """Extract paces config with defaults."""
     paces = config.get("paces", {})
     return {
-        "walking_threshold_s_per_mi": paces.get("walking_threshold_s_per_mi", 660),
+        "walking_threshold_s_per_mi": paces.get("walking_threshold_s_per_mi", 840),
         "stride_max_duration_s": paces.get("stride_max_duration_s", 30),
         "track_detection": paces.get("track_detection", {}),
         "measured_courses": paces.get("measured_courses", []),
@@ -539,12 +539,21 @@ def enrich_activity(conn, activity_id: int, config: dict,
 
     # Reset enrichment fields for non-pace-segment intervals so re-enrichment
     # starts clean (e.g. stale canonical_distance_mi from a previous run).
+    # Preserve is_walking on manual intervals — user edits are canonical.
     conn.execute(
         """UPDATE intervals SET
                canonical_distance_mi = NULL, location_type = NULL,
                is_recovery = 0, set_number = NULL,
                is_walking = 0, is_stride = 0, is_hill_sprint = 0
-           WHERE activity_id = ? AND (source IS NULL OR source != 'pace_segment')""",
+           WHERE activity_id = ? AND source NOT IN ('pace_segment', 'manual')""",
+        (activity_id,),
+    )
+    conn.execute(
+        """UPDATE intervals SET
+               canonical_distance_mi = NULL, location_type = NULL,
+               is_recovery = 0, set_number = NULL,
+               is_stride = 0, is_hill_sprint = 0
+           WHERE activity_id = ? AND source = 'manual'""",
         (activity_id,),
     )
     # Refresh in-memory intervals after reset
@@ -586,7 +595,21 @@ def enrich_activity(conn, activity_id: int, config: dict,
             # Reload intervals after segmentation
             intervals = _load_intervals(conn, activity_id)
 
-    # --- Track detection (Step 1) ---
+    # --- Workout tagging: recovery + set grouping (Step 1) ---
+    # Must run before track detection (needs is_recovery / set_number)
+    # and measured course detection (needs is_recovery).
+    is_structured_activity = is_structured(activity_info)
+    if is_structured_activity and boundaries:
+        from runbase.analysis.workout_tagger import tag_workout_intervals
+        tag_workout_intervals(intervals, boundaries)
+        recovery_count = sum(1 for iv in intervals if iv.get("is_recovery"))
+        set_count = len({iv.get("set_number") for iv in intervals if iv.get("set_number") is not None})
+        summary["recovery_intervals"] = recovery_count
+        summary["sets_tagged"] = set_count
+        if verbose and (recovery_count or set_count):
+            print(f"    Tagged {recovery_count} recoveries, {set_count} sets")
+
+    # --- Track detection (Step 2) ---
     # Run per source group to avoid mixing GPS from group-matched sub-activities.
     if streams and intervals:
         stream_groups = _split_streams_by_source(streams)
@@ -607,17 +630,22 @@ def enrich_activity(conn, activity_id: int, config: dict,
             # Estimate timestamps for intervals that lack them (e.g. XLSX splits)
             _estimate_interval_timestamps(intervals, streams)
 
-            # First pass: label all overlapping intervals as track
+            # First pass: label track intervals.
+            # Tag intervals that either temporally overlap the detected window
+            # OR are part of a workout set (set_number is set).  When you run
+            # to a track, the detection window may only cover the warmup laps,
+            # but the work sets are also on the track.
             track_intervals = []
             for interval in intervals:
                 if interval["is_recovery"] or not interval.get("gps_measured_distance_mi"):
                     continue
+                in_set = interval.get("set_number") is not None
                 iv_start = interval.get("start_timestamp_s")
                 iv_end = interval.get("end_timestamp_s")
+                overlaps_window = False
                 if iv_start is not None and iv_end is not None and win_start is not None and win_end is not None:
-                    if iv_end < win_start or iv_start > win_end:
-                        continue
-                elif win_start is not None:
+                    overlaps_window = not (iv_end < win_start or iv_start > win_end)
+                if not overlaps_window and not in_set:
                     continue
 
                 interval["location_type"] = "track"
@@ -644,7 +672,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
                     best_dist_m = best["gps_measured_distance_mi"] * METERS_PER_MILE
                     race_dist_m = _closest_race_distance_m(best_dist_m)
 
-                best["canonical_distance_mi"] = round(race_dist_m / METERS_PER_MILE, 4)
+                best["canonical_distance_mi"] = round(race_dist_m / METERS_PER_MILE, 6)
                 best["is_race"] = True
                 if verbose:
                     parsed = "parsed" if _parse_race_distance_m(workout_name) else "closest"
@@ -686,21 +714,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
                 score = track_result["fit_score"]
                 print(f"    Track detected ({method}, score={score})")
 
-    # --- Workout tagging: recovery + set grouping (Step 2) ---
-    # Must run before measured course detection so is_recovery is set
-    # and recovery jogs don't get snapped to course distances.
-    is_structured_activity = is_structured(activity_info)
-    if is_structured_activity and boundaries:
-        from runbase.analysis.workout_tagger import tag_workout_intervals
-        tag_workout_intervals(intervals, boundaries)
-        recovery_count = sum(1 for iv in intervals if iv.get("is_recovery"))
-        set_count = len({iv.get("set_number") for iv in intervals if iv.get("set_number") is not None})
-        summary["recovery_intervals"] = recovery_count
-        summary["sets_tagged"] = set_count
-        if verbose and (recovery_count or set_count):
-            print(f"    Tagged {recovery_count} recoveries, {set_count} sets")
-
-    # --- Measured course detection (Step 2b) ---
+    # --- Measured course detection (Step 3) ---
     # Only apply to structured workouts — skip easy runs whose FIT auto-laps
     # happen to be near measured course distances.
     # Uses work-rep centroids per distance group (not activity centroid) to avoid
@@ -740,7 +754,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
                 if course:
                     snap_m = course["snap_distance_m"]
                     interval["location_type"] = "measured_course"
-                    interval["canonical_distance_mi"] = round(snap_m / METERS_PER_MILE, 4)
+                    interval["canonical_distance_mi"] = round(snap_m / METERS_PER_MILE, 6)
                     _recalc_pace(interval)
                     summary["measured_intervals"] += 1
                     if verbose:
@@ -748,57 +762,27 @@ def enrich_activity(conn, activity_id: int, config: dict,
                         print(f"    Interval {raw_m}m → {round(snap_m)}m"
                               f" ({course.get('name', 'measured')})")
 
-    # --- Walking scrub (Step 3) ---
-    # Skip pace segments — instantaneous pace is unreliable for walking detection
-    # due to hills, GPS noise, etc.  Use elapsed_pace_zone instead.
+    # --- Walking scrub (Step 4) ---
+    # Skip pace segments (instantaneous pace unreliable) and manual intervals
+    # (user edits are canonical — their is_walking state was preserved above).
     for interval in intervals:
-        if interval.get("source") == "pace_segment":
+        if interval.get("source") in ("pace_segment", "manual"):
             continue
         pace = interval.get("avg_pace_s_per_mi")
         if pace and pace >= walking_threshold:
             interval["is_walking"] = True
             summary["walking_intervals"] += 1
 
-    # --- Stride detection (Step 4) ---
-    # Only flag manually lapped intervals, not pace segments or auto-lap
-    # trailing runts.  Deduplicate: if both null-source (FIT) and strava_lap
-    # exist for the same laps, prefer FIT — its higher GPS resolution gives
-    # more accurate pace for very short intervals like strides.
-    non_seg = [i for i in intervals if i.get("source") != "pace_segment"]
-    has_null_src = any(i.get("source") is None for i in non_seg)
-    has_strava_src = any(i.get("source") == "strava_lap" for i in non_seg)
-    if has_null_src and has_strava_src:
-        stride_candidates = [i for i in non_seg if i.get("source") is None]
-    else:
-        stride_candidates = non_seg
-
-    # Exclude auto-lap trailing runts: if the non-last laps have uniform
-    # distance (> 0.5 mi median), the final short segment is an artifact.
-    if len(stride_candidates) >= 3:
-        by_time = sorted(stride_candidates, key=lambda i: i.get("start_timestamp_s") or 0)
-        other_dists = [i.get("gps_measured_distance_mi") or 0 for i in by_time[:-1]]
-        median_dist = sorted(other_dists)[len(other_dists) // 2]
-        last_dist = by_time[-1].get("gps_measured_distance_mi") or 0
-        if median_dist > 0.5 and last_dist < median_dist * 0.5:
-            stride_candidates = [i for i in stride_candidates if i is not by_time[-1]]
-
-    for interval in stride_candidates:
-        duration = interval.get("duration_s")
-        if duration and duration < stride_max and not interval["is_recovery"]:
-            interval["is_stride"] = True
-            summary["stride_intervals"] += 1
-
-    # --- Hill sprint detection (Step 4b) ---
-    # Very short intervals (< 50m) with uphill elevation gain that aren't
-    # already strides.  Overrides is_recovery so the workout tagger's
-    # pace-based classification doesn't gray them out.
+    # --- Hill sprint detection (Step 5) ---
+    # Very short intervals (< 50m) with uphill elevation gain.
+    # Runs BEFORE stride detection so hills take priority.
+    # Overrides is_recovery so the workout tagger's pace-based
+    # classification doesn't gray them out.
     if streams:
-        hill_sprint_max_mi = 0.031  # ~50m
+        hill_sprint_max_mi = 0.035  # ~56m
         for interval in intervals:
             if interval.get("source") == "pace_segment":
                 continue
-            if interval.get("is_stride"):
-                continue  # strides dominate
             dist = interval.get("gps_measured_distance_mi") or 0
             if dist <= 0 or dist > hill_sprint_max_mi:
                 continue
@@ -819,7 +803,43 @@ def enrich_activity(conn, activity_id: int, config: dict,
                 interval["is_recovery"] = False
                 summary["hill_sprint_intervals"] += 1
 
-    # --- Pace zone assignment (Step 5) ---
+    # --- Stride detection (Step 5b) ---
+    # Only flag manually lapped intervals, not pace segments, hill sprints,
+    # or auto-lap trailing runts.  Minimum distance of 0.015 mi (~24m)
+    # excludes tiny stubs from watch start/stop.
+    # Deduplicate: if both null-source (FIT) and strava_lap exist for the
+    # same laps, prefer FIT — its higher GPS resolution gives more accurate
+    # pace for very short intervals like strides.
+    stride_min_mi = 0.015  # ~24m — excludes watch start/stop stubs
+    non_seg = [i for i in intervals if i.get("source") != "pace_segment"]
+    has_null_src = any(i.get("source") is None for i in non_seg)
+    has_strava_src = any(i.get("source") == "strava_lap" for i in non_seg)
+    if has_null_src and has_strava_src:
+        stride_candidates = [i for i in non_seg if i.get("source") is None]
+    else:
+        stride_candidates = non_seg
+
+    # Exclude auto-lap trailing runts: if the non-last laps have uniform
+    # distance (> 0.5 mi median), the final short segment is an artifact.
+    if len(stride_candidates) >= 3:
+        by_time = sorted(stride_candidates, key=lambda i: i.get("start_timestamp_s") or 0)
+        other_dists = [i.get("gps_measured_distance_mi") or 0 for i in by_time[:-1]]
+        median_dist = sorted(other_dists)[len(other_dists) // 2]
+        last_dist = by_time[-1].get("gps_measured_distance_mi") or 0
+        if median_dist > 0.5 and last_dist < median_dist * 0.5:
+            stride_candidates = [i for i in stride_candidates if i is not by_time[-1]]
+
+    for interval in stride_candidates:
+        duration = interval.get("duration_s")
+        dist = interval.get("gps_measured_distance_mi") or 0
+        if (duration and duration < stride_max
+                and dist >= stride_min_mi
+                and not interval["is_recovery"]
+                and not interval.get("is_hill_sprint")):
+            interval["is_stride"] = True
+            summary["stride_intervals"] += 1
+
+    # --- Pace zone assignment (Step 6) ---
     if boundaries:
         for interval in intervals:
             pace = interval.get("avg_pace_s_per_mi")
@@ -828,7 +848,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
                 interval["pace_zone"] = zone
                 summary["zones_assigned"] += 1
 
-    # --- Elapsed pace zone for pace segments (Step 5b) ---
+    # --- Elapsed pace zone for pace segments (Step 6b) ---
     # Compute overall elapsed pace (total distance / total time) and classify it.
     # This gives a more accurate effort score for pace segments than instantaneous
     # pace, which can be distorted by hills, GPS noise, wind, etc.
@@ -865,7 +885,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
              interval["id"]),
         )
 
-    # --- Compute adjusted_distance_mi (Step 6) ---
+    # --- Compute adjusted_distance_mi (Step 7) ---
     # Use pace_segment intervals if they exist and cover most of the activity,
     # otherwise fall back to FIT/Strava laps.
     # When both NULL-source (FIT) and strava_lap intervals exist for the same
@@ -895,9 +915,14 @@ def enrich_activity(conn, activity_id: int, config: dict,
         for i in distance_intervals
         if not i.get("is_walking")
     )
+    walking_duration = sum(
+        i.get("duration_s") or 0
+        for i in distance_intervals
+        if i.get("is_walking")
+    )
     adjusted_distance = round(non_walking_distance, 2) if distance_intervals else activity["distance_mi"]
 
-    # --- Fix duration for multi-source activities (Step 6b) ---
+    # --- Fix duration for multi-source activities (Step 7b) ---
     # Group-matched activities may have duration_s from only one sub-activity.
     # Recompute as the sum of all Strava source durations when that sum exceeds
     # the stored value (i.e. the stored value is partial or zero).
@@ -911,10 +936,39 @@ def enrich_activity(conn, activity_id: int, config: dict,
     if src_dur_sum > act_dur * 1.1:
         act_dur = src_dur_sum
 
-    # Recompute avg pace from (possibly corrected) duration and adjusted distance
-    if adjusted_distance and adjusted_distance > 0 and act_dur > 0:
-        avg_pace = act_dur / adjusted_distance
-        # Round to 1 decimal before formatting to avoid :60.0 from rounding 59.9x
+    # --- Store VDOT + adjusted distance + pace on activity ---
+    # --- Update activity strides count from detected stride intervals ---
+    stride_count = sum(1 for i in intervals if i.get("is_stride") and i.get("source") != "pace_segment")
+    stride_count = stride_count or None  # store NULL if zero
+
+    # Also count hill sprints for the activity record
+    hill_sprint_count = sum(1 for i in intervals if i.get("is_hill_sprint"))
+    hill_sprint_count = hill_sprint_count or None
+
+    # Respect manual overrides from the GUI — they are canonical.
+    overrides = {
+        r[0]: r[1] for r in conn.execute(
+            "SELECT field_name, override_value FROM activity_overrides WHERE activity_id = ?",
+            (activity_id,),
+        ).fetchall()
+    }
+
+    # Respect overrides — they are canonical and must not be overwritten.
+    if "distance_mi" in overrides:
+        adjusted_distance = float(overrides["distance_mi"])
+    if "strides" in overrides:
+        stride_count = int(overrides["strides"]) or None
+
+    # Compute running pace = running_time / adjusted_distance.
+    # Running time excludes walking duration so the pace reflects actual running.
+    running_time = act_dur - walking_duration
+    if "avg_pace_s_per_mi" in overrides:
+        avg_pace = float(overrides["avg_pace_s_per_mi"])
+        tenths = round(avg_pace * 10)
+        mins, secs_tenths = divmod(tenths, 600)
+        avg_pace_display = f"{mins}:{secs_tenths / 10:04.1f}"
+    elif adjusted_distance and adjusted_distance > 0 and running_time > 0:
+        avg_pace = running_time / adjusted_distance
         tenths = round(avg_pace * 10)
         mins, secs_tenths = divmod(tenths, 600)
         avg_pace_display = f"{mins}:{secs_tenths / 10:04.1f}"
@@ -922,17 +976,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
         avg_pace = activity.get("avg_pace_s_per_mi")
         avg_pace_display = None
 
-    # --- Store VDOT + adjusted distance + pace on activity ---
-    # --- Update activity strides count from detected stride intervals ---
-    stride_count = sum(1 for i in intervals if i.get("is_stride") and i.get("source") != "pace_segment")
-    stride_count = stride_count or None  # store NULL if zero
-
-    # Respect manual distance overrides from the GUI — they are canonical.
-    has_dist_override = conn.execute(
-        "SELECT 1 FROM activity_overrides WHERE activity_id = ? AND field_name = 'distance_mi'",
-        (activity_id,),
-    ).fetchone()
-    if has_dist_override:
+    if "distance_mi" in overrides:
         conn.execute(
             "UPDATE activities SET vdot = ?, duration_s = ?, "
             "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ? WHERE id = ?",

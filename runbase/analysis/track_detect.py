@@ -60,7 +60,7 @@ def snap_to_100m(distance_mi: float, snap_m: int = 100) -> float:
     """Snap a distance to the nearest N meters, return in miles."""
     distance_m = distance_mi * METERS_PER_MILE
     snapped_m = round(distance_m / snap_m) * snap_m
-    return round(snapped_m / METERS_PER_MILE, 4)
+    return round(snapped_m / METERS_PER_MILE, 6)
 
 
 def _check_known_tracks(conn, centroid_lat: float, centroid_lon: float,
