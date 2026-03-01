@@ -487,6 +487,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
         "sets_tagged": 0,
         "walking_intervals": 0,
         "stride_intervals": 0,
+        "hill_sprint_intervals": 0,
         "zones_assigned": 0,
         "segments_created": 0,
         "skipped": False,
@@ -542,7 +543,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
         """UPDATE intervals SET
                canonical_distance_mi = NULL, location_type = NULL,
                is_recovery = 0, set_number = NULL,
-               is_walking = 0, is_stride = 0
+               is_walking = 0, is_stride = 0, is_hill_sprint = 0
            WHERE activity_id = ? AND (source IS NULL OR source != 'pace_segment')""",
         (activity_id,),
     )
@@ -787,6 +788,37 @@ def enrich_activity(conn, activity_id: int, config: dict,
             interval["is_stride"] = True
             summary["stride_intervals"] += 1
 
+    # --- Hill sprint detection (Step 4b) ---
+    # Very short intervals (< 50m) with uphill elevation gain that aren't
+    # already strides.  Overrides is_recovery so the workout tagger's
+    # pace-based classification doesn't gray them out.
+    if streams:
+        hill_sprint_max_mi = 0.031  # ~50m
+        for interval in intervals:
+            if interval.get("source") == "pace_segment":
+                continue
+            if interval.get("is_stride"):
+                continue  # strides dominate
+            dist = interval.get("gps_measured_distance_mi") or 0
+            if dist <= 0 or dist > hill_sprint_max_mi:
+                continue
+            pace = interval.get("avg_pace_s_per_mi")
+            if not pace or pace >= walking_threshold:
+                continue  # walking, not a sprint
+            # Check elevation gain from stream data
+            iv_start = interval.get("start_timestamp_s")
+            iv_end = interval.get("end_timestamp_s")
+            if iv_start is None or iv_end is None:
+                continue
+            iv_alts = [s["altitude_ft"] for s in streams
+                       if s.get("altitude_ft") is not None
+                       and s.get("timestamp_s") is not None
+                       and iv_start <= s["timestamp_s"] <= iv_end]
+            if len(iv_alts) >= 2 and iv_alts[-1] > iv_alts[0]:
+                interval["is_hill_sprint"] = True
+                interval["is_recovery"] = False
+                summary["hill_sprint_intervals"] += 1
+
     # --- Pace zone assignment (Step 5) ---
     if boundaries:
         for interval in intervals:
@@ -817,7 +849,8 @@ def enrich_activity(conn, activity_id: int, config: dict,
                SET pace_zone = ?, is_walking = ?, is_stride = ?,
                    is_race = ?, location_type = ?, canonical_distance_mi = ?,
                    avg_pace_s_per_mi = ?, avg_pace_display = ?,
-                   is_recovery = ?, set_number = ?, elapsed_pace_zone = ?
+                   is_recovery = ?, set_number = ?, elapsed_pace_zone = ?,
+                   is_hill_sprint = ?
                WHERE id = ?""",
             (interval.get("pace_zone"), interval.get("is_walking", False),
              interval.get("is_stride", False), interval.get("is_race", False),
@@ -828,6 +861,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
              interval.get("is_recovery", False),
              interval.get("set_number"),
              interval.get("elapsed_pace_zone"),
+             interval.get("is_hill_sprint", False),
              interval["id"]),
         )
 
@@ -929,6 +963,8 @@ def enrich_activity(conn, activity_id: int, config: dict,
             parts.append(f"{summary['walking_intervals']} walk")
         if summary["stride_intervals"]:
             parts.append(f"{summary['stride_intervals']} stride")
+        if summary["hill_sprint_intervals"]:
+            parts.append(f"{summary['hill_sprint_intervals']} hill")
         if summary["zones_assigned"]:
             parts.append(f"{summary['zones_assigned']} zones")
         detail = ", ".join(parts) if parts else "no enrichment"
@@ -958,6 +994,7 @@ def enrich_batch(conn, config: dict, dry_run: bool = False,
         "sets_tagged": 0,
         "walking_intervals": 0,
         "stride_intervals": 0,
+        "hill_sprint_intervals": 0,
         "zones_assigned": 0,
         "segments_created": 0,
     }
@@ -982,6 +1019,7 @@ def enrich_batch(conn, config: dict, dry_run: bool = False,
             result["sets_tagged"] += summary["sets_tagged"]
             result["walking_intervals"] += summary["walking_intervals"]
             result["stride_intervals"] += summary["stride_intervals"]
+            result["hill_sprint_intervals"] += summary["hill_sprint_intervals"]
             result["zones_assigned"] += summary["zones_assigned"]
             result["segments_created"] += summary["segments_created"]
 

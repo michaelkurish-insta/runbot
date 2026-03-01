@@ -416,6 +416,7 @@ def cmd_enrich(args):
             print(f"  Measured intervals: {result['measured_intervals']}")
             print(f"  Walking intervals:  {result['walking_intervals']}")
             print(f"  Stride intervals:   {result['stride_intervals']}")
+            print(f"  Hill sprints:       {result['hill_sprint_intervals']}")
             print(f"  Zones assigned:     {result['zones_assigned']}")
             if result["segments_created"]:
                 print(f"  Segments created:   {result['segments_created']}")
@@ -430,6 +431,7 @@ def cmd_enrich(args):
         print(f"  Measured intervals: {result['measured_intervals']}")
         print(f"  Walking intervals:  {result['walking_intervals']}")
         print(f"  Stride intervals:   {result['stride_intervals']}")
+        print(f"  Hill sprints:       {result['hill_sprint_intervals']}")
         print(f"  Zones assigned:     {result['zones_assigned']}")
         print(f"  Segments created:   {result['segments_created']}")
 

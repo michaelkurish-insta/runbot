@@ -316,16 +316,26 @@
             }
         });
 
-        // Fetch chart data from all activities (merged)
-        Promise.all(activityIds.map(aid =>
-            fetch(`/api/activity/${aid}/chart`).then(r => r.json())
-        )).then(results => {
-            const allPace = results.flatMap(r => r.pace || []);
-            const allHr = results.flatMap(r => r.hr || []);
-            if (allPace.length || allHr.length) {
-                renderCharts(id, allPace, allHr);
-            }
-        });
+        // Fetch chart data — render per activity to avoid superimposed graphs
+        if (isMulti) {
+            activityIds.forEach(aid => {
+                fetch(`/api/activity/${aid}/chart`).then(r => r.json()).then(data => {
+                    const pace = data.pace || [];
+                    const hr = data.hr || [];
+                    if (pace.length || hr.length) {
+                        renderChartsForActivity(id, parseInt(aid), pace, hr);
+                    }
+                });
+            });
+        } else {
+            fetch(`/api/activity/${activityIds[0]}/chart`).then(r => r.json()).then(data => {
+                const pace = data.pace || [];
+                const hr = data.hr || [];
+                if (pace.length || hr.length) {
+                    renderCharts(id, pace, hr);
+                }
+            });
+        }
 
         // Fetch streams for map (merged)
         if (hasStreams) {
@@ -764,6 +774,50 @@
 
         wireChartCrosshair(`pace-chart-${id}`);
         wireChartCrosshair(`hr-chart-${id}`);
+    }
+
+    function renderChartsForActivity(rowId, activityId, paceData, hrData) {
+        // For multi-activity days, create chart canvases inside the activity section
+        const section = document.querySelector(`.activity-section[data-activity-id="${activityId}"]`);
+        if (!section) return;
+
+        const paceId = `pace-chart-act-${activityId}`;
+        const hrId = `hr-chart-act-${activityId}`;
+
+        const chartDiv = document.createElement("div");
+        chartDiv.className = "chart-section";
+        chartDiv.innerHTML = `<div class="chart-row">
+            <div class="chart-wrap"><h3>Pace</h3><canvas id="${paceId}" height="100"></canvas></div>
+            <div class="chart-wrap"><h3>Heart Rate</h3><canvas id="${hrId}" height="100"></canvas></div>
+        </div>`;
+        section.insertBefore(chartDiv, section.firstChild);
+
+        // Hide the template chart section (unused for multi-activity)
+        const templateChart = document.getElementById(`chart-${rowId}`);
+        if (templateChart) templateChart.style.display = "none";
+
+        if (paceData.length) {
+            drawChart(paceId, paceData, {
+                color: "#4a7ab5",
+                fillColor: "rgba(74,122,181,0.15)",
+                formatY: v => { const m = Math.floor(v / 60); const s = Math.round(v % 60); return `${m}:${s < 10 ? "0" : ""}${s}`; },
+                invertY: true,
+                partnerId: hrId,
+            });
+        }
+
+        if (hrData.length) {
+            drawChart(hrId, hrData, {
+                color: "#c05050",
+                fillColor: "rgba(192,80,80,0.15)",
+                formatY: v => Math.round(v).toString(),
+                invertY: false,
+                partnerId: paceId,
+            });
+        }
+
+        wireChartCrosshair(paceId);
+        wireChartCrosshair(hrId);
     }
 
     function drawChart(canvasId, data, opts) {
