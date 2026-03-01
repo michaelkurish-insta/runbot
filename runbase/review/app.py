@@ -708,6 +708,10 @@ def create_app(config=None):
         if field not in OVERRIDABLE_FIELDS:
             return jsonify({"error": f"field '{field}' is not overridable"}), 400
 
+        # Empty strides = explicitly zero (user says "no strides on this activity")
+        if field == "strides" and str(value).strip() == "":
+            value = "0"
+
         # Nullable numeric fields: empty string means NULL
         NULLABLE_NUMERIC = {"avg_hr", "max_hr", "avg_cadence", "avg_pace_s_per_mi", "duration_s"}
         is_null = field in NULLABLE_NUMERIC and str(value).strip() == ""

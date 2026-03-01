@@ -1215,7 +1215,7 @@
                 let value = input.value;
 
                 // Nullable numeric fields: allow saving empty to clear the value
-                const NULLABLE_FIELDS = new Set(["avg_hr", "max_hr", "avg_cadence", "avg_pace_s_per_mi", "duration_s"]);
+                const NULLABLE_FIELDS = new Set(["avg_hr", "max_hr", "avg_cadence", "avg_pace_s_per_mi", "duration_s", "strides"]);
                 if (value === "" || value === undefined) {
                     if (NULLABLE_FIELDS.has(field)) {
                         value = "";  // will be sent as empty string, backend stores NULL
