@@ -840,6 +840,22 @@ def enrich_activity(conn, activity_id: int, config: dict,
             interval["is_stride"] = True
             summary["stride_intervals"] += 1
 
+    # Propagate stride/hill flags to duplicate Strava laps.
+    # Stride detection prefers FIT laps (higher GPS resolution), but the
+    # corresponding Strava laps represent the same intervals and need
+    # matching flags so they don't leak into workout type computation.
+    if has_null_src and has_strava_src:
+        stride_reps = {i["rep_number"] for i in non_seg
+                       if i.get("source") is None and i.get("is_stride")}
+        hill_reps = {i["rep_number"] for i in non_seg
+                     if i.get("source") is None and i.get("is_hill_sprint")}
+        for i in non_seg:
+            if i.get("source") == "strava_lap":
+                if i["rep_number"] in stride_reps:
+                    i["is_stride"] = True
+                if i["rep_number"] in hill_reps:
+                    i["is_hill_sprint"] = True
+
     # --- Pace zone assignment (Step 6) ---
     if boundaries:
         for interval in intervals:

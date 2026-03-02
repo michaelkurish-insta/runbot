@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,6 +58,26 @@ def _interval_enrich_new(conn, activity_ids: list[int], config: dict, verbose: b
     return enriched
 
 
+def _trigger_icloud_download(icloud_path: str, verbose: bool = False) -> None:
+    """Ask macOS to download any cloud-only files in the HealthFit folder.
+
+    iCloud Drive keeps files as .icloud stubs until something requests them.
+    `brctl download` tells the system to fetch the real files.
+    """
+    root = Path(icloud_path).expanduser()
+    if not root.exists():
+        return
+    try:
+        subprocess.run(
+            ["brctl", "download", str(root)],
+            timeout=30, capture_output=True,
+        )
+        if verbose:
+            print(f"Triggered iCloud download for {root}")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass  # brctl not available or timed out — skip silently
+
+
 def sync_icloud(config: dict, dry_run: bool = False, verbose: bool = False) -> dict:
     """Scan iCloud HealthFit folder and import new .fit files.
 
@@ -64,6 +85,11 @@ def sync_icloud(config: dict, dry_run: bool = False, verbose: bool = False) -> d
     """
     icloud_path = config["paths"]["icloud_healthfit"]
     raw_store_path = config["paths"]["raw_store"]
+
+    # Trigger iCloud to download any cloud-only files before scanning.
+    # Without this, new .fit files from the phone may sit as .icloud stubs
+    # and be invisible to the scanner.
+    _trigger_icloud_download(icloud_path, verbose)
 
     fit_files = _scan_fit_files(icloud_path)
 

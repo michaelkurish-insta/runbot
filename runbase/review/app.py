@@ -127,6 +127,9 @@ def create_app(config=None):
                   AND pace_zone IS NOT NULL
                   AND NOT is_recovery
                   AND NOT is_walking
+                  AND NOT is_stride
+                  AND NOT is_hill_sprint
+                  AND gps_measured_distance_mi > 0.015
                   AND (source IS NULL OR source != 'pace_segment')""",
             activity_ids,
         ).fetchall()

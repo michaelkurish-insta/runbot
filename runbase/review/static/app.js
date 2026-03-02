@@ -1490,7 +1490,7 @@
                                 importBtn.textContent = "Import";
                                 if (s.success) {
                                     // Parse "Pipeline complete: N new activities" from output
-                                    const match = s.output.match(/(\d+) new activit/);
+                                    const match = s.output.match(/(\d+) new/);
                                     const newCount = match ? parseInt(match[1], 10) : 0;
                                     if (newCount > 0) {
                                         importStatus.textContent = `Done! ${newCount} new`;
