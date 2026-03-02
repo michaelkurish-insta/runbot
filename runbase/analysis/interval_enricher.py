@@ -835,7 +835,8 @@ def enrich_activity(conn, activity_id: int, config: dict,
         if (duration and duration < stride_max
                 and dist >= stride_min_mi
                 and not interval["is_recovery"]
-                and not interval.get("is_hill_sprint")):
+                and not interval.get("is_hill_sprint")
+                and not interval.get("is_walking")):
             interval["is_stride"] = True
             summary["stride_intervals"] += 1
 

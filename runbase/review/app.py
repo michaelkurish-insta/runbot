@@ -539,35 +539,54 @@ def create_app(config=None):
             else:
                 intervals.append(iv)
 
-        # Build rep distance summary stats (group by canonical distance)
-        summary = _build_rep_summary(intervals + laps)
+        # When both FIT laps and Strava laps exist, hide Strava laps
+        # (FIT has higher GPS resolution; showing both is confusing)
+        has_fit = any(iv.get("source") is None for iv in intervals)
+        if has_fit and laps:
+            laps = []
+
+        # Build rep distance summary from whichever source we're showing
+        summary = _build_rep_summary(intervals or laps)
 
         conn.close()
         return jsonify({"intervals": intervals, "laps": laps, "summary": summary})
 
     def _build_rep_summary(all_intervals):
-        """Group intervals by rep distance and compute averages."""
+        """Group work intervals by rep distance and compute averages.
+
+        Only includes intervals that are part of a workout set (set_number is set),
+        excluding warmup, cooldown, recovery, walking, and strides.
+        Groups by nearest 50m bucket, then shows actual average distance.
+        """
         from collections import defaultdict
         buckets = defaultdict(list)
         for iv in all_intervals:
-            if iv.get("is_walking") or iv.get("is_recovery"):
+            if iv.get("is_walking") or iv.get("is_recovery") or iv.get("is_stride"):
                 continue
+            if iv.get("set_number") is None:
+                continue  # skip warmup/cooldown
             dist = iv.get("canonical_distance_mi") or iv.get("gps_measured_distance_mi") or iv.get("prescribed_distance_mi")
             if not dist or dist <= 0:
                 continue
-            # Round to nearest bucket for grouping
-            if dist < 1.0:
-                key_m = round(dist * 1609.344 / 50) * 50  # nearest 50m
-                label = f"{key_m:.0f}m"
-            else:
-                key_m = round(dist, 2)
-                label = f"{key_m:.2f}mi"
-            buckets[label].append(iv)
+            # Round to nearest 50m bucket for grouping
+            dist_m = dist * 1609.344
+            key_m = round(dist_m / 50) * 50
+            buckets[key_m].append(iv)
 
         summary = []
-        for label, ivs in buckets.items():
+        for key_m, ivs in sorted(buckets.items()):
             if len(ivs) < 2:
                 continue
+            # Show actual average distance, not the rounded bucket
+            dists_m = [
+                (iv.get("canonical_distance_mi") or iv.get("gps_measured_distance_mi") or 0) * 1609.344
+                for iv in ivs
+            ]
+            avg_dist_m = sum(dists_m) / len(dists_m)
+            if avg_dist_m < 1609.344:
+                label = f"{avg_dist_m:.0f}m"
+            else:
+                label = f"{avg_dist_m / 1609.344:.2f}mi"
             durations = [iv["duration_s"] for iv in ivs if iv.get("duration_s")]
             paces = [iv["avg_pace_s_per_mi"] for iv in ivs if iv.get("avg_pace_s_per_mi")]
             hrs = [iv["avg_hr"] for iv in ivs if iv.get("avg_hr")]
