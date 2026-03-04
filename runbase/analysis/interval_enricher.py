@@ -955,7 +955,15 @@ def enrich_activity(conn, activity_id: int, config: dict,
 
     # --- Store VDOT + adjusted distance + pace on activity ---
     # --- Update activity strides count from detected stride intervals ---
-    stride_count = sum(1 for i in intervals if i.get("is_stride") and i.get("source") != "pace_segment")
+    # Count from preferred source only (FIT > Strava), matching the UI display logic.
+    non_seg = [i for i in intervals if i.get("source") != "pace_segment"]
+    _has_fit = any(i.get("source") is None for i in non_seg)
+    _has_strava = any(i.get("source") == "strava_lap" for i in non_seg)
+    if _has_fit and _has_strava:
+        visible = [i for i in non_seg if i.get("source") != "strava_lap"]
+    else:
+        visible = non_seg
+    stride_count = sum(1 for i in visible if i.get("is_stride"))
     stride_count = stride_count or None  # store NULL if zero
 
     # Also count hill sprints for the activity record

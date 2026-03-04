@@ -1,6 +1,6 @@
 # RunBase
 
-Personal running data pipeline. Ingests workout data from multiple sources, reconciles them into a canonical SQLite database, and (eventually) provides a review UI for conflict resolution and browsing.
+Personal running data pipeline. Ingests workout data from multiple sources, reconciles them into a canonical SQLite database, and provides a review UI for data browsing, conflict resolution, and manual corrections.
 
 ## Data Sources
 
@@ -104,7 +104,7 @@ python -m runbase review
 python -m runbase review --debug
 ```
 
-The review UI provides a year calendar grid, detail panels with interval tables and pace/HR charts, inline editing via double-click (activity fields, interval distance/duration/HR/zone), planned activity entry for future dates, and a one-click import pipeline trigger.
+The review UI provides a year calendar grid with a modal detail view. Click any activity row to open a popup with interval tables, pace/HR charts, GPS map, and an edit form. Multi-activity days show each activity's content sequentially (title, charts, intervals, edit form). Activity-level edits use a batch Save / Save & Close flow; interval-level operations (stride/recovery toggles, inline cell edits) save immediately. Double-click grid cells (name, type zone) for quick inline editing. Future blank rows accept planned distance/workout entries. An Import button triggers the full pipeline from the UI.
 
 ### One-time migrations
 
@@ -136,13 +136,19 @@ runbase/
 ├── analysis/
 │   ├── interval_enricher.py # Enrichment waterfall orchestrator
 │   ├── vdot.py            # VDOT calculator (Daniels-Gilbert), pace zones
+│   ├── workout_tagger.py  # Structured workout lap classification (warmup/work/recovery/cooldown)
 │   ├── track_detect.py    # Oval template matching for track detection
 │   ├── pace_segments.py   # Stream-based pace segmentation
 │   └── locations.py       # Workout location clustering, measured course matching
 └── review/
-    ├── app.py             # Flask routes and API endpoints
-    ├── static/            # app.js (UI logic), style.css
-    └── templates/         # Jinja2 templates (index.html, components/)
+    ├── app.py             # Flask routes, API endpoints, override logic
+    ├── static/
+    │   ├── app.js         # UI: modal detail view, inline editing, charts, maps
+    │   └── style.css      # Styling: grid, modal, zone colors
+    └── templates/
+        ├── index.html     # Main page: calendar grid, sidebar, stats footer, modal
+        └── components/
+            └── activity_row.html  # Grid row template
 
 config/
 ├── config.example.yaml    # Template config (check into git)
@@ -151,7 +157,8 @@ config/
 scripts/
 ├── setup_strava_auth.py        # Strava OAuth token setup
 ├── backfill_xlsx_fields.py     # Migration: strides + workout_category
-└── split_group_matched.py      # Migration: split group-matched activities
+├── split_group_matched.py      # Migration: split group-matched activities
+└── tag_races.py                # Scan activities for races, compute VDOT, populate timeline
 ```
 
 ## Database
@@ -214,18 +221,62 @@ When an orphan links to an activity, enrichment applies:
 
 The review UI allows manual edits to activity fields (distance, duration, pace, HR, cadence, shoe, name, notes) and interval fields (distance, duration, HR, zone). Activity edits are stored in `activity_overrides` and synced to the `activities` table, making them canonical — future imports will not overwrite them. Interval edits set the interval's `source` to `'manual'`.
 
+## VDOT & Pace Zone System
+
+All pace classification in RunBase is based on Jack Daniels' VDOT system. VDOT is a fitness metric derived from race performances using the Daniels-Gilbert formula — it represents your current VO2max-equivalent fitness level.
+
+### How VDOT Works
+
+A VDOT value (typically 30-85 for recreational to elite runners) determines training paces for six zones:
+
+| Zone | Purpose | %VO2max | Example (VDOT 50) |
+|------|---------|---------|-------------------|
+| **E** (Easy) | Aerobic base, recovery | 70% | ~9:30/mi |
+| **M** (Marathon) | Marathon race pace | 82% | ~8:00/mi |
+| **T** (Threshold) | Lactate threshold / tempo | 88% | ~7:15/mi |
+| **I** (Interval) | VO2max development | 98% | ~6:25/mi |
+| **R** (Repetition) | Speed & running economy | 107% | ~5:50/mi |
+| **FR** (Fast Rep) | Fast reps / sprint work | 115% | ~5:20/mi |
+
+Each zone corresponds to a target %VO2max. The formula converts VDOT → VO2 → velocity → pace for each zone. Zone boundaries are placed at %VO2max midpoints between adjacent zones (e.g., E/M boundary at 76%, M/T at 85%, T/I at 93%). A walking threshold (default 11:00/mi) catches intervals too slow to be running.
+
+### Setting VDOT
+
+```bash
+# View current VDOT and training paces
+python -m runbase vdot
+
+# Set manually
+python -m runbase vdot --set 50
+
+# Calculate from a race result
+python -m runbase vdot --from-race <activity_id>
+```
+
+VDOT is stored in the `vdot_history` table with effective dates. The enricher uses the most recent VDOT entry on or before each activity's date, so zone boundaries evolve as your fitness changes. Race tagging from the review UI can also insert VDOT history entries.
+
+### Workout Type Zone
+
+Each activity in the grid displays a color-coded **workout type zone** (the "Type" column). This is the highest-priority pace zone found across the activity's qualifying intervals — those that are not strides, recoveries, walking, or hill sprints. An easy run shows "E", a tempo workout shows "T", an interval session shows "I", etc.
+
+When an activity has both FIT and Strava laps (duplicate sources), only FIT laps are considered for workout type determination. This FIT-preferred source logic applies consistently across the UI: interval display, stride counting, and workout type classification.
+
 ## Enrichment Pipeline
 
 The `enrich` command runs a waterfall of analysis steps on each activity:
 
-1. **Structured vs unstructured** — Workouts with intervals (repetition, tempo, interval) keep their FIT/XLSX laps. Unstructured runs (easy, long, recovery) get pace segments generated from stream data.
-2. **Track detection** — Determines if the activity was on a 400m track using oval template matching (see below).
-3. **Measured course detection** — For structured workouts only, checks if the activity centroid is near a configured measured course and snaps intervals to known course distances (see below).
-4. **Walking scrub** — Flags intervals slower than the walking threshold (default 11:00/mi).
-5. **Stride detection** — Flags intervals shorter than 30s as strides.
-6. **Pace zone assignment** — Labels each interval's pace zone (E/M/T/I/R/FR) based on current VDOT.
-7. **Adjusted distance** — Sums non-walking interval distances.
-8. **VDOT storage** — Stores the current VDOT on the activity record.
+1. **Category inference** — If the activity has no `workout_category`, infer one from the name (e.g., "tempo" → tempo, "8x400" → interval).
+2. **Structured vs unstructured** — Workouts with intervals (repetition, tempo, interval, fartlek, hills, race) keep their FIT/XLSX laps. Unstructured runs (easy, long, recovery) get pace segments auto-generated from GPS stream data.
+3. **Workout tagging** (structured only) — Classifies laps as warmup, work, recovery, or cooldown using VDOT pace zones. Groups work intervals into sets, separated by walking laps, long recoveries (≥2x median), or distance breaks (≥0.3mi).
+4. **Track detection** — Determines if the activity was on a 400m track using oval template matching (see below).
+5. **Measured course detection** — For structured workouts only, checks if work-rep GPS centroids are near configured measured courses and snaps intervals to known distances (see below).
+6. **Walking scrub** — Flags intervals slower than the walking threshold (default 11:00/mi). Skips pace segments (instantaneous pace unreliable) and manual intervals (user edits are canonical).
+7. **Hill sprint detection** — Very short intervals (<56m) with uphill elevation gain. Runs before stride detection so hills take priority.
+8. **Stride detection** — Flags short intervals (<30s, >24m) as strides. Only applied to manually lapped intervals (FIT/Strava/XLSX), not pace segments. When both FIT and Strava laps exist, only FIT laps are candidates (higher GPS resolution). Stride flags are propagated to matching Strava laps by rep number.
+9. **Pace zone assignment** — Labels each interval's pace zone (E/M/T/I/R/FR) based on current VDOT boundaries.
+10. **Elapsed pace zone** (pace segments only) — Computes overall activity pace (total distance / total time) and classifies it. This gives a more stable effort score than instantaneous segment paces, which can be distorted by hills, GPS noise, and wind.
+11. **Adjusted distance & pace** — Sums non-walking interval distances. Computes running pace excluding walking time. Respects manual overrides.
+12. **Stride/hill counts** — Updates the activity's `strides` and `hill_sprints` fields from visible intervals (FIT-preferred when both sources exist).
 
 ### Track Detection
 
@@ -275,3 +326,29 @@ paces:
       radius_m: 1200
       snap_distance_m: 1609    # exact mile
 ```
+
+### FIT-Preferred Source Logic
+
+Many activities have intervals from two sources: FIT laps (from the watch, with high-resolution GPS) and Strava laps (from the API, lower resolution). Rather than showing both, the system uses a consistent FIT-preferred policy:
+
+- **Interval display**: When both FIT and Strava laps exist, only FIT laps are shown in the modal. Strava laps are hidden.
+- **Stride counting**: The `strides` field on each activity counts only from visible (FIT-preferred) intervals.
+- **Workout type zone**: The grid's "Type" column is derived only from visible intervals. Even if a Strava lap has a faster pace zone, it won't affect the displayed type when FIT laps exist.
+- **Stride detection**: FIT laps are preferred as stride candidates (higher GPS resolution for short intervals). Detected stride flags are propagated to corresponding Strava laps by rep number so they don't leak into other computations.
+
+This prevents Strava "tail" laps (auto-created by Strava with different properties) from distorting stride counts, workout types, or other derived values.
+
+### Enrichment by Interval Type
+
+Enrichment features apply differently to manual intervals vs auto-generated pace segments:
+
+| Feature | Manual Intervals (fit_lap, strava_lap, xlsx_split) | Pace Segments (auto-generated) |
+|---|---|---|
+| Walking filter | Yes | No — instantaneous pace unreliable |
+| Pace zone (per-segment) | Yes | Yes (assigned at creation) |
+| Elapsed pace zone | No | Yes — overall activity pace classified by VDOT |
+| Stride detection | Yes | No |
+| Hill sprint detection | Yes | No |
+| Workout tagging | Yes (structured only) | No |
+| Measured course snap | Yes (structured only) | No |
+| Track detection | Yes | No |

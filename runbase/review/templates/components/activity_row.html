@@ -20,8 +20,3 @@
     <td class="col-notes {{ 'overridden' if 'notes' in a.overridden_fields }}" title="{{ a.notes or '' }}">{{ a.notes or '' }}</td>
     <td class="col-vdot">{{ '%.1f' % a.vdot if a.vdot else '' }}</td>
 </tr>
-<tr class="detail-row" data-id="{{ a.id }}" style="display: none;">
-    <td colspan="13">
-        {% include "components/detail_panel.html" %}
-    </td>
-</tr>

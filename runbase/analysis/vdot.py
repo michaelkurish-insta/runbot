@@ -107,8 +107,8 @@ def vdot_to_boundaries(vdot: float, walking_threshold: float = 660.0) -> dict[st
 
     # I/R boundary: midpoint of I and R paces
     ir_boundary = (paces["I"] + paces["R"]) / 2
-    # R/FR boundary: midpoint of R and FR paces
-    rfr_boundary = (paces["R"] + paces["FR"]) / 2
+    # R/FR boundary: 1/3 R + 2/3 FR (gives R more room on the fast side)
+    rfr_boundary = (paces["R"] + 2 * paces["FR"]) / 3
 
     return {
         "walk": walking_threshold,

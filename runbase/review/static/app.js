@@ -3,31 +3,35 @@
 (function () {
     "use strict";
 
-    const maps = {};
-    const loaded = {};
     const mainContent = document.querySelector(".main-content");
 
-    // ── Row click → expand/collapse ─────────────────────────────
+    // ── Modal DOM references ────────────────────────────────────
+    const modalEl = document.getElementById("activity-modal");
+    const modalTitleEl = document.getElementById("modal-title");
+    const modalChartSectionEl = document.getElementById("modal-chart-section");
+    const modalIntervalsEl = document.getElementById("modal-intervals-container");
+    const modalEditSectionEl = document.getElementById("modal-edit-section");
+    const modalMapContainerEl = document.getElementById("modal-map-container");
+    const modalBtnSave = document.getElementById("modal-btn-save");
+    const modalBtnSaveClose = document.getElementById("modal-btn-save-close");
+
+    // ── Modal state ─────────────────────────────────────────────
+    let modalMap = null;
+    const modalChartRegistry = {};
+    let modalDirtyState = {};   // { aid: { field: newValue, ... } }
+    let modalOriginalValues = {}; // { aid: { field: originalValue, ... } }
+    let modalClearQueue = {};   // { aid: Set(field, ...) } — overrides to delete on save
+    let modalActivityIds = [];  // all activity IDs shown in the current modal
+    let modalVdotState = {};    // { aid: { vdot, race_distance_m, race_time_s, tag_race, apply_timeline } }
+
+    // ── Row click → open modal ──────────────────────────────────
 
     document.querySelectorAll(".activity-row").forEach(row => {
         row.addEventListener("click", () => {
             const id = row.dataset.id;
-            const detailRow = document.querySelector(`.detail-row[data-id="${id}"]`);
-            if (!detailRow) return;
-
-            const isVisible = detailRow.style.display !== "none";
-            document.querySelectorAll(".detail-row").forEach(r => r.style.display = "none");
-            document.querySelectorAll(".activity-row").forEach(r => r.classList.remove("expanded"));
-
-            if (!isVisible) {
-                detailRow.style.display = "table-row";
-                row.classList.add("expanded");
-                if (!loaded[id]) {
-                    const activityIds = (row.dataset.activityIds || id).split(",");
-                    loadDetail(id, activityIds, row.dataset.hasStreams === "true");
-                    loaded[id] = true;
-                }
-            }
+            const activityIds = (row.dataset.activityIds || id).split(",");
+            const hasStreams = row.dataset.hasStreams === "true";
+            openModal(id, activityIds, hasStreams, row);
         });
     });
 
@@ -134,20 +138,16 @@
             const dateStr = row.dataset.date;
             if (!dateStr) return;
 
-            // Read existing planned values if any
             const existingDist = row.querySelector(".planned-dist");
             const existingName = row.querySelector(".planned-name");
             const oldDist = existingDist ? existingDist.textContent.trim() : "";
             const oldName = existingName ? existingName.textContent.trim() : "";
 
-            // Find the blank colspan cell or replace planned cells
             const cells = row.querySelectorAll("td");
-            // Remove all cells after date (index 2+)
             while (cells.length > 2 && row.children.length > 2) {
                 row.removeChild(row.lastChild);
             }
 
-            // Create dist input cell
             const distTd = document.createElement("td");
             distTd.className = "col-dist";
             const distInput = document.createElement("input");
@@ -159,7 +159,6 @@
             distTd.appendChild(distInput);
             row.appendChild(distTd);
 
-            // Create name input cell
             const nameTd = document.createElement("td");
             nameTd.className = "col-name";
             const nameInput = document.createElement("input");
@@ -170,7 +169,6 @@
             nameTd.appendChild(nameInput);
             row.appendChild(nameTd);
 
-            // Remaining colspan
             const restTd = document.createElement("td");
             restTd.colSpan = 9;
             row.appendChild(restTd);
@@ -204,7 +202,6 @@
                     }),
                 }).then(r => r.json()).then(d => {
                     if (d.ok) {
-                        // Update row in place
                         while (row.children.length > 2) row.removeChild(row.lastChild);
                         const dTd = document.createElement("td");
                         dTd.className = "col-dist planned-dist";
@@ -246,15 +243,14 @@
                 input.addEventListener("click", (ev) => ev.stopPropagation());
             });
 
-            nameInput.addEventListener("blur", (ev) => {
-                // Only save on blur if focus isn't moving to the other input
+            nameInput.addEventListener("blur", () => {
                 setTimeout(() => {
                     if (!row.contains(document.activeElement) || !document.activeElement.classList.contains("planned-input")) {
                         savePlanned();
                     }
                 }, 100);
             });
-            distInput.addEventListener("blur", (ev) => {
+            distInput.addEventListener("blur", () => {
                 setTimeout(() => {
                     if (!row.contains(document.activeElement) || !document.activeElement.classList.contains("planned-input")) {
                         savePlanned();
@@ -295,9 +291,116 @@
         });
     });
 
-    // ── Load detail ─────────────────────────────────────────────
+    // ── Modal open/close ────────────────────────────────────────
 
-    function loadDetail(id, activityIds, hasStreams) {
+    function openModal(id, activityIds, hasStreams, row) {
+        // Reset state
+        modalDirtyState = {};
+        modalOriginalValues = {};
+        modalClearQueue = {};
+        modalVdotState = {};
+        modalActivityIds = activityIds.map(Number);
+
+        // Clean up old chart registry entries
+        for (const key of Object.keys(modalChartRegistry)) {
+            delete modalChartRegistry[key];
+        }
+
+        // Set title from row data
+        const dateCell = row.querySelector(".date-cell");
+        const nameCell = row.querySelector(".col-name");
+        const dateText = dateCell ? dateCell.textContent.trim() : "";
+        const nameText = nameCell ? nameCell.textContent.trim() : "";
+        modalTitleEl.textContent = `${dateText}${nameText ? " \u2014 " + nameText : ""}`;
+
+        // Clear containers
+        modalChartSectionEl.innerHTML = "";
+        modalIntervalsEl.innerHTML = '<p class="loading">Loading...</p>';
+        modalEditSectionEl.innerHTML = "";
+        modalMapContainerEl.innerHTML = "";
+
+        // Show modal
+        modalEl.style.display = "flex";
+
+        // Buttons always visible but disabled until dirty
+        modalBtnSave.disabled = true;
+        modalBtnSaveClose.disabled = true;
+
+        // Load data
+        loadDetailIntoModal(id, activityIds, hasStreams);
+    }
+
+    function closeModal() {
+        modalEl.style.display = "none";
+
+        // Clean up leaflet map
+        if (modalMap) {
+            modalMap.remove();
+            modalMap = null;
+        }
+
+        // Clean up chart registry
+        for (const key of Object.keys(modalChartRegistry)) {
+            delete modalChartRegistry[key];
+        }
+    }
+
+    function isDirty() {
+        for (const aid of Object.keys(modalDirtyState)) {
+            if (Object.keys(modalDirtyState[aid]).length > 0) return true;
+        }
+        for (const aid of Object.keys(modalClearQueue)) {
+            if (modalClearQueue[aid] && modalClearQueue[aid].size > 0) return true;
+        }
+        for (const aid of Object.keys(modalVdotState)) {
+            if (modalVdotState[aid]) return true;
+        }
+        return false;
+    }
+
+    function confirmDiscard() {
+        if (!isDirty()) return true;
+        return confirm("You have unsaved changes. Discard them?");
+    }
+
+    // Wire close buttons
+    document.getElementById("modal-close-x").addEventListener("click", () => {
+        if (confirmDiscard()) closeModal();
+    });
+    document.getElementById("modal-btn-close").addEventListener("click", () => {
+        if (confirmDiscard()) closeModal();
+    });
+
+    // Overlay click
+    modalEl.addEventListener("click", (e) => {
+        if (e.target === e.currentTarget) {
+            if (confirmDiscard()) closeModal();
+        }
+    });
+
+    // Save button
+    modalBtnSave.addEventListener("click", () => {
+        saveModalChanges(false);
+    });
+
+    // Save & Close button
+    modalBtnSaveClose.addEventListener("click", () => {
+        saveModalChanges(true);
+    });
+
+    // Escape key
+    document.addEventListener("keydown", (e) => {
+        if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
+        if (e.key === "Escape") {
+            if (modalEl.style.display !== "none") {
+                if (confirmDiscard()) closeModal();
+            }
+        }
+    });
+
+    // ── Load data into modal ────────────────────────────────────
+
+    function loadDetailIntoModal(id, activityIds, hasStreams) {
         const isMulti = activityIds.length > 1;
 
         // Fetch intervals + metadata from all activities
@@ -307,56 +410,170 @@
                 fetch(`/api/activity/${aid}/meta`).then(r => r.json()),
             ]).then(([intervals, meta]) => ({ aid: parseInt(aid), meta, ...intervals }))
         )).then(results => {
-            if (isMulti) {
-                renderMultiActivityIntervals(id, results);
-            } else {
-                // Single activity — render as before
-                const r = results[0];
-                renderIntervals(id, r.intervals || [], r.laps || [], r.summary || [], r.meta);
+            // Build all content per-activity into a single stream:
+            // title → charts → intervals → edit form, then next activity
+            let html = "";
+
+            for (let i = 0; i < results.length; i++) {
+                const r = results[i];
+                const meta = r.meta;
+                const intervals = r.intervals || [];
+                const laps = r.laps || [];
+                const summary = r.summary || [];
+
+                if (i > 0) html += '<hr class="activity-divider">';
+
+                if (isMulti) {
+                    html += `<div class="activity-section" data-activity-id="${r.aid}">`;
+                    html += `<div class="activity-section-header">`;
+                    html += `<span class="activity-title">${escapeHtml(meta.workout_name || "Activity #" + r.aid)}</span>`;
+                    const hrPart = meta.display_hr ? ` &middot; ${meta.display_hr}bpm` : "";
+                    html += `<span class="activity-meta">${meta.display_distance}mi &middot; ${meta.display_pace}/mi &middot; ${meta.display_duration}${hrPart}</span>`;
+                    html += `</div>`;
+                }
+
+                // Chart placeholder (renderChartsInModal will fill this)
+                html += `<div class="modal-chart-placeholder" data-chart-aid="${r.aid}"></div>`;
+
+                if (intervals.length) {
+                    html += `<h3>Intervals</h3>`;
+                    html += buildTable(intervals);
+                }
+                if (laps.length) {
+                    html += `<h3 style="margin-top:10px">Laps</h3>`;
+                    html += buildTable(laps);
+                }
+                if (summary && summary.length) {
+                    html += `<h3 style="margin-top:10px">Summary</h3>`;
+                    html += renderSummary(summary);
+                }
+
+                // Edit form inline with this activity's content
+                html += buildEditForm(meta);
+
+                if (isMulti) html += `</div>`;
+            }
+
+            // Put everything into the intervals container; leave chart/edit sections empty
+            modalChartSectionEl.innerHTML = "";
+            modalEditSectionEl.innerHTML = "";
+            modalIntervalsEl.innerHTML = html || "<p class='loading'>No intervals.</p>";
+
+            // Wire interval-level interactions (immediate saves)
+            wireWalkingButtons(modalIntervalsEl);
+            wireIntervalCheckboxes(modalIntervalsEl);
+            wireIntervalEditing(modalIntervalsEl);
+
+            // Wire edit forms for dirty tracking
+            for (const r of results) {
+                wireEditForm(modalIntervalsEl, r.meta);
             }
         });
 
-        // Fetch chart data — render per activity to avoid superimposed graphs
-        if (isMulti) {
-            activityIds.forEach(aid => {
-                fetch(`/api/activity/${aid}/chart`).then(r => r.json()).then(data => {
-                    const pace = data.pace || [];
-                    const hr = data.hr || [];
-                    if (pace.length || hr.length) {
-                        renderChartsForActivity(id, parseInt(aid), pace, hr);
-                    }
-                });
-            });
-        } else {
-            fetch(`/api/activity/${activityIds[0]}/chart`).then(r => r.json()).then(data => {
+        // Fetch chart data per activity
+        activityIds.forEach(aid => {
+            fetch(`/api/activity/${aid}/chart`).then(r => r.json()).then(data => {
                 const pace = data.pace || [];
                 const hr = data.hr || [];
                 if (pace.length || hr.length) {
-                    renderCharts(id, pace, hr);
+                    renderChartsInModal(parseInt(aid), pace, hr, isMulti ? data.name : null);
                 }
             });
-        }
+        });
 
-        // Fetch streams for map (merged)
+        // Fetch streams for map
         if (hasStreams) {
             Promise.all(activityIds.map(aid =>
                 fetch(`/api/activity/${aid}/streams`).then(r => r.json())
             )).then(results => {
-                renderMap(id, results.flat());
+                renderMapInModal(results.flat());
             });
         }
     }
 
+    // ── Render charts in modal ──────────────────────────────────
+
+    function renderChartsInModal(activityId, paceData, hrData, label) {
+        // Render into the per-activity placeholder if it exists, else fall back to chart section
+        const placeholder = document.querySelector(`.modal-chart-placeholder[data-chart-aid="${activityId}"]`);
+        const target = placeholder || modalChartSectionEl;
+        if (!target) return;
+
+        const paceId = `modal-pace-chart-${activityId}`;
+        const hrId = `modal-hr-chart-${activityId}`;
+
+        const chartDiv = document.createElement("div");
+        chartDiv.className = "chart-section";
+        const labelHtml = label ? `<div class="chart-activity-label">${escapeHtml(label)}</div>` : "";
+        chartDiv.innerHTML = `${labelHtml}<div class="chart-row">
+            <div class="chart-wrap"><h3>Pace</h3><canvas id="${paceId}" height="100"></canvas></div>
+            <div class="chart-wrap"><h3>Heart Rate</h3><canvas id="${hrId}" height="100"></canvas></div>
+        </div>`;
+        target.appendChild(chartDiv);
+
+        if (paceData.length) {
+            drawChart(paceId, paceData, {
+                color: "#4a7ab5",
+                fillColor: "rgba(74,122,181,0.15)",
+                formatY: v => { const m = Math.floor(v / 60); const s = Math.round(v % 60); return `${m}:${s < 10 ? "0" : ""}${s}`; },
+                invertY: true,
+                partnerId: hrId,
+            }, modalChartRegistry);
+        }
+
+        if (hrData.length) {
+            drawChart(hrId, hrData, {
+                color: "#c05050",
+                fillColor: "rgba(192,80,80,0.15)",
+                formatY: v => Math.round(v).toString(),
+                invertY: false,
+                partnerId: paceId,
+            }, modalChartRegistry);
+        }
+
+        wireChartCrosshair(paceId, modalChartRegistry);
+        wireChartCrosshair(hrId, modalChartRegistry);
+    }
+
+    // ── Render map in modal ─────────────────────────────────────
+
+    function renderMapInModal(points) {
+        if (!modalMapContainerEl || !points.length) return;
+
+        modalMapContainerEl.innerHTML = '<h3>Map</h3><div class="map-container" id="modal-map"></div>';
+        const mapEl = document.getElementById("modal-map");
+
+        setTimeout(() => {
+            if (modalMap) {
+                modalMap.remove();
+                modalMap = null;
+            }
+
+            const map = L.map(mapEl, { attributionControl: false });
+            L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+                maxZoom: 19,
+            }).addTo(map);
+
+            const latlngs = points.map(p => [p.lat, p.lon]);
+            const polyline = L.polyline(latlngs, {
+                color: "#4A90D9", weight: 3, opacity: 0.8,
+            }).addTo(map);
+
+            map.fitBounds(polyline.getBounds(), { padding: [20, 20] });
+            modalMap = map;
+        }, 150);
+    }
+
     // ── Render intervals + laps ─────────────────────────────────
 
-    function buildTable(rows, showSource) {
+    function buildTable(rows) {
         if (!rows.length) return "";
 
         let html = `<table class="intervals-table">
             <thead><tr>
                 <th>#</th><th>Distance</th><th>Duration</th><th>Pace</th>
                 <th>HR</th><th>Zone</th>`;
-        if (showSource) html += `<th>Source</th>`;
+        html += `<th title="Stride">S</th><th title="Recovery">Rec</th>`;
         html += `<th></th>`;  // walking toggle column
         html += `</tr></thead><tbody>`;
 
@@ -372,10 +589,8 @@
             const setLabel = iv.set_number ? ` S${iv.set_number}` : "";
             const locLabel = iv.location_type ? ` [${iv.location_type}]` : "";
 
-            // Raw distance in miles for editing
             const rawDist = iv.canonical_distance_mi || iv.gps_measured_distance_mi || iv.prescribed_distance_mi || 0;
 
-            // Walking toggle button
             let walkBtn = "";
             if (iv.is_walking) {
                 walkBtn = `<button class="btn-unscrub" data-interval-id="${iv.id}" title="Mark as not walking">&#x21A9;</button>`;
@@ -390,7 +605,10 @@
                 <td>${iv.display_pace}</td>
                 <td class="iv-editable" data-field="avg_hr" data-raw="${iv.avg_hr || ""}">${iv.display_hr}</td>
                 <td class="iv-editable ${zoneClass}" data-field="pace_zone" data-raw="${zone}">${zone}${setLabel}</td>`;
-            if (showSource) html += `<td class="iv-source">${iv.source || ""}</td>`;
+            const strideChecked = iv.is_stride ? "checked" : "";
+            const recoveryChecked = iv.is_recovery ? "checked" : "";
+            html += `<td class="iv-checkbox-cell"><input type="checkbox" class="iv-stride-cb" data-interval-id="${iv.id}" ${strideChecked}></td>`;
+            html += `<td class="iv-checkbox-cell"><input type="checkbox" class="iv-recovery-cb" data-interval-id="${iv.id}" ${recoveryChecked}></td>`;
             html += `<td class="walk-toggle-cell">${walkBtn}</td>`;
             html += `</tr>`;
         }
@@ -416,94 +634,6 @@
         }
         html += `</tbody></table></div>`;
         return html;
-    }
-
-    function renderIntervals(id, intervals, laps, summary, meta) {
-        const container = document.getElementById(`intervals-${id}`);
-        if (!intervals.length && !laps.length) {
-            container.innerHTML = "<p class='loading'>No intervals.</p>";
-            if (meta) {
-                container.innerHTML += buildEditForm(meta);
-                wireEditForm(container, meta);
-            }
-            return;
-        }
-
-        let html = "";
-
-        if (intervals.length) {
-            html += `<h3>Intervals</h3>`;
-            html += buildTable(intervals, true);
-        }
-
-        if (laps.length) {
-            html += `<h3 style="margin-top:10px">Laps</h3>`;
-            html += buildTable(laps, false);
-        }
-
-        if (summary && summary.length) {
-            html += `<h3 style="margin-top:10px">Summary</h3>`;
-            html += renderSummary(summary);
-        }
-
-        if (meta) {
-            html += buildEditForm(meta);
-        }
-
-        container.innerHTML = html;
-        wireWalkingButtons(container);
-        wireIntervalEditing(container);
-        if (meta) wireEditForm(container, meta);
-    }
-
-    function renderMultiActivityIntervals(id, results) {
-        const container = document.getElementById(`intervals-${id}`);
-        let html = "";
-
-        for (let i = 0; i < results.length; i++) {
-            const r = results[i];
-            const meta = r.meta;
-            const intervals = r.intervals || [];
-            const laps = r.laps || [];
-            const summary = r.summary || [];
-
-            if (i > 0) html += `<hr class="activity-divider">`;
-
-            html += `<div class="activity-section" data-activity-id="${r.aid}">`;
-            html += `<div class="activity-section-header">`;
-            html += `<span class="activity-title">${escapeHtml(meta.workout_name || `Activity #${r.aid}`)}</span>`;
-            const hrPart = meta.display_hr ? ` &middot; ${meta.display_hr}bpm` : "";
-            html += `<span class="activity-meta">${meta.display_distance}mi &middot; ${meta.display_pace}/mi &middot; ${meta.display_duration}${hrPart}</span>`;
-            html += `</div>`;
-
-            if (intervals.length) {
-                html += `<h3>Intervals</h3>`;
-                html += buildTable(intervals, true);
-            }
-
-            if (laps.length) {
-                html += `<h3 style="margin-top:10px">Laps</h3>`;
-                html += buildTable(laps, false);
-            }
-
-            if (summary && summary.length) {
-                html += `<h3 style="margin-top:10px">Summary</h3>`;
-                html += renderSummary(summary);
-            }
-
-            html += buildEditForm(meta);
-            html += `</div>`;
-        }
-
-        container.innerHTML = html;
-        wireWalkingButtons(container);
-        wireIntervalEditing(container);
-
-        // Wire edit forms for each activity
-        for (const r of results) {
-            const section = container.querySelector(`.activity-section[data-activity-id="${r.aid}"]`);
-            if (section) wireEditForm(section, r.meta);
-        }
     }
 
     function wireWalkingButtons(container) {
@@ -532,6 +662,42 @@
         });
     }
 
+    function wireIntervalCheckboxes(container) {
+        container.querySelectorAll(".iv-stride-cb, .iv-recovery-cb").forEach(cb => {
+            cb.addEventListener("change", (e) => {
+                e.stopPropagation();
+                const intervalId = cb.dataset.intervalId;
+                const field = cb.classList.contains("iv-stride-cb") ? "is_stride" : "is_recovery";
+                const value = cb.checked;
+                fetch(`/api/interval/${intervalId}/flag`, {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ field, value }),
+                }).then(r => r.json()).then(d => {
+                    if (!d.ok) {
+                        cb.checked = !value;
+                    } else {
+                        const tr = cb.closest("tr");
+                        if (field === "is_stride") {
+                            tr.classList.toggle("is-stride", value);
+                            // Update the grid row's strides cell
+                            if (d.activity_id && d.strides !== undefined) {
+                                const gridRow = document.querySelector(`.activity-row[data-id="${d.activity_id}"]`)
+                                    || document.querySelector(`.activity-row[data-activity-ids*="${d.activity_id}"]`);
+                                if (gridRow) {
+                                    const cell = gridRow.querySelector(".col-strides");
+                                    if (cell) cell.textContent = d.strides || "";
+                                }
+                            }
+                        } else {
+                            tr.classList.toggle("is-recovery", value);
+                        }
+                    }
+                }).catch(() => { cb.checked = !value; });
+            });
+        });
+    }
+
     const IV_ZONE_OPTIONS = ["", "E", "M", "T", "I", "R", "FR"];
 
     function wireIntervalEditing(container) {
@@ -547,7 +713,6 @@
                 const originalHtml = cell.innerHTML;
 
                 if (field === "pace_zone") {
-                    // Zone dropdown
                     const select = document.createElement("select");
                     select.className = "iv-inline-edit";
                     for (const z of IV_ZONE_OPTIONS) {
@@ -573,10 +738,8 @@
                                     cell.className = "iv-editable" + (z ? ` zone-${z}` : "");
                                     cell.textContent = z + setLabel;
                                     cell.dataset.raw = z;
-                                    // Update zone bg on row
                                     tr.className = tr.className.replace(/zone-bg-\w+/g, "");
                                     if (z) tr.classList.add(`zone-bg-${z}`);
-                                    updateSourceCell(tr, "manual");
                                 } else {
                                     cell.innerHTML = originalHtml;
                                 }
@@ -594,7 +757,6 @@
                     select.addEventListener("blur", () => finish(true));
 
                 } else {
-                    // Text/number input for distance, duration, HR
                     const input = document.createElement("input");
                     input.className = "iv-inline-edit";
 
@@ -615,7 +777,6 @@
                         input.type = "text";
                         const dur = parseFloat(rawValue);
                         if (dur) {
-                            // Format with tenths: m:ss.t
                             const total = Math.floor(dur);
                             const tenths = Math.round((dur - total) * 10) % 10;
                             const m = Math.floor(total / 60);
@@ -652,7 +813,6 @@
                                     return;
                                 }
                             } else if (field === "duration_s") {
-                                // Parse m:ss or m:ss.t
                                 sendValue = parseDurationPrecise(val);
                                 if (sendValue === null) {
                                     cell.innerHTML = originalHtml;
@@ -672,7 +832,6 @@
                                     if (field === "distance") {
                                         cell.textContent = iv.display_distance;
                                         cell.dataset.raw = iv.canonical_distance_mi || iv.gps_measured_distance_mi || iv.prescribed_distance_mi || 0;
-                                        // Update pace cell
                                         const paceCell = tr.children[3];
                                         if (paceCell) paceCell.textContent = iv.display_pace;
                                     } else if (field === "duration_s") {
@@ -684,7 +843,6 @@
                                         cell.textContent = iv.display_hr;
                                         cell.dataset.raw = iv.avg_hr || "";
                                     }
-                                    updateSourceCell(tr, "manual");
                                 } else {
                                     cell.innerHTML = originalHtml;
                                 }
@@ -707,26 +865,18 @@
 
     function parseDurationPrecise(str) {
         if (!str) return null;
-        // Accept m:ss, m:ss.t, h:mm:ss, h:mm:ss.t
         const match = str.match(/^(\d+):(\d{1,2})(?::(\d{1,2}))?(?:\.(\d))?$/);
         if (!match) return null;
         let result;
         if (match[3] !== undefined) {
-            // h:mm:ss.t
             result = parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseInt(match[3]);
         } else {
-            // m:ss.t
             result = parseInt(match[1]) * 60 + parseInt(match[2]);
         }
         if (match[4] !== undefined) {
             result += parseInt(match[4]) / 10;
         }
         return result;
-    }
-
-    function updateSourceCell(tr, source) {
-        const sourceCell = tr.querySelector(".iv-source");
-        if (sourceCell) sourceCell.textContent = source;
     }
 
     function saveIntervalEdit(intervalId, field, value) {
@@ -743,84 +893,450 @@
         return div.innerHTML;
     }
 
+    // ── VDOT calculator (Daniels-Gilbert) ─────────────────────
+
+    function computeVDOT(distanceM, timeS) {
+        const timeMin = timeS / 60.0;
+        const velocity = distanceM / timeMin;
+        const vo2 = -4.60 + 0.182258 * velocity + 0.000104 * velocity * velocity;
+        const pctVO2max = 0.8 + 0.1894393 * Math.exp(-0.012778 * timeMin)
+                        + 0.2989558 * Math.exp(-0.1932605 * timeMin);
+        return Math.round((vo2 / pctVO2max) * 100) / 100;
+    }
+
+    // ── Per-activity edit form builder (no per-field save buttons) ──
+
+    function formatDurationInput(seconds) {
+        if (seconds == null) return "";
+        const s = Math.round(seconds);
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = s % 60;
+        if (h > 0) return `${h}:${m < 10 ? "0" : ""}${m}:${sec < 10 ? "0" : ""}${sec}`;
+        return `${m}:${sec < 10 ? "0" : ""}${sec}`;
+    }
+
+    function formatPaceInput(secPerMile) {
+        if (secPerMile == null) return "";
+        const s = Math.round(secPerMile);
+        const m = Math.floor(s / 60);
+        const sec = s % 60;
+        return `${m}:${sec < 10 ? "0" : ""}${sec}`;
+    }
+
+    function parseDuration(str) {
+        if (!str) return null;
+        const parts = str.split(":").map(Number);
+        if (parts.some(isNaN)) return null;
+        if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+        if (parts.length === 2) return parts[0] * 60 + parts[1];
+        return null;
+    }
+
+    function buildEditForm(meta) {
+        const aid = meta.id;
+        const ov = meta.overridden_fields || [];
+        const cats = ["", "easy", "long", "tempo", "interval", "race", "recovery", "other"];
+
+        let shoeOptions = '<option value="">--</option>';
+        if (window.SHOES) {
+            for (const [shoeId, name] of Object.entries(window.SHOES)) {
+                const sel = meta.shoe_id && parseInt(shoeId) === meta.shoe_id ? " selected" : "";
+                shoeOptions += `<option value="${shoeId}"${sel}>${escapeHtml(name)}</option>`;
+            }
+        }
+
+        let catOptions = "";
+        for (const cat of cats) {
+            const sel = meta.workout_category === cat ? " selected" : "";
+            catOptions += `<option value="${cat}"${sel}>${cat || "--"}</option>`;
+        }
+
+        const durVal = formatDurationInput(meta.duration_s);
+        const paceVal = formatPaceInput(meta.avg_pace_s_per_mi);
+
+        // Reset button for overridden fields
+        function resetBtn(field) {
+            if (!ov.includes(field)) return "";
+            return `<button class="btn-reset-override" data-field="${field}" data-aid="${aid}" title="Clear override (revert to original)">&#x21A9;</button>`;
+        }
+
+        return `
+        <h3 style="margin-top:10px">Edit — Activity #${aid}</h3>
+        <div class="edit-form" data-edit-aid="${aid}">
+            <div class="edit-row" data-field-row="workout_name">
+                <label>Name</label>
+                <input type="text" data-field="workout_name" value="${escapeHtml(meta.workout_name)}" placeholder="${escapeHtml(meta.workout_name)}">
+                ${resetBtn("workout_name")}
+            </div>
+            <div class="edit-row" data-field-row="workout_category">
+                <label>Category</label>
+                <select data-field="workout_category">${catOptions}</select>
+                ${resetBtn("workout_category")}
+            </div>
+            <div class="edit-row" data-field-row="distance_mi">
+                <label>Distance (mi)</label>
+                <input type="number" step="0.01" data-field="distance_mi" value="${meta.adjusted_distance_mi != null ? parseFloat(meta.adjusted_distance_mi).toFixed(2) : (meta.distance_mi != null ? parseFloat(meta.distance_mi).toFixed(2) : "")}" placeholder="${meta.display_distance || ""}">
+                ${resetBtn("distance_mi")}
+            </div>
+            <div class="edit-row" data-field-row="duration_s">
+                <label>Duration</label>
+                <input type="text" data-field="duration_s" data-type="duration" value="${durVal}" placeholder="${durVal || "m:ss"}">
+                ${resetBtn("duration_s")}
+            </div>
+            <div class="edit-row" data-field-row="avg_pace_s_per_mi">
+                <label>Pace (/mi)</label>
+                <input type="text" data-field="avg_pace_s_per_mi" data-type="pace" value="${paceVal}" placeholder="${paceVal || "m:ss"}">
+                ${resetBtn("avg_pace_s_per_mi")}
+            </div>
+            <div class="edit-row" data-field-row="avg_hr">
+                <label>Avg HR</label>
+                <input type="number" step="1" data-field="avg_hr" value="${meta.avg_hr != null ? Math.round(meta.avg_hr) : ""}" placeholder="${meta.avg_hr != null ? Math.round(meta.avg_hr) : ""}">
+                ${resetBtn("avg_hr")}
+            </div>
+            <div class="edit-row" data-field-row="avg_cadence">
+                <label>Cadence</label>
+                <input type="number" step="1" data-field="avg_cadence" value="${meta.avg_cadence != null ? Math.round(meta.avg_cadence) : ""}" placeholder="${meta.avg_cadence != null ? Math.round(meta.avg_cadence) : ""}">
+                ${resetBtn("avg_cadence")}
+            </div>
+            <div class="edit-row" data-field-row="shoe_id">
+                <label>Shoe</label>
+                <select data-field="shoe_id">${shoeOptions}</select>
+                ${resetBtn("shoe_id")}
+            </div>
+            <div class="edit-row" data-field-row="strides">
+                <label>Strides</label>
+                <input type="number" step="1" data-field="strides" value="${meta.strides || ""}" placeholder="${meta.strides || ""}">
+                ${resetBtn("strides")}
+            </div>
+            <div class="edit-row" data-field-row="vdot">
+                <label>VDOT</label>
+                <input type="number" step="0.1" data-field="vdot" value="${meta.vdot != null ? meta.vdot : ""}" placeholder="${meta.vdot != null ? meta.vdot : ""}">
+            </div>
+            <div class="edit-row race-entry-row" data-field-row="race">
+                <label>Race</label>
+                <select class="race-distance-select">
+                    <option value="">-- distance --</option>
+                    <option value="800">800m</option>
+                    <option value="1500">1500m</option>
+                    <option value="1609.344">Mile</option>
+                    <option value="3000">3000m</option>
+                    <option value="3200">3200m</option>
+                    <option value="3218.688">2 Mile</option>
+                    <option value="5000">5K</option>
+                    <option value="8000">8K</option>
+                    <option value="10000">10K</option>
+                    <option value="21097.5">Half Marathon</option>
+                    <option value="42195">Marathon</option>
+                    <option value="custom">Custom (m)</option>
+                </select>
+                <input type="number" step="1" class="race-custom-dist" placeholder="meters" style="display:none;width:70px">
+                <input type="text" class="race-time-input" placeholder="m:ss" style="width:70px">
+                <span class="race-vdot-computed"></span>
+                <label style="margin-left:6px;width:auto">Adj:</label>
+                <input type="number" step="0.1" class="race-vdot-adjusted" placeholder="VDOT" style="width:60px">
+                <label style="margin-left:4px;width:auto"><input type="checkbox" class="race-tag-cb"> Tag Race</label>
+            </div>
+            <div class="edit-row" data-field-row="notes">
+                <label>Notes</label>
+                <textarea data-field="notes" rows="2" placeholder="${escapeHtml(meta.notes)}">${escapeHtml(meta.notes)}</textarea>
+                ${resetBtn("notes")}
+            </div>
+        </div>`;
+    }
+
+    function wireEditForm(container, meta) {
+        const aid = meta.id;
+        const form = container.querySelector(`[data-edit-aid="${aid}"]`);
+        if (!form) return;
+
+        // Store original values
+        const originals = {};
+        form.querySelectorAll("[data-field]").forEach(input => {
+            const field = input.dataset.field;
+            originals[field] = input.value;
+        });
+        modalOriginalValues[aid] = originals;
+        modalDirtyState[aid] = {};
+        modalClearQueue[aid] = new Set();
+
+        // Track changes on all inputs
+        form.querySelectorAll("[data-field]").forEach(input => {
+            const field = input.dataset.field;
+            const handler = () => {
+                const current = input.value;
+                const original = modalOriginalValues[aid][field];
+                const editRow = input.closest(".edit-row");
+
+                if (current !== original) {
+                    modalDirtyState[aid][field] = current;
+                    if (editRow) editRow.classList.add("dirty");
+                } else {
+                    delete modalDirtyState[aid][field];
+                    if (editRow) editRow.classList.remove("dirty");
+                }
+                updateModalButtons();
+            };
+            input.addEventListener("input", handler);
+            input.addEventListener("change", handler);
+        });
+
+        // Reset override buttons (queue clear on save)
+        form.querySelectorAll(".btn-reset-override").forEach(btn => {
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const field = btn.dataset.field;
+                const btnAid = parseInt(btn.dataset.aid);
+                if (!modalClearQueue[btnAid]) modalClearQueue[btnAid] = new Set();
+                modalClearQueue[btnAid].add(field);
+                btn.style.opacity = "0.2";
+                btn.title = "Will be cleared on save";
+                const editRow = btn.closest(".edit-row");
+                if (editRow) editRow.classList.add("dirty");
+                updateModalButtons();
+            });
+        });
+
+        // Race entry: auto-compute VDOT
+        const raceDistSelect = form.querySelector(".race-distance-select");
+        const raceCustomDist = form.querySelector(".race-custom-dist");
+        const raceTimeInput = form.querySelector(".race-time-input");
+        const raceComputedSpan = form.querySelector(".race-vdot-computed");
+        const raceAdjustedInput = form.querySelector(".race-vdot-adjusted");
+        const raceTagCb = form.querySelector(".race-tag-cb");
+        let userEditedAdjusted = false;
+
+        function getRaceDistM() {
+            if (!raceDistSelect) return NaN;
+            if (raceDistSelect.value === "custom") {
+                return parseFloat(raceCustomDist.value);
+            }
+            return parseFloat(raceDistSelect.value);
+        }
+
+        function updateRaceVDOT() {
+            const distM = getRaceDistM();
+            const timeS = parseDuration(raceTimeInput ? raceTimeInput.value.trim() : "");
+            if (!distM || isNaN(distM) || distM <= 0 || !timeS || timeS <= 0) {
+                if (raceComputedSpan) raceComputedSpan.textContent = "";
+                return;
+            }
+            const vdot = computeVDOT(distM, timeS);
+            if (raceComputedSpan) raceComputedSpan.textContent = `= ${vdot.toFixed(1)}`;
+            if (raceAdjustedInput && !userEditedAdjusted) {
+                raceAdjustedInput.value = vdot.toFixed(1);
+            }
+            // Mark as dirty if we have race data
+            updateRaceDirty();
+        }
+
+        function updateRaceDirty() {
+            const distM = getRaceDistM();
+            const timeS = parseDuration(raceTimeInput ? raceTimeInput.value.trim() : "");
+            const hasRace = distM > 0 && timeS > 0;
+            const editRow = form.querySelector('.race-entry-row');
+
+            if (hasRace) {
+                // Store VDOT state for batch save
+                let vdotToSave = raceAdjustedInput ? parseFloat(raceAdjustedInput.value) : NaN;
+                if (isNaN(vdotToSave) || vdotToSave <= 0) {
+                    vdotToSave = computeVDOT(distM, timeS);
+                }
+                modalVdotState[aid] = {
+                    vdot: vdotToSave,
+                    race_distance_m: distM,
+                    race_time_s: timeS,
+                    tag_race: raceTagCb ? raceTagCb.checked : false,
+                };
+                if (editRow) editRow.classList.add("dirty");
+            } else {
+                delete modalVdotState[aid];
+                if (editRow) editRow.classList.remove("dirty");
+            }
+            updateModalButtons();
+        }
+
+        if (raceDistSelect && raceCustomDist) {
+            raceDistSelect.addEventListener("change", () => {
+                raceCustomDist.style.display = raceDistSelect.value === "custom" ? "" : "none";
+                userEditedAdjusted = false;
+                updateRaceVDOT();
+            });
+            raceCustomDist.addEventListener("input", () => { userEditedAdjusted = false; updateRaceVDOT(); });
+        }
+        if (raceTimeInput) {
+            raceTimeInput.addEventListener("input", () => { userEditedAdjusted = false; updateRaceVDOT(); });
+        }
+        if (raceAdjustedInput) {
+            raceAdjustedInput.addEventListener("input", () => {
+                userEditedAdjusted = true;
+                updateRaceDirty();
+            });
+        }
+        if (raceTagCb) {
+            raceTagCb.addEventListener("change", updateRaceDirty);
+        }
+
+        // VDOT field dirty tracking (separate from race entry)
+        const vdotInput = form.querySelector('[data-field="vdot"]');
+        if (vdotInput) {
+            const vdotHandler = () => {
+                const current = vdotInput.value;
+                const original = modalOriginalValues[aid]["vdot"];
+                const editRow = vdotInput.closest(".edit-row");
+                if (current !== original) {
+                    // Track VDOT change in vdotState (without race data)
+                    const v = parseFloat(current);
+                    if (!isNaN(v) && v > 0) {
+                        if (!modalVdotState[aid]) {
+                            modalVdotState[aid] = { vdot: v };
+                        } else {
+                            modalVdotState[aid].vdot = v;
+                        }
+                    }
+                    if (editRow) editRow.classList.add("dirty");
+                } else {
+                    // Only remove if no race data
+                    if (modalVdotState[aid] && !modalVdotState[aid].race_distance_m) {
+                        delete modalVdotState[aid];
+                    }
+                    if (editRow) editRow.classList.remove("dirty");
+                }
+                updateModalButtons();
+            };
+            vdotInput.addEventListener("input", vdotHandler);
+            vdotInput.addEventListener("change", vdotHandler);
+        }
+
+        form.addEventListener("click", e => e.stopPropagation());
+    }
+
+    function updateModalButtons() {
+        // Save and Save & Close are always visible; disabled when nothing to save
+        const hasDirty = isDirty();
+        modalBtnSave.disabled = !hasDirty;
+        modalBtnSaveClose.disabled = !hasDirty;
+    }
+
+    // ── Batch save ──────────────────────────────────────────────
+
+    async function saveModalChanges(andClose) {
+        modalBtnSave.disabled = true;
+        modalBtnSaveClose.disabled = true;
+
+        try {
+            // 1. Save dirty field overrides
+            for (const [aidStr, fields] of Object.entries(modalDirtyState)) {
+                const aid = parseInt(aidStr);
+                for (const [field, rawValue] of Object.entries(fields)) {
+                    if (field === "vdot") continue; // handled separately
+                    let value = rawValue;
+                    // Parse duration/pace
+                    const form = document.querySelector(`[data-edit-aid="${aid}"]`);
+                    const input = form ? form.querySelector(`[data-field="${field}"]`) : null;
+                    if (input && value !== "" && (input.dataset.type === "duration" || input.dataset.type === "pace")) {
+                        const parsed = parseDuration(value);
+                        if (parsed === null) continue;
+                        value = parsed;
+                    }
+                    await saveOverride(aid, field, value);
+
+                    // Update grid row
+                    const row = document.querySelector(`.activity-row[data-id="${aid}"]`)
+                             || document.querySelector(`.activity-row[data-activity-ids*="${aid}"]`);
+                    if (row) {
+                        const colClass = fieldToColClass(field);
+                        const cell = row.querySelector(`.col-${colClass}`);
+                        if (cell) {
+                            cell.classList.add("overridden");
+                            updateCellDisplay(cell, field, value);
+                        }
+                    }
+                }
+            }
+
+            // 2. Clear queued overrides
+            for (const [aidStr, fields] of Object.entries(modalClearQueue)) {
+                const aid = parseInt(aidStr);
+                for (const field of fields) {
+                    await clearOverride(aid, field);
+                    const row = document.querySelector(`.activity-row[data-id="${aid}"]`)
+                             || document.querySelector(`.activity-row[data-activity-ids*="${aid}"]`);
+                    if (row) {
+                        const cell = row.querySelector(`.col-${fieldToColClass(field)}`);
+                        if (cell) cell.classList.remove("overridden");
+                    }
+                }
+            }
+
+            // 3. Save VDOT changes
+            for (const [aidStr, vdotData] of Object.entries(modalVdotState)) {
+                const aid = parseInt(aidStr);
+                if (!vdotData || !vdotData.vdot) continue;
+
+                const payload = { vdot: vdotData.vdot };
+                if (vdotData.race_distance_m) {
+                    payload.race_distance_m = vdotData.race_distance_m;
+                    payload.race_time_s = vdotData.race_time_s;
+                    payload.tag_race = vdotData.tag_race || false;
+                }
+                // For VDOT timeline: prompt user
+                const applyTimeline = confirm(
+                    "Apply this VDOT to all activities from this date until the next race?\n\n" +
+                    "OK = yes (updates VDOT timeline + re-enriches)\n" +
+                    "Cancel = this activity only"
+                );
+                payload.apply_timeline = applyTimeline;
+
+                await fetch(`/api/activity/${aid}/vdot`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                }).then(r => r.json());
+            }
+
+            // Reset dirty state
+            modalDirtyState = {};
+            modalClearQueue = {};
+            modalVdotState = {};
+            // Remove dirty classes
+            document.querySelectorAll("#modal-edit-section .edit-row.dirty").forEach(el => {
+                el.classList.remove("dirty");
+            });
+            updateModalButtons();
+
+            // Refresh footer stats
+            refreshFooterStats();
+
+            // Refresh 7d MA for affected dates
+            for (const aid of modalActivityIds) {
+                const row = document.querySelector(`.activity-row[data-id="${aid}"]`)
+                         || document.querySelector(`.activity-row[data-activity-ids*="${aid}"]`);
+                if (row && row.dataset.date) {
+                    refreshSevenDayMA(row.dataset.date);
+                }
+            }
+
+            if (andClose) {
+                // Enrich all activity IDs then close
+                await fetch("/api/enrich", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ activity_ids: modalActivityIds }),
+                }).then(r => r.json());
+                closeModal();
+            }
+        } catch (err) {
+            console.error("Save error:", err);
+            // Re-enable so user can retry
+            updateModalButtons();
+        }
+    }
+
     // ── Render charts (canvas) ──────────────────────────────────
 
-    const chartRegistry = {};
-
-    function renderCharts(id, paceData, hrData) {
-        const section = document.getElementById(`chart-${id}`);
-        if (!section) return;
-        section.style.display = "";
-
-        if (paceData.length) {
-            drawChart(`pace-chart-${id}`, paceData, {
-                color: "#4a7ab5",
-                fillColor: "rgba(74,122,181,0.15)",
-                formatY: v => { const m = Math.floor(v / 60); const s = Math.round(v % 60); return `${m}:${s < 10 ? "0" : ""}${s}`; },
-                invertY: true, // lower pace = faster = top
-                partnerId: `hr-chart-${id}`,
-            });
-        }
-
-        if (hrData.length) {
-            drawChart(`hr-chart-${id}`, hrData, {
-                color: "#c05050",
-                fillColor: "rgba(192,80,80,0.15)",
-                formatY: v => Math.round(v).toString(),
-                invertY: false,
-                partnerId: `pace-chart-${id}`,
-            });
-        }
-
-        wireChartCrosshair(`pace-chart-${id}`);
-        wireChartCrosshair(`hr-chart-${id}`);
-    }
-
-    function renderChartsForActivity(rowId, activityId, paceData, hrData) {
-        // For multi-activity days, create chart canvases inside the activity section
-        const section = document.querySelector(`.activity-section[data-activity-id="${activityId}"]`);
-        if (!section) return;
-
-        const paceId = `pace-chart-act-${activityId}`;
-        const hrId = `hr-chart-act-${activityId}`;
-
-        const chartDiv = document.createElement("div");
-        chartDiv.className = "chart-section";
-        chartDiv.innerHTML = `<div class="chart-row">
-            <div class="chart-wrap"><h3>Pace</h3><canvas id="${paceId}" height="100"></canvas></div>
-            <div class="chart-wrap"><h3>Heart Rate</h3><canvas id="${hrId}" height="100"></canvas></div>
-        </div>`;
-        section.insertBefore(chartDiv, section.firstChild);
-
-        // Hide the template chart section (unused for multi-activity)
-        const templateChart = document.getElementById(`chart-${rowId}`);
-        if (templateChart) templateChart.style.display = "none";
-
-        if (paceData.length) {
-            drawChart(paceId, paceData, {
-                color: "#4a7ab5",
-                fillColor: "rgba(74,122,181,0.15)",
-                formatY: v => { const m = Math.floor(v / 60); const s = Math.round(v % 60); return `${m}:${s < 10 ? "0" : ""}${s}`; },
-                invertY: true,
-                partnerId: hrId,
-            });
-        }
-
-        if (hrData.length) {
-            drawChart(hrId, hrData, {
-                color: "#c05050",
-                fillColor: "rgba(192,80,80,0.15)",
-                formatY: v => Math.round(v).toString(),
-                invertY: false,
-                partnerId: paceId,
-            });
-        }
-
-        wireChartCrosshair(paceId);
-        wireChartCrosshair(hrId);
-    }
-
-    function drawChart(canvasId, data, opts) {
+    function drawChart(canvasId, data, opts, registry) {
+        if (!registry) registry = modalChartRegistry;
         const canvas = document.getElementById(canvasId);
         if (!canvas || !data.length) return;
 
@@ -895,7 +1411,7 @@
             ctx.stroke();
         }
 
-        // X-axis labels (time in minutes)
+        // X-axis labels
         ctx.textAlign = "center";
         ctx.fillStyle = "#999";
         const totalMin = tRange / 60;
@@ -906,28 +1422,25 @@
             ctx.fillText(`${min}m`, x, h - 4);
         }
 
-        // Save clean image and metadata for crosshair overlay
         const cleanImage = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        chartRegistry[canvasId] = {
+        registry[canvasId] = {
             data, opts, canvas, cleanImage, dpr,
             xPos, yPos, tFromX,
             pad, w, h, tMin, tMax, tRange,
         };
     }
 
-    function drawCrosshair(canvasId, time, frozen) {
-        const reg = chartRegistry[canvasId];
+    function drawCrosshair(canvasId, time, frozen, registry) {
+        if (!registry) registry = modalChartRegistry;
+        const reg = registry[canvasId];
         if (!reg) return;
         const { data, opts, canvas, cleanImage, dpr, xPos, yPos, pad, w, h } = reg;
         const ctx = canvas.getContext("2d");
 
-        // Restore clean chart (putImageData ignores transform, writes raw pixels)
         ctx.putImageData(cleanImage, 0, 0);
-        // Set transform absolutely to DPR scale (don't stack on existing)
         ctx.save();
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-        // Find nearest data point to time
         let nearest = data[0];
         let minDiff = Infinity;
         for (const d of data) {
@@ -938,7 +1451,6 @@
         const x = xPos(nearest.t);
         const y = yPos(nearest.v);
 
-        // Vertical time line
         ctx.beginPath();
         ctx.moveTo(x, pad.top);
         ctx.lineTo(x, h - pad.bottom);
@@ -948,7 +1460,6 @@
         ctx.stroke();
         ctx.setLineDash([]);
 
-        // Dot on curve
         ctx.beginPath();
         ctx.arc(x, y, frozen ? 5 : 4, 0, Math.PI * 2);
         ctx.fillStyle = opts.color;
@@ -957,7 +1468,6 @@
         ctx.lineWidth = 1.5;
         ctx.stroke();
 
-        // Value + time label
         {
             const min = Math.floor((nearest.t - data[0].t) / 60);
             const sec = Math.round((nearest.t - data[0].t) % 60);
@@ -992,8 +1502,9 @@
         ctx.restore();
     }
 
-    function wireChartCrosshair(canvasId) {
-        const reg = chartRegistry[canvasId];
+    function wireChartCrosshair(canvasId, registry) {
+        if (!registry) registry = modalChartRegistry;
+        const reg = registry[canvasId];
         if (!reg) return;
         const { canvas, tFromX } = reg;
         let tracking = false;
@@ -1008,20 +1519,19 @@
             e.preventDefault();
             e.stopPropagation();
             if (frozenTime !== null) {
-                // Clear existing frozen crosshair, start fresh
                 frozenTime = null;
             }
             tracking = true;
             const time = getTime(e);
-            drawCrosshair(canvasId, time, false);
-            syncPartner(canvasId, time, false);
+            drawCrosshair(canvasId, time, false, registry);
+            syncPartner(canvasId, time, false, registry);
         });
 
         canvas.addEventListener("mousemove", (e) => {
             if (!tracking) return;
             const time = getTime(e);
-            drawCrosshair(canvasId, time, false);
-            syncPartner(canvasId, time, false);
+            drawCrosshair(canvasId, time, false, registry);
+            syncPartner(canvasId, time, false, registry);
         });
 
         canvas.addEventListener("mouseup", (e) => {
@@ -1029,255 +1539,32 @@
             tracking = false;
             const time = getTime(e);
             frozenTime = time;
-            drawCrosshair(canvasId, time, true);
-            syncPartner(canvasId, time, true);
+            drawCrosshair(canvasId, time, true, registry);
+            syncPartner(canvasId, time, true, registry);
         });
 
-        // If mouse leaves during drag, freeze at last position
         canvas.addEventListener("mouseleave", (e) => {
             if (tracking) {
                 tracking = false;
                 const time = getTime(e);
                 frozenTime = time;
-                drawCrosshair(canvasId, time, true);
-                syncPartner(canvasId, time, true);
+                drawCrosshair(canvasId, time, true, registry);
+                syncPartner(canvasId, time, true, registry);
             }
         });
     }
 
-    function syncPartner(canvasId, time, frozen) {
-        const reg = chartRegistry[canvasId];
+    function syncPartner(canvasId, time, frozen, registry) {
+        if (!registry) registry = modalChartRegistry;
+        const reg = registry[canvasId];
         if (!reg || !reg.opts.partnerId) return;
         const partnerId = reg.opts.partnerId;
-        if (chartRegistry[partnerId]) {
-            drawCrosshair(partnerId, time, frozen);
+        if (registry[partnerId]) {
+            drawCrosshair(partnerId, time, frozen, registry);
         }
     }
 
-    function clearCrosshair(canvasId) {
-        const reg = chartRegistry[canvasId];
-        if (!reg) return;
-        const ctx = reg.canvas.getContext("2d");
-        ctx.putImageData(reg.cleanImage, 0, 0);
-    }
-
-    // ── Render map ──────────────────────────────────────────────
-
-    function renderMap(id, points) {
-        const container = document.getElementById(`map-${id}`);
-        if (!container || !points.length) return;
-
-        setTimeout(() => {
-            if (maps[id]) { maps[id].invalidateSize(); return; }
-
-            const map = L.map(container, { attributionControl: false });
-            L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-                maxZoom: 19,
-            }).addTo(map);
-
-            const latlngs = points.map(p => [p.lat, p.lon]);
-            const polyline = L.polyline(latlngs, {
-                color: "#4A90D9", weight: 3, opacity: 0.8,
-            }).addTo(map);
-
-            map.fitBounds(polyline.getBounds(), { padding: [20, 20] });
-            maps[id] = map;
-        }, 100);
-    }
-
-    // ── Per-activity edit form builder ─────────────────────────
-
-    function formatDurationInput(seconds) {
-        if (seconds == null) return "";
-        const s = Math.round(seconds);
-        const h = Math.floor(s / 3600);
-        const m = Math.floor((s % 3600) / 60);
-        const sec = s % 60;
-        if (h > 0) return `${h}:${m < 10 ? "0" : ""}${m}:${sec < 10 ? "0" : ""}${sec}`;
-        return `${m}:${sec < 10 ? "0" : ""}${sec}`;
-    }
-
-    function formatPaceInput(secPerMile) {
-        if (secPerMile == null) return "";
-        const s = Math.round(secPerMile);
-        const m = Math.floor(s / 60);
-        const sec = s % 60;
-        return `${m}:${sec < 10 ? "0" : ""}${sec}`;
-    }
-
-    function parseDuration(str) {
-        if (!str) return null;
-        const parts = str.split(":").map(Number);
-        if (parts.some(isNaN)) return null;
-        if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-        if (parts.length === 2) return parts[0] * 60 + parts[1];
-        return null;
-    }
-
-    function buildEditForm(meta) {
-        const aid = meta.id;
-        const ov = meta.overridden_fields || [];
-        const cats = ["", "easy", "long", "tempo", "interval", "race", "recovery", "other"];
-
-        let shoeOptions = '<option value="">--</option>';
-        if (window.SHOES) {
-            for (const [shoeId, name] of Object.entries(window.SHOES)) {
-                const sel = meta.shoe_id && parseInt(shoeId) === meta.shoe_id ? " selected" : "";
-                shoeOptions += `<option value="${shoeId}"${sel}>${escapeHtml(name)}</option>`;
-            }
-        }
-
-        let catOptions = "";
-        for (const cat of cats) {
-            const sel = meta.workout_category === cat ? " selected" : "";
-            catOptions += `<option value="${cat}"${sel}>${cat || "--"}</option>`;
-        }
-
-        const durVal = formatDurationInput(meta.duration_s);
-        const paceVal = formatPaceInput(meta.avg_pace_s_per_mi);
-
-        return `
-        <h3 style="margin-top:10px">Edit</h3>
-        <div class="edit-form" data-edit-aid="${aid}">
-            <div class="edit-row">
-                <label>Name</label>
-                <input type="text" data-field="workout_name" value="${escapeHtml(meta.workout_name)}" placeholder="${escapeHtml(meta.workout_name)}">
-                <button class="btn-save" data-field="workout_name">Save</button>
-                <button class="btn-clear" data-field="workout_name" ${ov.includes("workout_name") ? "" : 'style="display:none"'}>Clear</button>
-            </div>
-            <div class="edit-row">
-                <label>Category</label>
-                <select data-field="workout_category">${catOptions}</select>
-                <button class="btn-save" data-field="workout_category">Save</button>
-                <button class="btn-clear" data-field="workout_category" ${ov.includes("workout_category") ? "" : 'style="display:none"'}>Clear</button>
-            </div>
-            <div class="edit-row">
-                <label>Distance (mi)</label>
-                <input type="number" step="0.01" data-field="distance_mi" value="${meta.adjusted_distance_mi != null ? parseFloat(meta.adjusted_distance_mi).toFixed(2) : (meta.distance_mi != null ? parseFloat(meta.distance_mi).toFixed(2) : "")}" placeholder="${meta.display_distance || ""}">
-                <button class="btn-save" data-field="distance_mi">Save</button>
-                <button class="btn-clear" data-field="distance_mi" ${ov.includes("distance_mi") ? "" : 'style="display:none"'}>Clear</button>
-            </div>
-            <div class="edit-row">
-                <label>Duration</label>
-                <input type="text" data-field="duration_s" data-type="duration" value="${durVal}" placeholder="${durVal || "m:ss"}">
-                <button class="btn-save" data-field="duration_s">Save</button>
-                <button class="btn-clear" data-field="duration_s" ${ov.includes("duration_s") ? "" : 'style="display:none"'}>Clear</button>
-            </div>
-            <div class="edit-row">
-                <label>Pace (/mi)</label>
-                <input type="text" data-field="avg_pace_s_per_mi" data-type="pace" value="${paceVal}" placeholder="${paceVal || "m:ss"}">
-                <button class="btn-save" data-field="avg_pace_s_per_mi">Save</button>
-                <button class="btn-clear" data-field="avg_pace_s_per_mi" ${ov.includes("avg_pace_s_per_mi") ? "" : 'style="display:none"'}>Clear</button>
-            </div>
-            <div class="edit-row">
-                <label>Avg HR</label>
-                <input type="number" step="1" data-field="avg_hr" value="${meta.avg_hr != null ? Math.round(meta.avg_hr) : ""}" placeholder="${meta.avg_hr != null ? Math.round(meta.avg_hr) : ""}">
-                <button class="btn-save" data-field="avg_hr">Save</button>
-                <button class="btn-clear" data-field="avg_hr" ${ov.includes("avg_hr") ? "" : 'style="display:none"'}>Clear</button>
-            </div>
-            <div class="edit-row">
-                <label>Cadence</label>
-                <input type="number" step="1" data-field="avg_cadence" value="${meta.avg_cadence != null ? Math.round(meta.avg_cadence) : ""}" placeholder="${meta.avg_cadence != null ? Math.round(meta.avg_cadence) : ""}">
-                <button class="btn-save" data-field="avg_cadence">Save</button>
-                <button class="btn-clear" data-field="avg_cadence" ${ov.includes("avg_cadence") ? "" : 'style="display:none"'}>Clear</button>
-            </div>
-            <div class="edit-row">
-                <label>Shoe</label>
-                <select data-field="shoe_id">${shoeOptions}</select>
-                <button class="btn-save" data-field="shoe_id">Save</button>
-                <button class="btn-clear" data-field="shoe_id" ${ov.includes("shoe_id") ? "" : 'style="display:none"'}>Clear</button>
-            </div>
-            <div class="edit-row">
-                <label>Strides</label>
-                <input type="number" step="1" data-field="strides" value="${meta.strides || ""}" placeholder="${meta.strides || ""}">
-                <button class="btn-save" data-field="strides">Save</button>
-                <button class="btn-clear" data-field="strides" ${ov.includes("strides") ? "" : 'style="display:none"'}>Clear</button>
-            </div>
-            <div class="edit-row">
-                <label>Notes</label>
-                <textarea data-field="notes" rows="2" placeholder="${escapeHtml(meta.notes)}">${escapeHtml(meta.notes)}</textarea>
-                <button class="btn-save" data-field="notes">Save</button>
-                <button class="btn-clear" data-field="notes" ${ov.includes("notes") ? "" : 'style="display:none"'}>Clear</button>
-            </div>
-        </div>`;
-    }
-
-    function wireEditForm(container, meta) {
-        const aid = meta.id;
-        const form = container.querySelector(`[data-edit-aid="${aid}"]`);
-        if (!form) return;
-
-        form.querySelectorAll(".btn-save").forEach(btn => {
-            btn.addEventListener("click", (e) => {
-                e.stopPropagation();
-                const field = btn.dataset.field;
-                const input = form.querySelector(`[data-field="${field}"]`);
-                let value = input.value;
-
-                // Nullable numeric fields: allow saving empty to clear the value
-                const NULLABLE_FIELDS = new Set(["avg_hr", "max_hr", "avg_cadence", "avg_pace_s_per_mi", "duration_s", "strides"]);
-                if (value === "" || value === undefined) {
-                    if (NULLABLE_FIELDS.has(field)) {
-                        value = "";  // will be sent as empty string, backend stores NULL
-                    } else {
-                        return;
-                    }
-                }
-
-                // Parse m:ss format for duration/pace fields
-                if (value !== "" && (input.dataset.type === "duration" || input.dataset.type === "pace")) {
-                    const parsed = parseDuration(value);
-                    if (parsed === null) { input.style.borderColor = "#c00"; return; }
-                    input.style.borderColor = "";
-                    value = parsed;
-                }
-
-                saveOverride(aid, field, value).then(result => {
-                    if (result) {
-                        btn.textContent = "Saved!";
-                        setTimeout(() => btn.textContent = "Save", 1500);
-                        const clearBtn = form.querySelector(`.btn-clear[data-field="${field}"]`);
-                        if (clearBtn) clearBtn.style.display = "";
-                        // Update the grid row (uses primary activity id from the row)
-                        const row = document.querySelector(`.activity-row[data-id="${aid}"]`)
-                                 || document.querySelector(`.activity-row[data-activity-ids*="${aid}"]`);
-                        if (row) {
-                            const colClass = fieldToColClass(field);
-                            const cell = row.querySelector(`.col-${colClass}`);
-                            if (cell) {
-                                cell.classList.add("overridden");
-                                updateCellDisplay(cell, field, value);
-                            }
-                        }
-                        if (field === "distance_mi" && result.date) {
-                            refreshSevenDayMA(result.date);
-                            refreshFooterStats();
-                        }
-                    }
-                });
-            });
-        });
-
-        form.querySelectorAll(".btn-clear").forEach(btn => {
-            btn.addEventListener("click", (e) => {
-                e.stopPropagation();
-                const field = btn.dataset.field;
-                clearOverride(aid, field).then(ok => {
-                    if (ok) {
-                        btn.style.display = "none";
-                        const row = document.querySelector(`.activity-row[data-id="${aid}"]`)
-                                 || document.querySelector(`.activity-row[data-activity-ids*="${aid}"]`);
-                        if (row) {
-                            const cell = row.querySelector(`.col-${fieldToColClass(field)}`);
-                            if (cell) cell.classList.remove("overridden");
-                        }
-                    }
-                });
-            });
-        });
-
-        form.addEventListener("click", e => e.stopPropagation());
-    }
+    // ── Field helpers ───────────────────────────────────────────
 
     function fieldToColClass(field) {
         const map = {
@@ -1293,7 +1580,7 @@
     function updateCellDisplay(cell, field, value) {
         const empty = value === "" || value === null || value === undefined;
         if (field === "distance_mi") {
-            cell.textContent = empty ? "" : parseFloat(value).toFixed(1);
+            cell.textContent = empty ? "" : parseFloat(value).toFixed(2);
         } else if (field === "workout_name") {
             cell.textContent = value || "";
         } else if (field === "strides") {
@@ -1345,17 +1632,9 @@
         }).then(r => r.json()).then(d => d.ok).catch(() => false);
     }
 
-    // ── Keyboard nav ────────────────────────────────────────────
-
-    document.addEventListener("keydown", (e) => {
-        if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
-        if (e.key === "Escape") {
-            document.querySelectorAll(".detail-row").forEach(r => r.style.display = "none");
-            document.querySelectorAll(".activity-row").forEach(r => r.classList.remove("expanded"));
-        }
-    });
-
     // ── Weekly mileage sidebar chart ────────────────────────────
+
+    const sidebarChartRegistry = {};
 
     function drawWeeklyMileageChart() {
         const canvas = document.getElementById("weekly-mileage-chart");
@@ -1381,7 +1660,6 @@
         function xPos(i) { return pad.left + (i / (data.length - 1 || 1)) * cw; }
         function yPos(v) { return pad.top + (1 - v / vMax) * ch; }
 
-        // Grid lines
         ctx.strokeStyle = "#eee";
         ctx.lineWidth = 0.5;
         const ySteps = 4;
@@ -1398,7 +1676,6 @@
             ctx.fillText(Math.round(v).toString(), pad.left - 3, y + 3);
         }
 
-        // Fill area under line
         ctx.beginPath();
         ctx.moveTo(xPos(0), yPos(data[0].distance));
         for (let i = 1; i < data.length; i++) {
@@ -1410,7 +1687,6 @@
         ctx.fillStyle = "rgba(74,122,181,0.12)";
         ctx.fill();
 
-        // Weekly mileage line
         ctx.beginPath();
         ctx.moveTo(xPos(0), yPos(data[0].distance));
         for (let i = 1; i < data.length; i++) {
@@ -1420,7 +1696,6 @@
         ctx.lineWidth = 1.5;
         ctx.stroke();
 
-        // 6-week moving average (dotted line)
         const maWindow = 6;
         if (data.length >= maWindow) {
             ctx.beginPath();
@@ -1445,7 +1720,6 @@
             ctx.setLineDash([]);
         }
 
-        // X-axis labels (show ~4 evenly spaced)
         ctx.textAlign = "center";
         ctx.fillStyle = "#aaa";
         ctx.font = "8px -apple-system, sans-serif";
@@ -1453,7 +1727,6 @@
         for (let i = 0; i < data.length; i += labelStep) {
             ctx.fillText(data[i].label, xPos(i), h - 4);
         }
-        // Always label the last point
         if (data.length > 1) {
             ctx.fillText(data[data.length - 1].label, xPos(data.length - 1), h - 4);
         }
@@ -1481,7 +1754,6 @@
                         importStatus.textContent = d.error || "Error";
                         return;
                     }
-                    // Poll for completion
                     const poll = setInterval(() => {
                         fetch("/api/import/status").then(r => r.json()).then(s => {
                             if (!s.running) {
@@ -1489,7 +1761,6 @@
                                 importBtn.disabled = false;
                                 importBtn.textContent = "Import";
                                 if (s.success) {
-                                    // Parse "Pipeline complete: N new activities" from output
                                     const match = s.output.match(/(\d+) new/);
                                     const newCount = match ? parseInt(match[1], 10) : 0;
                                     if (newCount > 0) {
@@ -1520,7 +1791,6 @@
     // ── Refresh 7d MA after planned activity change ────────────
 
     function refreshSevenDayMA(changedDate) {
-        // The changed date affects 7d MA for itself and the next 6 days
         const d = new Date(changedDate + "T00:00:00");
         const start = changedDate;
         const endD = new Date(d);
@@ -1530,7 +1800,6 @@
         fetch(`/api/seven_day_ma?start=${start}&end=${end}`)
             .then(r => r.json())
             .then(maData => {
-                // Patch all matching rows in the DOM
                 for (const [dateStr, maValue] of Object.entries(maData)) {
                     const rows = mainContent.querySelectorAll(`[data-date="${dateStr}"]`);
                     for (const row of rows) {
@@ -1542,14 +1811,12 @@
     }
 
     function refreshFooterStats() {
-        // Extract current year from the page
         const yearEl = document.querySelector(".cal-year");
         const year = yearEl ? yearEl.textContent.trim() : new Date().getFullYear();
 
         fetch(`/api/footer_stats?year=${year}`)
             .then(r => r.json())
             .then(data => {
-                // Update stat cards
                 const cards = document.querySelectorAll(".stat-card");
                 const cardMap = {};
                 cards.forEach(card => {
@@ -1562,7 +1829,6 @@
                 if (cardMap["Avg Pace"]) cardMap["Avg Pace"].textContent = data.yearly_avg_pace;
                 if (cardMap["Longest"]) cardMap["Longest"].textContent = data.longest_run.toFixed(1);
 
-                // Update monthly table
                 const monthRows = document.querySelectorAll(".monthly-table tbody tr");
                 const monthByName = {};
                 data.monthly.forEach(s => { monthByName[s.name] = s; });
@@ -1579,7 +1845,6 @@
                     cells[5].textContent = s.display_pace;
                 });
 
-                // Update monthly bar chart
                 const bars = document.querySelectorAll(".chart-col");
                 bars.forEach(col => {
                     const label = col.querySelector(".chart-label");
@@ -1611,13 +1876,6 @@
         if (best) best.scrollIntoView({ block: "center" });
     }
 
-    function reloadToDate(dateStr) {
-        // Preserve scroll position by storing target date, then reload
-        sessionStorage.setItem("runbase_scroll_to", dateStr);
-        location.reload();
-    }
-
-    // On load: scroll to stored date (from reload) or current week
     const scrollTarget = sessionStorage.getItem("runbase_scroll_to");
     if (scrollTarget) {
         sessionStorage.removeItem("runbase_scroll_to");
@@ -1630,4 +1888,3 @@
     }
 
 })();
-

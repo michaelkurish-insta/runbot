@@ -181,6 +181,33 @@
         </div>
     </footer>
 
+    <!-- ── Activity Detail Modal ─────────────────────────────── -->
+    <div class="modal-overlay" id="activity-modal" style="display:none">
+        <div class="modal-container">
+            <div class="modal-header">
+                <span class="modal-title" id="modal-title"></span>
+                <button class="modal-close-x" id="modal-close-x">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-sections">
+                    <div class="modal-left">
+                        <div class="modal-chart-section" id="modal-chart-section"></div>
+                        <div class="modal-intervals-container" id="modal-intervals-container"></div>
+                        <div class="modal-edit-section" id="modal-edit-section"></div>
+                    </div>
+                    <div class="modal-right">
+                        <div class="modal-map-container" id="modal-map-container"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="modal-btn modal-btn-close" id="modal-btn-close">Close</button>
+                <button class="modal-btn modal-btn-save" id="modal-btn-save" disabled>Save</button>
+                <button class="modal-btn modal-btn-save-close" id="modal-btn-save-close" disabled>Save &amp; Close</button>
+            </div>
+        </div>
+    </div>
+
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
         window.SHOES = {{ shoes | tojson }};

@@ -36,6 +36,9 @@ RunBase is a personal running data pipeline that ingests workout data from multi
 - `python scripts/backfill_xlsx_fields.py -v` — one-time migration for strides + workout_category
 - `python scripts/split_group_matched.py -v` — one-time: split group-matched activities into individual rows
 - `python scripts/split_group_matched.py --dry-run -v` — preview split without writing
+- `python scripts/tag_races.py -v` — scan activities for races, compute VDOT, populate timeline
+- `python scripts/tag_races.py --dry-run -v` — preview race candidates without writing
+- `python scripts/tag_races.py --yes --re-enrich -v` — non-interactive: tag races + re-enrich all
 
 ## Architecture
 
@@ -62,11 +65,11 @@ runbase/
 └── review/
     ├── app.py             # Flask routes, API endpoints, override logic
     ├── static/
-    │   ├── app.js         # UI: grid interactions, detail panels, inline editing, charts
-    │   └── style.css      # Styling: grid, detail panels, zone colors
+    │   ├── app.js         # UI: modal detail view, inline editing, charts, maps
+    │   └── style.css      # Styling: grid, modal, zone colors
     └── templates/
-        ├── index.html     # Main page: calendar grid, sidebar, stats footer
-        └── components/    # activity_row.html, detail_panel.html
+        ├── index.html     # Main page: calendar grid, sidebar, stats footer, modal
+        └── components/    # activity_row.html
 ```
 
 ## Configuration
@@ -134,11 +137,12 @@ complementary measure of true exertion.
 The Flask review UI (`python -m runbase review`) provides:
 
 - **Activity grid**: Year calendar with color-coded date cells, 7-day trailing mileage, monthly sections
-- **Detail panels**: Click a row to expand — shows intervals/laps, pace/HR charts, GPS map, edit form
-- **Same-day merging**: Multiple activities on one day display as a single merged grid row; the detail panel shows each activity separately with its own edit form
-- **Inline editing**: Double-click grid cells (name, type zone) or interval cells (distance, duration, HR, zone) to edit in place
+- **Modal detail view**: Click a row to open a modal popup — shows intervals/laps, pace/HR charts, GPS map, and edit form. Multi-activity days show each activity sequentially (title, charts, intervals, edit form). Save & Close re-enriches the activity.
+- **Same-day merging**: Multiple activities on one day display as a single merged grid row; the modal shows each activity separately with its own edit form
+- **Inline editing**: Double-click grid cells (name, type zone) for quick edits. Double-click interval cells (distance, duration, HR, zone) in the modal.
 - **Override system**: Activity edits go through `activity_overrides` table and sync to `activities` table, making them canonical (won't be overwritten by future imports)
 - **Interval editing**: Double-click interval cells to edit; sets `source='manual'`; auto-recalculates pace; does NOT update parent activity aggregates
+- **Stride/recovery toggles**: Checkbox toggles save immediately and update the grid's stride count in real time
 - **Nullable fields**: HR, cadence, pace, duration can be set to NULL by saving an empty value
 - **Planned activities**: Click future blank rows to enter planned distance/workout
 - **Import button**: Triggers the full pipeline from the UI

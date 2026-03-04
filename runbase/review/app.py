@@ -116,12 +116,16 @@ def create_app(config=None):
     ZONE_PRIORITY = {"FR": 6, "R": 5, "I": 4, "T": 3, "M": 2, "E": 1}
 
     def _get_workout_types(conn, activity_ids):
-        """Get predominant pace zone per activity from qualifying intervals."""
+        """Get predominant pace zone per activity from qualifying intervals.
+
+        Uses FIT-preferred logic: when an activity has both FIT (NULL source)
+        and strava_lap intervals, only FIT intervals are considered.
+        """
         if not activity_ids:
             return {}
         placeholders = ",".join("?" * len(activity_ids))
         rows = conn.execute(
-            f"""SELECT activity_id, pace_zone
+            f"""SELECT activity_id, pace_zone, source
                 FROM intervals
                 WHERE activity_id IN ({placeholders})
                   AND pace_zone IS NOT NULL
@@ -130,13 +134,28 @@ def create_app(config=None):
                   AND NOT is_stride
                   AND NOT is_hill_sprint
                   AND gps_measured_distance_mi > 0.015
+                  AND (source IS NULL OR source NOT IN ('pace_segment'))""",
+            activity_ids,
+        ).fetchall()
+
+        # Find which activities have ANY FIT (NULL-source) non-pace-segment intervals.
+        # Check all intervals, not just qualifying ones — an activity with only
+        # stride FIT laps still has FIT data, so its Strava laps should be hidden.
+        fit_check = conn.execute(
+            f"""SELECT DISTINCT activity_id FROM intervals
+                WHERE activity_id IN ({placeholders})
+                  AND source IS NULL
                   AND (source IS NULL OR source != 'pace_segment')""",
             activity_ids,
         ).fetchall()
-        # Pick highest-priority zone per activity
+        has_fit = {r["activity_id"] for r in fit_check}
+
+        # Pick highest-priority zone per activity, skipping strava_lap when FIT exists
         result = {}
         for r in rows:
             aid = r["activity_id"]
+            if r["source"] == "strava_lap" and aid in has_fit:
+                continue
             zone = r["pace_zone"]
             prio = ZONE_PRIORITY.get(zone, 0)
             if prio > ZONE_PRIORITY.get(result.get(aid, ""), 0):
@@ -508,6 +527,30 @@ def create_app(config=None):
         conn.close()
         return jsonify(result)
 
+    def _count_visible_strides(conn, activity_id):
+        """Count strides from the preferred source only (FIT > Strava).
+
+        Matches the display logic in api_intervals: when both FIT (NULL source)
+        and strava_lap intervals exist, only FIT laps are shown.
+        """
+        rows = conn.execute(
+            """SELECT source, is_stride FROM intervals
+               WHERE activity_id = ? AND (source IS NULL OR source != 'pace_segment')""",
+            (activity_id,),
+        ).fetchall()
+        fit_intervals = [r for r in rows if r["source"] is None]
+        strava_laps = [r for r in rows if r["source"] == "strava_lap"]
+        other = [r for r in rows if r["source"] not in (None, "strava_lap")]
+
+        if fit_intervals and strava_laps:
+            # FIT preferred: count from FIT + manual/other, exclude Strava
+            visible = fit_intervals + other
+        else:
+            visible = rows
+
+        count = sum(1 for r in visible if r["is_stride"])
+        return count or None  # NULL if zero
+
     def _format_interval(r):
         iv = dict(r)
         dist = iv.get("canonical_distance_mi") or iv.get("gps_measured_distance_mi") or iv.get("prescribed_distance_mi")
@@ -612,9 +655,13 @@ def create_app(config=None):
             (activity_id,),
         ).fetchall()
         points = [dict(r) for r in rows]
+        name_row = conn.execute(
+            "SELECT workout_name FROM activities WHERE id = ?", (activity_id,)
+        ).fetchone()
+        act_name = name_row["workout_name"] if name_row else None
         conn.close()
         if not points:
-            return jsonify({"pace": [], "hr": []})
+            return jsonify({"pace": [], "hr": [], "name": act_name})
 
         # 10-second rolling average for pace
         pace_out = []
@@ -654,6 +701,7 @@ def create_app(config=None):
         return jsonify({
             "pace": downsample(pace_out),
             "hr": downsample(hr_out),
+            "name": act_name,
         })
 
     @app.route("/api/activity/<int:activity_id>/streams")
@@ -715,6 +763,7 @@ def create_app(config=None):
             "avg_cadence": a.get("avg_cadence"),
             "strides": a.get("strides"),
             "notes": a.get("notes") or "",
+            "vdot": a.get("vdot"),
             "overridden_fields": overridden,
         })
 
@@ -863,6 +912,38 @@ def create_app(config=None):
         conn.commit()
         conn.close()
         return jsonify({"ok": True, "interval_id": interval_id, "is_walking": is_walking})
+
+    @app.route("/api/interval/<int:interval_id>/flag", methods=["PUT"])
+    def api_toggle_interval_flag(interval_id):
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+        field = data.get("field")
+        if field not in ("is_stride", "is_recovery"):
+            return jsonify({"error": "field must be is_stride or is_recovery"}), 400
+        value = bool(data.get("value", False))
+        conn = get_db()
+        conn.execute(
+            f"UPDATE intervals SET {field} = ?, source = 'manual' WHERE id = ?",
+            (value, interval_id),
+        )
+
+        # Recount strides for the activity (using visible-source logic)
+        activity_id = conn.execute(
+            "SELECT activity_id FROM intervals WHERE id = ?", (interval_id,)
+        ).fetchone()[0]
+        new_strides = _count_visible_strides(conn, activity_id)
+        conn.execute(
+            "UPDATE activities SET strides = ? WHERE id = ?",
+            (new_strides, activity_id),
+        )
+
+        conn.commit()
+        conn.close()
+        return jsonify({
+            "ok": True, "interval_id": interval_id, field: value,
+            "activity_id": activity_id, "strides": new_strides,
+        })
 
     # ── Interval editing ──────────────────────────────────────────
 
@@ -1146,5 +1227,153 @@ def create_app(config=None):
         conn.commit()
         conn.close()
         return jsonify({"ok": True, "activity_id": activity_id, "field": field})
+
+    @app.route("/api/enrich", methods=["POST"])
+    def api_enrich():
+        from runbase.analysis.interval_enricher import enrich_activity
+
+        data = request.get_json()
+        if not data or not data.get("activity_ids"):
+            return jsonify({"error": "activity_ids required"}), 400
+
+        activity_ids = data["activity_ids"]
+        cfg = app.config["RUNBASE"]
+        conn = get_db()
+        results = []
+        for aid in activity_ids:
+            try:
+                enrich_activity(conn, aid, cfg, verbose=False)
+                results.append({"id": aid, "ok": True})
+            except Exception as e:
+                results.append({"id": aid, "ok": False, "error": str(e)})
+        conn.close()
+        return jsonify({"ok": True, "results": results})
+
+    @app.route("/api/activity/<int:activity_id>/vdot", methods=["POST"])
+    def api_set_vdot(activity_id):
+        from runbase.analysis.vdot import race_to_vdot, set_vdot
+        from runbase.analysis.interval_enricher import enrich_activity
+
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        apply_timeline = data.get("apply_timeline", False)
+        tag_race = data.get("tag_race", False)
+        conn = get_db()
+
+        # Get the activity date
+        row = conn.execute(
+            "SELECT date FROM activities WHERE id = ?", (activity_id,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "activity not found"}), 404
+        activity_date = row["date"]
+
+        # Determine VDOT: explicit vdot (adjusted) takes priority,
+        # then computed from race distance + time
+        vdot = None
+        race_distance_m = data.get("race_distance_m")
+        race_time_s = data.get("race_time_s")
+
+        # Validate race distance/time if provided (used for notes even if vdot is explicit)
+        if race_distance_m is not None and race_time_s is not None:
+            try:
+                race_distance_m = float(race_distance_m)
+                race_time_s = float(race_time_s)
+            except (ValueError, TypeError):
+                conn.close()
+                return jsonify({"error": "invalid race_distance_m or race_time_s"}), 400
+            if race_distance_m <= 0 or race_time_s <= 0:
+                conn.close()
+                return jsonify({"error": "race distance and time must be positive"}), 400
+
+        # Explicit vdot (adjusted by user) takes priority over computed
+        if "vdot" in data and data["vdot"] is not None:
+            try:
+                vdot = float(data["vdot"])
+            except (ValueError, TypeError):
+                conn.close()
+                return jsonify({"error": "invalid vdot value"}), 400
+        elif race_distance_m is not None and race_time_s is not None:
+            vdot = race_to_vdot(race_distance_m, race_time_s)
+        else:
+            conn.close()
+            return jsonify({"error": "vdot or race_distance_m+race_time_s required"}), 400
+
+        # Tag as race if requested (does NOT change distance/duration)
+        if tag_race:
+            conn.execute(
+                """UPDATE activities SET workout_category = 'race', workout_type = 'race',
+                          updated_at = datetime('now')
+                   WHERE id = ?""",
+                (activity_id,),
+            )
+
+        if not apply_timeline:
+            # Just update this single activity's vdot
+            conn.execute(
+                "UPDATE activities SET vdot = ?, updated_at = datetime('now') WHERE id = ?",
+                (vdot, activity_id),
+            )
+            conn.commit()
+            conn.close()
+            return jsonify({"ok": True, "vdot": round(vdot, 2), "affected_count": 1})
+
+        # Build notes for the vdot_history entry
+        notes = None
+        if race_distance_m and race_time_s:
+            if race_distance_m >= 1609.344:
+                dist_label = f"{race_distance_m / 1609.344:.2f}mi"
+            else:
+                dist_label = f"{race_distance_m:.0f}m"
+            mins = int(race_time_s // 60)
+            secs = int(race_time_s % 60)
+            notes = f"{dist_label} in {mins}:{secs:02d}"
+
+        # Insert/update vdot_history entry
+        source = "race" if tag_race else "manual"
+        existing = conn.execute(
+            "SELECT id FROM vdot_history WHERE activity_id = ?",
+            (activity_id,),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE vdot_history SET vdot = ?, effective_date = ?, source = ?, notes = ? WHERE id = ?",
+                (vdot, activity_date, source, notes, existing["id"]),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO vdot_history (effective_date, vdot, source, activity_id, notes)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (activity_date, vdot, source, activity_id, notes),
+            )
+        conn.commit()
+
+        # Find the date range to re-enrich: from this date until the next vdot_history entry
+        next_entry = conn.execute(
+            "SELECT effective_date FROM vdot_history WHERE effective_date > ? ORDER BY effective_date LIMIT 1",
+            (activity_date,),
+        ).fetchone()
+        end_date = next_entry["effective_date"] if next_entry else "9999-12-31"
+
+        # Re-enrich affected activities
+        affected_rows = conn.execute(
+            "SELECT id FROM activities WHERE date >= ? AND date < ? ORDER BY date",
+            (activity_date, end_date),
+        ).fetchall()
+
+        affected_count = 0
+        cfg = app.config["RUNBASE"]
+        for r in affected_rows:
+            try:
+                enrich_activity(conn, r["id"], cfg, verbose=False)
+                affected_count += 1
+            except Exception:
+                pass
+
+        conn.close()
+        return jsonify({"ok": True, "vdot": round(vdot, 2), "affected_count": affected_count})
 
     return app
