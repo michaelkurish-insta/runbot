@@ -162,7 +162,140 @@ def create_app(config=None):
                 result[aid] = zone
         return result
 
-    def _build_activity(r, overrides_map, shoes, has_streams_set, workout_types):
+    # ── Intensity Score ────────────────────────────────────────────
+    INTENSITY_PTS_PER_MIN = {
+        "walk": 0, "E": 0.2, "M": 0.4, "T": 0.6,
+        "I": 1.0, "R": 1.5, "FR": 2.0,
+    }
+    STRIDE_PTS = 0.2   # flat per stride
+    HILL_PTS = 0.25     # flat per hill sprint
+
+    def _compute_intensity_scores(conn, activity_ids):
+        """Compute I-score per activity from interval pace zones and durations.
+
+        Rules:
+        - Walking intervals: 0 points
+        - Strides: 0.2 pts each (flat, ignoring duration/pace)
+        - Hill sprints: 0.25 pts each (flat, ignoring duration/pace)
+        - Pace zone == "walk" but NOT is_walking: treat as E (0.2 pts/min)
+        - Otherwise: zone multiplier * duration_minutes
+        - Fallback: if no intervals, use activity-level pace to classify zone
+          and multiply by activity duration
+        Uses FIT-preferred logic (skip strava_laps when FIT intervals exist).
+        """
+        from runbase.analysis.vdot import classify_pace, vdot_to_boundaries, get_current_vdot
+
+        if not activity_ids:
+            return {}
+        placeholders = ",".join("?" * len(activity_ids))
+        rows = conn.execute(
+            f"""SELECT activity_id, pace_zone, duration_s, source,
+                       is_stride, is_hill_sprint, is_walking, is_recovery
+                FROM intervals
+                WHERE activity_id IN ({placeholders})""",
+            activity_ids,
+        ).fetchall()
+
+        # Group by activity
+        by_act = {}
+        for r in rows:
+            by_act.setdefault(r["activity_id"], []).append(r)
+
+        # Determine which activities have manual laps (FIT, strava_lap, xlsx_split)
+        # vs only pace_segments. When manual laps exist, skip pace_segments
+        # to avoid double-counting the same time period.
+        has_manual_laps = set()
+        has_fit = set()
+        for aid, intervals in by_act.items():
+            for iv in intervals:
+                if iv["source"] != "pace_segment":
+                    has_manual_laps.add(aid)
+                if iv["source"] is None:
+                    has_fit.add(aid)
+
+        result = {}
+        for aid, intervals in by_act.items():
+            # Skip pace_segments when manual laps exist (avoid double-counting)
+            if aid in has_manual_laps:
+                visible = [iv for iv in intervals if iv["source"] != "pace_segment"]
+            else:
+                visible = intervals
+            # FIT-preferred: skip strava_lap when FIT exists
+            if aid in has_fit:
+                visible = [iv for iv in visible if iv["source"] != "strava_lap"]
+
+            score = 0.0
+            for iv in visible:
+                if iv["is_walking"]:
+                    continue  # 0 points
+                if iv["is_stride"]:
+                    score += STRIDE_PTS
+                    continue
+                if iv["is_hill_sprint"]:
+                    score += HILL_PTS
+                    continue
+                duration_min = (iv["duration_s"] or 0) / 60.0
+                if duration_min <= 0:
+                    continue
+                zone = iv["pace_zone"]
+                if zone == "walk":
+                    # Manually marked as running (not is_walking) — count as E
+                    score += INTENSITY_PTS_PER_MIN["E"] * duration_min
+                else:
+                    score += INTENSITY_PTS_PER_MIN.get(zone, 0) * duration_min
+
+            result[aid] = round(score, 1) if score > 0 else None
+
+        # Fallback: activities with no intervals — use activity-level pace + duration
+        missing = [aid for aid in activity_ids if aid not in result or result[aid] is None]
+        if missing:
+            ph2 = ",".join("?" * len(missing))
+            act_rows = conn.execute(
+                f"""SELECT id, date, avg_pace_s_per_mi, duration_s,
+                           COALESCE(adjusted_distance_mi, distance_mi) as dist
+                    FROM activities WHERE id IN ({ph2})""",
+                missing,
+            ).fetchall()
+            # Cache VDOT boundaries + E-pace by date to avoid repeated lookups
+            boundary_cache = {}
+            for ar in act_rows:
+                pace = ar["avg_pace_s_per_mi"]
+                dur = ar["duration_s"]
+                dist = ar["dist"]
+                act_date = ar["date"]
+
+                if act_date not in boundary_cache:
+                    vdot = get_current_vdot(conn, act_date)
+                    if vdot:
+                        bounds = vdot_to_boundaries(vdot)
+                        # E-pace = boundary between E and M (slower side of M)
+                        e_pace = bounds.get("E", 570)
+                    else:
+                        bounds = None
+                        e_pace = 570  # ~9:30/mi default
+                    boundary_cache[act_date] = (bounds, e_pace)
+                bounds, e_pace = boundary_cache[act_date]
+
+                if pace and dur and pace > 0 and dur > 0:
+                    # Have pace + duration: classify pace into zone
+                    if bounds:
+                        zone = classify_pace(pace, bounds)
+                    else:
+                        zone = "E"
+                    if zone == "walk":
+                        zone = "E"  # a real activity is running, not walking
+                    score = INTENSITY_PTS_PER_MIN.get(zone, 0.2) * (dur / 60.0)
+                elif dist and dist > 0:
+                    # Distance only (no duration/pace): estimate duration at E pace
+                    est_dur_min = (dist * e_pace) / 60.0
+                    score = INTENSITY_PTS_PER_MIN["E"] * est_dur_min
+                else:
+                    continue
+                result[ar["id"]] = round(score, 1)
+
+        return result
+
+    def _build_activity(r, overrides_map, shoes, has_streams_set, workout_types, intensity_scores=None):
         a = dict(r)
         ovr = overrides_map.get(a["id"], {})
         overridden = _apply_overrides(a, ovr)
@@ -177,6 +310,7 @@ def create_app(config=None):
         a["has_streams"] = a["id"] in has_streams_set
         a["overridden_fields"] = list(overridden)
         a["workout_type_zone"] = ovr.get("workout_type_zone", workout_types.get(a["id"], ""))
+        a["intensity_score"] = (intensity_scores or {}).get(a["id"])
 
         dt = datetime.strptime(a["date"], "%Y-%m-%d")
         a["day_of_week"] = dt.strftime("%a")
@@ -213,6 +347,8 @@ def create_app(config=None):
         merged["display_distance"] = f"{total_dist:.2f}" if total_dist else ""
         merged["display_duration"] = _format_duration(total_dur) if total_dur else ""
         merged["strides"] = total_strides or None
+        total_iscore = sum((a.get("intensity_score") or 0) for a in day_acts)
+        merged["intensity_score"] = round(total_iscore, 1) if total_iscore > 0 else None
         # Keep primary's pace/HR/cadence/shoe/name/vdot
         merged["has_streams"] = any(a["has_streams"] for a in day_acts)
         merged["overridden_fields"] = list(set().union(*(a["overridden_fields"] for a in day_acts)))
@@ -253,17 +389,25 @@ def create_app(config=None):
         start = f"{year}-01-01"
         end = f"{year}-12-31"
 
-        # Fetch prior year's last 6 days for 7d MA at start of year
-        prior_start = f"{year - 1}-12-25"
+        # Fetch prior days for 7d MA (6 days) and ATL/CTL EMA seeding (~90 days)
+        seed_start = (date(year, 1, 1) - timedelta(days=90)).isoformat()
         prior_rows = conn.execute(
-            """SELECT date, COALESCE(adjusted_distance_mi, distance_mi, 0) as dist
+            """SELECT id, date, COALESCE(adjusted_distance_mi, distance_mi, 0) as dist
                FROM activities
                WHERE date BETWEEN ? AND ?""",
-            (prior_start, f"{year - 1}-12-31"),
+            (seed_start, f"{year - 1}-12-31"),
         ).fetchall()
         daily_dist = {}
+        prior_ids = [r["id"] for r in prior_rows]
         for r in prior_rows:
             daily_dist[r["date"]] = daily_dist.get(r["date"], 0) + r["dist"]
+
+        # Compute I-scores for prior activities (for ATL/CTL seeding)
+        prior_iscores = _compute_intensity_scores(conn, prior_ids) if prior_ids else {}
+        daily_iscore = {}
+        for r in prior_rows:
+            iscore = prior_iscores.get(r["id"], 0) or 0
+            daily_iscore[r["date"]] = daily_iscore.get(r["date"], 0) + iscore
 
         rows = conn.execute(
             """SELECT a.*, s.name as shoe_name
@@ -289,6 +433,7 @@ def create_app(config=None):
             has_streams = {r["activity_id"] for r in stream_rows}
 
         workout_types = _get_workout_types(conn, activity_ids)
+        intensity_scores = _compute_intensity_scores(conn, activity_ids)
 
         # Fetch planned activities for the year (used in blank calendar rows + 7d MA)
         planned_rows = conn.execute(
@@ -303,18 +448,36 @@ def create_app(config=None):
         months_with_data = set()
         by_date = {}
         for r in rows:
-            a = _build_activity(r, overrides_map, shoes, has_streams, workout_types)
+            a = _build_activity(r, overrides_map, shoes, has_streams, workout_types, intensity_scores)
             activities.append(a)
             months_with_data.add(a["month_num"])
             by_date.setdefault(a["date"], []).append(a)
-            # Accumulate daily distances for 7d MA
+            # Accumulate daily distances and I-scores
             dist = a.get("adjusted_distance_mi") or a.get("distance_mi") or 0
             daily_dist[a["date"]] = daily_dist.get(a["date"], 0) + dist
+            daily_iscore[a["date"]] = daily_iscore.get(a["date"], 0) + (a.get("intensity_score") or 0)
 
         # Add planned distances to daily_dist for 7d MA (only for dates without real activities)
         for p_date, p_data in planned_map.items():
             if p_date not in by_date and p_data.get("distance_mi"):
                 daily_dist[p_date] = daily_dist.get(p_date, 0) + p_data["distance_mi"]
+
+        # Pre-compute ATL/CTL EMAs by walking all days from seed through year end
+        lambda_a = 2.0 / (7 + 1)    # ATL: 7-day decay
+        lambda_f = 2.0 / (42 + 1)   # CTL: 42-day decay
+        atl = 0.0
+        ctl = 0.0
+        seed_dt = date.fromisoformat(seed_start)
+        year_end = date(year, 12, 31)
+        atl_ctl_map = {}  # date_str -> (atl, ctl)
+        d_cursor = seed_dt
+        while d_cursor <= year_end:
+            trimp = daily_iscore.get(d_cursor.isoformat(), 0)
+            atl = trimp * lambda_a + (1 - lambda_a) * atl
+            ctl = trimp * lambda_f + (1 - lambda_f) * ctl
+            if d_cursor.year == year:
+                atl_ctl_map[d_cursor.isoformat()] = (round(atl, 1), round(ctl, 1))
+            d_cursor += timedelta(days=1)
 
         # Build full calendar: one row per day (merged if multiple activities)
         month_calendars = {}
@@ -335,10 +498,25 @@ def create_app(config=None):
                 is_saturday = dt.weekday() == 5  # Saturday
                 ma_display = f"{seven_day:.1f}"
 
+                # 7-day trailing intensity sum
+                seven_day_i = 0.0
+                for offset in range(7):
+                    dd = dt - timedelta(days=offset)
+                    seven_day_i += daily_iscore.get(dd.isoformat(), 0)
+                i7_display = f"{seven_day_i:.1f}" if seven_day_i > 0 else ""
+
+                # ATL / CTL
+                day_atl, day_ctl = atl_ctl_map.get(date_str, (0, 0))
+                atl_display = f"{day_atl:.1f}" if day_atl >= 0.05 else ""
+                ctl_display = f"{day_ctl:.1f}" if day_ctl >= 0.05 else ""
+
                 if day_acts:
                     merged = _merge_day(day_acts)
                     merged["week_of_month"] = wom
                     merged["seven_day_ma"] = ma_display
+                    merged["seven_day_i"] = i7_display
+                    merged["atl"] = atl_display
+                    merged["ctl"] = ctl_display
                     merged["is_saturday"] = is_saturday
                     cal.append({"blank": False, "activity": merged})
                 else:
@@ -351,6 +529,9 @@ def create_app(config=None):
                         "month_num": m,
                         "week_of_month": wom,
                         "seven_day_ma": ma_display,
+                        "seven_day_i": i7_display,
+                        "atl": atl_display,
+                        "ctl": ctl_display,
                         "is_saturday": is_saturday,
                         "planned": planned,
                         "is_future": dt >= today,
@@ -386,6 +567,7 @@ def create_app(config=None):
         monthly_stats = []
         yearly_distance = 0.0
         yearly_duration = 0.0
+        yearly_pace_distance = 0.0  # only from activities with duration
         yearly_count = 0
         longest_run = 0.0
         max_week_dist = 0.0
@@ -395,7 +577,9 @@ def create_app(config=None):
             dist = sum((a.get("adjusted_distance_mi") or a.get("distance_mi") or 0) for a in month_acts)
             dur = sum((a.get("duration_s") or 0) for a in month_acts)
             count = len(month_acts)
-            avg_pace = (dur / dist) if dist > 0 else None
+            # Pace: only count distance from activities that have duration
+            pace_dist = sum((a.get("adjusted_distance_mi") or a.get("distance_mi") or 0) for a in month_acts if a.get("duration_s"))
+            avg_pace = (dur / pace_dist) if pace_dist > 0 else None
 
             # Average weekly mileage: total miles / number of weeks elapsed
             days_in_m = monthrange(year, m)[1]
@@ -426,6 +610,7 @@ def create_app(config=None):
 
             yearly_distance += dist
             yearly_duration += dur
+            yearly_pace_distance += pace_dist
             yearly_count += count
             for a in month_acts:
                 d = a.get("adjusted_distance_mi") or a.get("distance_mi") or 0
@@ -437,7 +622,7 @@ def create_app(config=None):
                 max_week_dist = w["distance"]
 
         max_month_dist = max((s["distance"] for s in monthly_stats), default=1) or 1
-        yearly_avg_pace = (yearly_duration / yearly_distance) if yearly_distance > 0 else None
+        yearly_avg_pace = (yearly_duration / yearly_pace_distance) if yearly_pace_distance > 0 else None
 
         # ── Weekly mileage chart data (prior 6 months) ──────────────
         chart_start = (today - timedelta(days=180)).isoformat()
@@ -1118,7 +1303,8 @@ def create_app(config=None):
         rows = conn.execute(
             """SELECT date,
                       COALESCE(adjusted_distance_mi, distance_mi, 0) as dist,
-                      COALESCE(duration_s, 0) as dur
+                      COALESCE(duration_s, 0) as dur,
+                      duration_s as raw_dur
                FROM activities
                WHERE date BETWEEN ? AND ?""",
             (f"{year}-01-01", f"{year}-12-31"),
@@ -1126,20 +1312,23 @@ def create_app(config=None):
         conn.close()
 
         # Monthly buckets
-        monthly = {m: {"distance": 0.0, "duration": 0.0, "count": 0, "longest": 0.0} for m in range(1, 13)}
+        monthly = {m: {"distance": 0.0, "duration": 0.0, "pace_distance": 0.0, "count": 0, "longest": 0.0} for m in range(1, 13)}
         for r in rows:
             m = int(r["date"][5:7])
             monthly[m]["distance"] += r["dist"]
             monthly[m]["duration"] += r["dur"]
+            if r["raw_dur"]:  # only count distance for pace when duration exists
+                monthly[m]["pace_distance"] += r["dist"]
             monthly[m]["count"] += 1
             if r["dist"] > monthly[m]["longest"]:
                 monthly[m]["longest"] = r["dist"]
 
         yearly_distance = sum(monthly[m]["distance"] for m in range(1, 13))
         yearly_duration = sum(monthly[m]["duration"] for m in range(1, 13))
+        yearly_pace_distance = sum(monthly[m]["pace_distance"] for m in range(1, 13))
         yearly_count = sum(monthly[m]["count"] for m in range(1, 13))
         longest_run = max(monthly[m]["longest"] for m in range(1, 13))
-        yearly_avg_pace = (yearly_duration / yearly_distance) if yearly_distance > 0 else None
+        yearly_avg_pace = (yearly_duration / yearly_pace_distance) if yearly_pace_distance > 0 else None
 
         stats = []
         for m in range(1, 13):
@@ -1153,7 +1342,7 @@ def create_app(config=None):
                 elapsed_days = 0
             elapsed_weeks = elapsed_days / 7.0 if elapsed_days > 0 else 0
             avg_weekly = (s["distance"] / elapsed_weeks) if elapsed_weeks > 0 else 0
-            avg_pace = (s["duration"] / s["distance"]) if s["distance"] > 0 else None
+            avg_pace = (s["duration"] / s["pace_distance"]) if s["pace_distance"] > 0 else None
 
             stats.append({
                 "month": m,

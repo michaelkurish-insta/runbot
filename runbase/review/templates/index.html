@@ -54,6 +54,9 @@
                     <table class="grid">
                         <thead>
                             <tr>
+                                <th class="col-ctl">CTL</th>
+                                <th class="col-atl">ATL</th>
+                                <th class="col-7di">7dI</th>
                                 <th class="col-7d">7d</th>
                                 <th class="col-date">Date</th>
                                 <th class="col-dist">Dist</th>
@@ -64,7 +67,7 @@
                                 <th class="col-pace">Pace</th>
                                 <th class="col-hr">HR</th>
                                 <th class="col-cad">Cad</th>
-                                <th class="col-shoe">Shoe</th>
+                                <th class="col-iscore">I</th>
                                 <th class="col-notes">Notes</th>
                                 <th class="col-vdot">VDOT</th>
                             </tr>
@@ -77,6 +80,9 @@
                                 {% else %}
                                     {% if day.planned %}
                                     <tr class="blank-row planned-row month-{{ m }} week-{{ day.week_of_month }}" data-date="{{ day.date_str }}">
+                                        <td class="col-ctl ma-dim">{{ day.ctl }}</td>
+                                        <td class="col-atl ma-dim">{{ day.atl }}</td>
+                                        <td class="col-7di {{ 'ma-saturday' if day.is_saturday else 'ma-dim' }}">{{ day.seven_day_i }}</td>
                                         <td class="col-7d {{ 'ma-saturday' if day.is_saturday else 'ma-dim' }}">{{ day.seven_day_ma }}</td>
                                         <td class="col-date date-cell">
                                             <span class="day-name">{{ day.day_of_week }}</span>
@@ -88,6 +94,9 @@
                                     </tr>
                                     {% else %}
                                     <tr class="blank-row month-{{ m }} week-{{ day.week_of_month }} {{ 'future-row' if day.is_future }}" data-date="{{ day.date_str }}">
+                                        <td class="col-ctl ma-dim">{{ day.ctl }}</td>
+                                        <td class="col-atl ma-dim">{{ day.atl }}</td>
+                                        <td class="col-7di {{ 'ma-saturday' if day.is_saturday else 'ma-dim' }}">{{ day.seven_day_i }}</td>
                                         <td class="col-7d {{ 'ma-saturday' if day.is_saturday else 'ma-dim' }}">{{ day.seven_day_ma }}</td>
                                         <td class="col-date date-cell">
                                             <span class="day-name">{{ day.day_of_week }}</span>

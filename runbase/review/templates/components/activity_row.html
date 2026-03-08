@@ -3,6 +3,9 @@
     data-date="{{ a.date }}"
     data-activity-ids="{{ a.activity_ids | join(',') }}"
     data-has-streams="{{ 'true' if a.has_streams else 'false' }}">
+    <td class="col-ctl ma-dim">{{ a.ctl }}</td>
+    <td class="col-atl ma-dim">{{ a.atl }}</td>
+    <td class="col-7di {{ 'ma-saturday' if a.is_saturday else 'ma-dim' }}">{{ a.seven_day_i }}</td>
     <td class="col-7d {{ 'ma-saturday' if a.is_saturday else 'ma-dim' }}">{{ a.seven_day_ma }}</td>
     <td class="col-date date-cell">
         <span class="day-name">{{ a.day_of_week }}</span>
@@ -16,7 +19,7 @@
     <td class="col-pace {{ 'overridden' if 'avg_pace_s_per_mi' in a.overridden_fields }}">{{ a.display_pace }}</td>
     <td class="col-hr">{{ a.display_hr }}</td>
     <td class="col-cad">{{ a.display_cadence }}</td>
-    <td class="col-shoe {{ 'overridden' if 'shoe_id' in a.overridden_fields }}">{{ a.shoe_name or '' }}</td>
+    <td class="col-iscore">{{ '%.1f' % a.intensity_score if a.intensity_score else '' }}</td>
     <td class="col-notes {{ 'overridden' if 'notes' in a.overridden_fields }}" title="{{ a.notes or '' }}">{{ a.notes or '' }}</td>
     <td class="col-vdot">{{ '%.1f' % a.vdot if a.vdot else '' }}</td>
 </tr>

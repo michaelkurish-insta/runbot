@@ -1570,7 +1570,7 @@
         const map = {
             distance_mi: "dist", duration_s: "dur", avg_pace_s_per_mi: "pace",
             workout_name: "name", workout_category: "name",
-            shoe_id: "shoe", notes: "notes", strides: "strides",
+            notes: "notes", strides: "strides",
             workout_type_zone: "type", avg_hr: "hr", max_hr: "hr",
             avg_cadence: "cad",
         };
@@ -1588,8 +1588,6 @@
         } else if (field === "notes") {
             cell.textContent = value || "";
             cell.title = value || "";
-        } else if (field === "shoe_id" && window.SHOES) {
-            cell.textContent = window.SHOES[value] || "";
         } else if (field === "duration_s") {
             if (empty) { cell.textContent = ""; return; }
             const s = parseInt(value, 10);

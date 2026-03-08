@@ -232,6 +232,9 @@ header {
     border-bottom: 1px solid #ddd;
 }
 
+.col-ctl     { width: 38px; text-align: right; font-size: 10px; }
+.col-atl     { width: 38px; text-align: right; font-size: 10px; }
+.col-7di     { width: 40px; text-align: right; font-size: 10px; }
 .col-7d      { width: 40px; text-align: right; font-size: 11px; padding-right: 6px; }
 .col-date    { width: 75px; }
 .col-dist    { width: 58px; text-align: right; }
@@ -242,7 +245,7 @@ header {
 .col-pace    { width: 55px; text-align: right; }
 .col-hr      { width: 38px; text-align: right; }
 .col-cad     { width: 40px; text-align: right; }
-.col-shoe    { width: 110px; }
+.col-iscore  { width: 42px; text-align: right; }
 .col-notes   { width: auto; }
 .col-vdot    { width: 42px; text-align: right; }
 
@@ -961,7 +964,7 @@ header {
 @media (max-width: 1100px) {
     .modal-sections { flex-direction: column; }
     .modal-right { width: 100%; }
-    .col-notes, .col-vdot, .col-cad { display: none; }
+    .col-notes, .col-vdot, .col-cad, .col-ctl, .col-atl, .col-7di { display: none; }
     .stats-inner { flex-direction: column; }
     .stats-cards { grid-template-columns: repeat(3, 1fr); width: 100%; }
     .monthly-table-wrap { width: 100%; }
@@ -972,5 +975,5 @@ header {
 
 @media (max-width: 800px) {
     .sidebar { width: 150px; }
-    .col-shoe { display: none; }
+    .col-iscore { display: none; }
 }

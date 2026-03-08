@@ -11,7 +11,7 @@ _WORK_ZONES = {"T", "I", "R", "FR"}
 _EASY_ZONES = {"E", "M", "walk"}
 
 # Sources that represent real laps (not auto-generated pace segments)
-_LAP_SOURCES = {"fit_lap", "strava_lap", "xlsx_split", None}
+_LAP_SOURCES = {"fit_lap", "strava_lap", "xlsx_split", "manual", None}
 
 
 def tag_workout_intervals(intervals: list[dict], boundaries: dict | None) -> list[dict]:
