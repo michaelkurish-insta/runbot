@@ -276,8 +276,9 @@ def create_app(config=None):
                     boundary_cache[act_date] = (bounds, e_pace)
                 bounds, e_pace = boundary_cache[act_date]
 
-                if pace and dur and pace > 0 and dur > 0:
-                    # Have pace + duration: classify pace into zone
+                if dist and dist > 0 and dur and dur > 0:
+                    # Always derive pace from distance/duration (canonical)
+                    pace = dur / dist
                     if bounds:
                         zone = classify_pace(pace, bounds)
                     else:
@@ -286,8 +287,8 @@ def create_app(config=None):
                         zone = "E"  # a real activity is running, not walking
                     score = INTENSITY_PTS_PER_MIN.get(zone, 0.2) * (dur / 60.0)
                 elif dist and dist > 0:
-                    # Distance only (no duration/pace): estimate duration at E pace
-                    est_dur_min = (dist * e_pace) / 60.0
+                    # Distance only, no duration: assume 9:00/mi pace
+                    est_dur_min = (dist * 540) / 60.0
                     score = INTENSITY_PTS_PER_MIN["E"] * est_dur_min
                 else:
                     continue
@@ -747,7 +748,7 @@ def create_app(config=None):
             iv["display_distance"] = ""
         iv["display_duration"] = _format_duration_precise(iv.get("duration_s"))
         iv["display_pace"] = _format_pace(iv.get("avg_pace_s_per_mi"))
-        iv["display_hr"] = f"{iv['avg_hr']:.0f}" if iv.get("avg_hr") else ""
+        iv["display_hr"] = f"{iv['avg_hr']:.1f}" if iv.get("avg_hr") else ""
         iv["display_cadence"] = f"{iv['avg_cadence']:.0f}" if iv.get("avg_cadence") else ""
         return iv
 
@@ -826,7 +827,7 @@ def create_app(config=None):
                 "count": len(ivs),
                 "avg_duration": _format_duration_precise(sum(durations) / len(durations)) if durations else "",
                 "avg_pace": _format_pace(sum(paces) / len(paces)) if paces else "",
-                "avg_hr": f"{sum(hrs) / len(hrs):.0f}" if hrs else "",
+                "avg_hr": f"{sum(hrs) / len(hrs):.1f}" if hrs else "",
             })
         return summary
 
@@ -943,7 +944,7 @@ def create_app(config=None):
             "avg_pace_s_per_mi": a.get("avg_pace_s_per_mi"),
             "display_pace": _format_pace(a.get("avg_pace_s_per_mi")),
             "avg_hr": a.get("avg_hr"),
-            "display_hr": f"{a['avg_hr']:.0f}" if a.get("avg_hr") else "",
+            "display_hr": f"{a['avg_hr']:.1f}" if a.get("avg_hr") else "",
             "max_hr": a.get("max_hr"),
             "avg_cadence": a.get("avg_cadence"),
             "strides": a.get("strides"),
@@ -1211,6 +1212,30 @@ def create_app(config=None):
         result = _format_interval(updated)
         return jsonify({"ok": True, "interval": result})
 
+    # ── New activity creation ──────────────────────────────────────
+
+    @app.route("/api/activity", methods=["POST"])
+    def api_create_activity():
+        data = request.get_json()
+        if not data or not data.get("date"):
+            return jsonify({"error": "date required"}), 400
+        activity_date = data["date"]
+        # Validate date format
+        try:
+            datetime.strptime(activity_date, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "invalid date format, use YYYY-MM-DD"}), 400
+
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO activities (date, updated_at) VALUES (?, datetime('now'))",
+            (activity_date,),
+        )
+        activity_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "activity_id": activity_id})
+
     # ── Planned activities ─────────────────────────────────────────
 
     @app.route("/api/planned/<date_str>", methods=["POST"])
@@ -1245,6 +1270,23 @@ def create_app(config=None):
         conn.commit()
         conn.close()
         return jsonify({"ok": True, "date": date_str})
+
+    @app.route("/api/activity/<int:activity_id>", methods=["DELETE"])
+    def api_delete_activity(activity_id):
+        conn = get_db()
+        # Verify it exists
+        row = conn.execute("SELECT id FROM activities WHERE id = ?", (activity_id,)).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "not found"}), 404
+        conn.execute("DELETE FROM streams WHERE activity_id = ?", (activity_id,))
+        conn.execute("DELETE FROM intervals WHERE activity_id = ?", (activity_id,))
+        conn.execute("DELETE FROM activity_sources WHERE activity_id = ?", (activity_id,))
+        conn.execute("DELETE FROM activity_overrides WHERE activity_id = ?", (activity_id,))
+        conn.execute("DELETE FROM activities WHERE id = ?", (activity_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "activity_id": activity_id})
 
     @app.route("/api/seven_day_ma")
     def api_seven_day_ma():

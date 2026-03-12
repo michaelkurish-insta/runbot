@@ -78,7 +78,7 @@
                                     {% set a = day.activity %}
                                     {% include "components/activity_row.html" %}
                                 {% else %}
-                                    {% if day.planned %}
+                                    {% if day.planned and day.is_future %}
                                     <tr class="blank-row planned-row month-{{ m }} week-{{ day.week_of_month }}" data-date="{{ day.date_str }}">
                                         <td class="col-ctl ma-dim">{{ day.ctl }}</td>
                                         <td class="col-atl ma-dim">{{ day.atl }}</td>
@@ -210,6 +210,7 @@
                 </div>
             </div>
             <div class="modal-footer">
+                <button class="modal-btn modal-btn-new" id="modal-btn-new">+ New Activity</button>
                 <button class="modal-btn modal-btn-close" id="modal-btn-close">Close</button>
                 <button class="modal-btn modal-btn-save" id="modal-btn-save" disabled>Save</button>
                 <button class="modal-btn modal-btn-save-close" id="modal-btn-save-close" disabled>Save &amp; Close</button>

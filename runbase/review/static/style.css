@@ -234,7 +234,7 @@ header {
 
 .col-ctl     { width: 38px; text-align: right; font-size: 10px; }
 .col-atl     { width: 38px; text-align: right; font-size: 10px; }
-.col-7di     { width: 40px; text-align: right; font-size: 10px; }
+.col-7di     { width: 48px; text-align: right; font-size: 10px; }
 .col-7d      { width: 40px; text-align: right; font-size: 11px; padding-right: 6px; }
 .col-date    { width: 75px; }
 .col-dist    { width: 58px; text-align: right; }
@@ -292,15 +292,19 @@ header {
     background: #fafafa;
 }
 
-.blank-row .date-cell .day-name { color: #ccc; }
-.blank-row .date-cell .date-num { color: #ccc; }
+.blank-row .date-cell .day-name { color: #999; }
+.blank-row .date-cell .date-num { color: #333; }
 
 /* Planned activity rows — keep date cell normal, tint the rest */
 .planned-row td:not(.col-7d):not(.col-date) { background: #fefdf5 !important; }
 .planned-dist { color: #b8960a; font-style: italic; }
 .planned-name { color: #b8960a; font-style: italic; }
 
-/* Future blank rows are clickable */
+/* Past blank rows are clickable (open modal) */
+.blank-row:not(.future-row):not(.planned-row) { cursor: pointer; }
+.blank-row:not(.future-row):not(.planned-row):hover td { background: #f0f0f0 !important; }
+
+/* Future blank rows are clickable (planned entry) */
 .future-row { cursor: pointer; }
 .future-row:hover td { background: #f5f3e8 !important; }
 
@@ -506,6 +510,9 @@ header {
 
 .modal-btn-save-close { background: #2E7D32; color: #fff; }
 .modal-btn-save-close:hover { background: #256d29; }
+
+.modal-btn-new { background: #558B2F; color: #fff; margin-right: auto; }
+.modal-btn-new:hover { background: #467525; }
 
 .modal-btn:disabled { opacity: 0.5; cursor: default; }
 
@@ -806,6 +813,19 @@ header {
 .btn-save:hover { background: #3a6a9a; }
 .btn-clear { background: #e8c8c8; color: #a04040; }
 .btn-clear:hover { background: #d8b0b0; }
+
+.edit-row-delete { justify-content: flex-end; margin-top: 6px; }
+.btn-delete-activity {
+    padding: 3px 10px;
+    border: 1px solid #c05050;
+    border-radius: 3px;
+    background: #fff;
+    color: #c05050;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+}
+.btn-delete-activity:hover { background: #c05050; color: #fff; }
 
 /* ── Stats Panel (bottom) ────────────────────────────────────── */
 .stats-panel {

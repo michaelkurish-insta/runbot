@@ -551,8 +551,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
     conn.execute(
         """UPDATE intervals SET
                canonical_distance_mi = NULL, location_type = NULL,
-               is_recovery = 0, set_number = NULL,
-               is_stride = 0, is_hill_sprint = 0
+               is_recovery = 0, set_number = NULL
            WHERE activity_id = ? AND source = 'manual'""",
         (activity_id,),
     )
@@ -811,7 +810,8 @@ def enrich_activity(conn, activity_id: int, config: dict,
     # same laps, prefer FIT — its higher GPS resolution gives more accurate
     # pace for very short intervals like strides.
     stride_min_mi = 0.015  # ~24m — excludes watch start/stop stubs
-    non_seg = [i for i in intervals if i.get("source") != "pace_segment"]
+    # Skip pace_segment and manual intervals — user edits are canonical.
+    non_seg = [i for i in intervals if i.get("source") not in ("pace_segment", "manual")]
     has_null_src = any(i.get("source") is None for i in non_seg)
     has_strava_src = any(i.get("source") == "strava_lap" for i in non_seg)
     if has_null_src and has_strava_src:

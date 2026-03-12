@@ -14,6 +14,7 @@
     const modalMapContainerEl = document.getElementById("modal-map-container");
     const modalBtnSave = document.getElementById("modal-btn-save");
     const modalBtnSaveClose = document.getElementById("modal-btn-save-close");
+    const modalBtnNew = document.getElementById("modal-btn-new");
 
     // ── Modal state ─────────────────────────────────────────────
     let modalMap = null;
@@ -23,6 +24,9 @@
     let modalClearQueue = {};   // { aid: Set(field, ...) } — overrides to delete on save
     let modalActivityIds = [];  // all activity IDs shown in the current modal
     let modalVdotState = {};    // { aid: { vdot, race_distance_m, race_time_s, tag_race, apply_timeline } }
+    let modalDate = null;       // date of the currently open modal's activity
+    let modalNewActivityIds = new Set();  // IDs of activities created during this modal session
+    let modalNeedsEnrich = false;  // set when stride/recovery/walking toggles fire
 
     // ── Row click → open modal ──────────────────────────────────
 
@@ -130,7 +134,17 @@
         });
     });
 
-    // ── Click future blank row → planned activity entry ────────
+    // ── Click past blank row → open modal for that date ────────
+
+    document.querySelectorAll(".blank-row:not(.future-row):not(.planned-row)").forEach(row => {
+        row.addEventListener("click", () => {
+            const dateStr = row.dataset.date;
+            if (!dateStr) return;
+            openModal(null, [], false, row);
+        });
+    });
+
+    // ── Click future/planned blank row → planned activity entry ──
 
     document.querySelectorAll(".future-row, .planned-row").forEach(row => {
         row.addEventListener("click", (e) => {
@@ -144,7 +158,7 @@
             const oldName = existingName ? existingName.textContent.trim() : "";
 
             const cells = row.querySelectorAll("td");
-            while (cells.length > 2 && row.children.length > 2) {
+            while (cells.length > 5 && row.children.length > 5) {
                 row.removeChild(row.lastChild);
             }
 
@@ -202,7 +216,7 @@
                     }),
                 }).then(r => r.json()).then(d => {
                     if (d.ok) {
-                        while (row.children.length > 2) row.removeChild(row.lastChild);
+                        while (row.children.length > 5) row.removeChild(row.lastChild);
                         const dTd = document.createElement("td");
                         dTd.className = "col-dist planned-dist";
                         dTd.textContent = dist ? parseFloat(dist).toFixed(1) : "";
@@ -222,7 +236,7 @@
             }
 
             function restoreBlanks() {
-                while (row.children.length > 2) row.removeChild(row.lastChild);
+                while (row.children.length > 5) row.removeChild(row.lastChild);
                 const td = document.createElement("td");
                 td.colSpan = 11;
                 row.appendChild(td);
@@ -300,6 +314,9 @@
         modalClearQueue = {};
         modalVdotState = {};
         modalActivityIds = activityIds.map(Number);
+        modalDate = row.dataset.date || null;
+        modalNewActivityIds = new Set();
+        modalNeedsEnrich = false;
 
         // Clean up old chart registry entries
         for (const key of Object.keys(modalChartRegistry)) {
@@ -315,7 +332,6 @@
 
         // Clear containers
         modalChartSectionEl.innerHTML = "";
-        modalIntervalsEl.innerHTML = '<p class="loading">Loading...</p>';
         modalEditSectionEl.innerHTML = "";
         modalMapContainerEl.innerHTML = "";
 
@@ -326,8 +342,13 @@
         modalBtnSave.disabled = true;
         modalBtnSaveClose.disabled = true;
 
-        // Load data
-        loadDetailIntoModal(id, activityIds, hasStreams);
+        // Load data or show empty state
+        if (activityIds.length === 0) {
+            modalIntervalsEl.innerHTML = '<p class="loading">No activities on this day. Click "+ New Activity" to add one.</p>';
+        } else {
+            modalIntervalsEl.innerHTML = '<p class="loading">Loading...</p>';
+            loadDetailIntoModal(id, activityIds, hasStreams);
+        }
     }
 
     function closeModal() {
@@ -386,6 +407,35 @@
     // Save & Close button
     modalBtnSaveClose.addEventListener("click", () => {
         saveModalChanges(true);
+    });
+
+    // + New Activity button
+    modalBtnNew.addEventListener("click", () => {
+        if (!modalDate) return;
+        modalBtnNew.disabled = true;
+        fetch("/api/activity", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ date: modalDate }),
+        }).then(r => r.json()).then(d => {
+            modalBtnNew.disabled = false;
+            if (!d.ok) return;
+            const newId = d.activity_id;
+            modalNewActivityIds.add(newId);
+            modalActivityIds.push(newId);
+
+            // Reload modal content with updated activity list
+            modalChartSectionEl.innerHTML = "";
+            modalIntervalsEl.innerHTML = '<p class="loading">Loading...</p>';
+            modalEditSectionEl.innerHTML = "";
+
+            const hasStreams = modalActivityIds.some(aid => {
+                const row = document.querySelector(`.activity-row[data-id="${aid}"]`)
+                         || document.querySelector(`.activity-row[data-activity-ids*="${aid}"]`);
+                return row && row.dataset.hasStreams === "true";
+            });
+            loadDetailIntoModal(modalActivityIds[0], modalActivityIds.map(String), hasStreams);
+        }).catch(() => { modalBtnNew.disabled = false; });
     });
 
     // Escape key
@@ -656,6 +706,8 @@
                             btn.innerHTML = "&#x1F6B6;";
                             btn.title = "Mark as walking";
                         }
+                        modalNeedsEnrich = true;
+                        updateModalButtons();
                     }
                 });
             });
@@ -692,6 +744,8 @@
                         } else {
                             tr.classList.toggle("is-recovery", value);
                         }
+                        modalNeedsEnrich = true;
+                        updateModalButtons();
                     }
                 }).catch(() => { cb.checked = !value; });
             });
@@ -1042,6 +1096,9 @@
                 <textarea data-field="notes" rows="2" placeholder="${escapeHtml(meta.notes)}">${escapeHtml(meta.notes)}</textarea>
                 ${resetBtn("notes")}
             </div>
+            <div class="edit-row edit-row-delete">
+                <button class="btn-delete-activity" data-aid="${aid}">Delete Activity</button>
+            </div>
         </div>`;
     }
 
@@ -1208,6 +1265,24 @@
             vdotInput.addEventListener("change", vdotHandler);
         }
 
+        // Delete activity button
+        const deleteBtn = form.querySelector(".btn-delete-activity");
+        if (deleteBtn) {
+            deleteBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                if (!confirm(`Delete activity #${aid}? This cannot be undone.`)) return;
+                fetch(`/api/activity/${aid}`, { method: "DELETE" })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.ok) {
+                            closeModal();
+                            sessionStorage.setItem("runbase_scroll_to", modalDate);
+                            location.reload();
+                        }
+                    });
+            });
+        }
+
         form.addEventListener("click", e => e.stopPropagation());
     }
 
@@ -1215,7 +1290,8 @@
         // Save and Save & Close are always visible; disabled when nothing to save
         const hasDirty = isDirty();
         modalBtnSave.disabled = !hasDirty;
-        modalBtnSaveClose.disabled = !hasDirty;
+        // Save & Close also enabled when enrichment needed (stride/recovery/walking toggled)
+        modalBtnSaveClose.disabled = !(hasDirty || modalNeedsEnrich);
     }
 
     // ── Batch save ──────────────────────────────────────────────
@@ -1299,8 +1375,13 @@
             modalDirtyState = {};
             modalClearQueue = {};
             modalVdotState = {};
+            modalNeedsEnrich = false;
             // Remove dirty classes
             document.querySelectorAll("#modal-edit-section .edit-row.dirty").forEach(el => {
+                el.classList.remove("dirty");
+            });
+            // Also check inside modal-intervals-container for inline edit forms
+            document.querySelectorAll("#modal-intervals-container .edit-row.dirty").forEach(el => {
                 el.classList.remove("dirty");
             });
             updateModalButtons();
@@ -1325,6 +1406,11 @@
                     body: JSON.stringify({ activity_ids: modalActivityIds }),
                 }).then(r => r.json());
                 closeModal();
+                // Reload page if new activities were created (grid needs server re-render)
+                if (modalNewActivityIds.size > 0) {
+                    sessionStorage.setItem("runbase_scroll_to", modalDate);
+                    location.reload();
+                }
             }
         } catch (err) {
             console.error("Save error:", err);

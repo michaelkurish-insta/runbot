@@ -152,10 +152,17 @@ def _avg_from_streams(streams: list[Stream], field: str) -> float | None:
 
 
 def _apply_stream_averages(activity: Activity, streams: list[Stream]) -> None:
-    """Recompute avg HR, cadence, and pace from per-second stream data."""
+    """Recompute avg HR, cadence, and pace from per-second stream data.
+
+    Only overrides session-level HR if stream data has good coverage (>=50%
+    of points), since some devices (e.g. WorkOutDoors) may only include HR
+    in a subset of record messages while the session summary is complete.
+    """
     avg_hr = _avg_from_streams(streams, "heart_rate")
-    if avg_hr is not None:
-        activity.avg_hr = round(avg_hr, 2)
+    if avg_hr is not None and streams:
+        hr_count = sum(1 for s in streams if s.heart_rate is not None)
+        if hr_count / len(streams) >= 0.5:
+            activity.avg_hr = round(avg_hr, 2)
 
     avg_cadence = _avg_from_streams(streams, "cadence")
     if avg_cadence is not None:
@@ -262,6 +269,16 @@ def _extract_laps(messages, streams: list[Stream]) -> list[Interval]:
             ]
             avg_hr = _avg_from_streams(lap_streams, "heart_rate")
             avg_cadence = _avg_from_streams(lap_streams, "cadence")
+
+        # Fall back to lap record fields if stream computation yielded nothing
+        if avg_hr is None:
+            lap_hr = get("avg_heart_rate")
+            if lap_hr is not None:
+                avg_hr = float(lap_hr)
+        if avg_cadence is None:
+            lap_cad = get("avg_running_cadence") or get("avg_cadence")
+            if lap_cad is not None:
+                avg_cadence = float(lap_cad) * 2  # per-foot to full strides
 
         if avg_hr is not None:
             avg_hr = round(avg_hr, 2)
