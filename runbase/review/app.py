@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import subprocess
 import threading
@@ -296,6 +297,205 @@ def create_app(config=None):
 
         return result
 
+    # ── Planned Activity Estimation ──────────────────────────────
+
+    def _parse_workout_structure(name):
+        """Parse workout name into structured reps.
+
+        Supports:
+        - Distance-based: "8x200m", "6x400", "4x1mi", "3x1k"
+        - Time-based: "6x(3min I, 2min E)", "4x(5min T)"
+        """
+        if not name:
+            return None
+
+        # Time-based: "6x(3min I, 2min E)" or "6x(3min on, 2min off)"
+        ZONE_ALIASES = {"ON": None, "OFF": "E"}  # ON = use row's zone
+        ZONE_NAMES = r'E|M|T|I|FR|R|on|off'
+        time_pat = re.compile(
+            r'(\d+)\s*x\s*\(?\s*(\d+\.?\d*)\s*min(?:s|utes?)?\s+(' + ZONE_NAMES + r')'
+            r'(?:\s*[,/]\s*(\d+\.?\d*)\s*min(?:s|utes?)?\s+(' + ZONE_NAMES + r'))?\s*\)?',
+            re.IGNORECASE,
+        )
+        m = time_pat.search(name)
+        if m:
+            work_z = m.group(3).upper()
+            result = {
+                "type": "time",
+                "reps": int(m.group(1)),
+                "work_time_min": float(m.group(2)),
+                "work_zone": ZONE_ALIASES.get(work_z, work_z),  # None = defer to row zone
+            }
+            if m.group(4) and m.group(5):
+                rec_z = m.group(5).upper()
+                result["recovery_time_min"] = float(m.group(4))
+                result["recovery_zone"] = ZONE_ALIASES.get(rec_z, rec_z)
+            return result
+
+        # Distance-based: "8x200m", "6x400", "4x1mi", "3x1k"
+        # Finds ALL NxD groups (e.g. "2x600, 3x400, 4x200") and sums them
+        dist_pat = re.compile(
+            r'(\d+)\s*x\s*(\d+\.?\d*)\s*(mile|mi|k|km|m)?',
+            re.IGNORECASE,
+        )
+        matches = dist_pat.findall(name)
+        if matches:
+            total_work_mi = 0.0
+            for reps_s, val_s, unit_s in matches:
+                reps = int(reps_s)
+                val = float(val_s)
+                unit = unit_s.lower()
+                if unit in ("mile", "mi"):
+                    dist_mi = val
+                elif unit in ("k", "km"):
+                    dist_mi = val * 1000 / 1609.344
+                elif unit == "m":
+                    dist_mi = val / 1609.344
+                else:
+                    dist_mi = val if val <= 10 else val / 1609.344
+                total_work_mi += reps * dist_mi
+
+            return {
+                "type": "distance",
+                "total_work_dist_mi": total_work_mi,
+            }
+
+        return None
+
+    def _get_avg_e_pace(conn, target_date, vdot=None):
+        """Get average E-pace (s/mi) from recent E-zone activities.
+
+        Fallback chain: 30-day weighted average -> VDOT E-pace -> 570 s/mi.
+        """
+        window_start = (date.fromisoformat(target_date) - timedelta(days=30)).isoformat()
+        rows = conn.execute(
+            """SELECT id, COALESCE(adjusted_distance_mi, distance_mi, 0) as dist, duration_s
+               FROM activities
+               WHERE date BETWEEN ? AND ? AND duration_s > 0""",
+            (window_start, target_date),
+        ).fetchall()
+
+        if rows:
+            act_ids = [r["id"] for r in rows]
+            wt = _get_workout_types(conn, act_ids)
+            total_dur = 0.0
+            total_dist = 0.0
+            for r in rows:
+                if wt.get(r["id"], "E") == "E" and r["dist"] > 0:
+                    total_dur += r["duration_s"]
+                    total_dist += r["dist"]
+            if total_dist > 0:
+                return total_dur / total_dist
+
+        if vdot:
+            from runbase.analysis.vdot import vdot_to_paces
+            return vdot_to_paces(vdot).get("E", 570)
+
+        return 570  # ~9:30/mi default
+
+    def _estimate_planned_iscore(distance_mi, name, zone, strides, vdot, e_pace):
+        """Estimate I-score for a planned activity.
+
+        Handles three cases:
+        1. Time-based structured: "6x(3min I, 2min E)"
+        2. Distance-based structured: "8x200m" with non-E zone + VDOT
+        3. E fallback: all distance at E pace + strides
+        """
+        if not distance_mi or distance_mi <= 0:
+            return None
+
+        strides = strides or 0
+        stride_dist = strides * 0.05  # ~80m per stride
+        structure = _parse_workout_structure(name)
+
+        # ── Time-based structured workout ──
+        if structure and structure["type"] == "time":
+            reps = structure["reps"]
+            work_zone = structure["work_zone"] or zone or "E"  # "on" defers to row zone
+            total_work_min = reps * structure["work_time_min"]
+            work_mult = INTENSITY_PTS_PER_MIN.get(work_zone, 0.2)
+            score = total_work_min * work_mult
+
+            # Recovery
+            if "recovery_time_min" in structure:
+                rec_time_min = reps * structure["recovery_time_min"]
+                rec_zone = structure.get("recovery_zone") or "E"
+                rec_mult = INTENSITY_PTS_PER_MIN.get(rec_zone, 0.2)
+                score += rec_time_min * rec_mult
+                # Estimate recovery distance for WU/CD calc
+                rec_pace = e_pace
+                if vdot and rec_zone != "E":
+                    from runbase.analysis.vdot import vdot_to_paces
+                    rec_pace = vdot_to_paces(vdot).get(rec_zone, e_pace)
+                rec_dist = rec_time_min * 60 / rec_pace
+            else:
+                # Default recovery by zone
+                if work_zone == "T":
+                    rec_time_min = 0
+                elif work_zone == "FR":
+                    rec_time_min = total_work_min * 2
+                elif work_zone in ("I", "M"):
+                    rec_time_min = total_work_min * (2 / 3)
+                else:  # R, E
+                    rec_time_min = total_work_min
+                score += rec_time_min * 0.2
+                rec_dist = rec_time_min * 60 / e_pace if rec_time_min else 0
+
+            # Estimate work distance for WU/CD calc
+            work_pace = e_pace
+            if vdot:
+                from runbase.analysis.vdot import vdot_to_paces
+                work_pace = vdot_to_paces(vdot).get(work_zone, e_pace)
+            work_dist = total_work_min * 60 / work_pace
+
+            wucd_dist = max(distance_mi - work_dist - rec_dist - stride_dist, 0)
+            wucd_time_min = wucd_dist * e_pace / 60
+            score += wucd_time_min * 0.2
+            score += strides * STRIDE_PTS
+
+            return round(score, 1) if score > 0 else None
+
+        # ── Distance-based structured workout ──
+        if structure and structure["type"] == "distance" and zone and zone != "E" and vdot:
+            from runbase.analysis.vdot import vdot_to_paces
+            paces = vdot_to_paces(vdot)
+
+            work_dist = structure["total_work_dist_mi"]
+            zone_pace = paces.get(zone, e_pace)
+            work_time_min = work_dist * zone_pace / 60
+            work_mult = INTENSITY_PTS_PER_MIN.get(zone, 0.2)
+            score = work_time_min * work_mult
+
+            # Recovery by zone
+            if zone == "T":
+                rec_time_min = 0
+                rec_dist = 0
+            elif zone == "R":
+                rec_dist = work_dist
+                rec_time_min = rec_dist * e_pace / 60
+            elif zone == "FR":
+                rec_time_min = work_time_min * 2
+                rec_dist = rec_time_min * 60 / e_pace
+            else:  # I, M
+                rec_time_min = work_time_min * (2 / 3)
+                rec_dist = rec_time_min * 60 / e_pace
+
+            score += rec_time_min * 0.2
+
+            wucd_dist = max(distance_mi - work_dist - rec_dist - stride_dist, 0)
+            wucd_time_min = wucd_dist * e_pace / 60
+            score += wucd_time_min * 0.2
+            score += strides * STRIDE_PTS
+
+            return round(score, 1) if score > 0 else None
+
+        # ── E workout (fallback) ──
+        e_dist = max(distance_mi - stride_dist, 0)
+        e_time_min = e_dist * e_pace / 60
+        score = e_time_min * 0.2 + strides * STRIDE_PTS
+
+        return round(score, 1) if score > 0 else None
+
     def _build_activity(r, overrides_map, shoes, has_streams_set, workout_types, intensity_scores=None):
         a = dict(r)
         ovr = overrides_map.get(a["id"], {})
@@ -438,8 +638,8 @@ def create_app(config=None):
 
         # Fetch planned activities for the year (used in blank calendar rows + 7d MA)
         planned_rows = conn.execute(
-            "SELECT date, distance_mi, workout_name FROM planned_activities "
-            "WHERE date BETWEEN ? AND ?",
+            "SELECT date, distance_mi, workout_name, workout_type_zone, strides "
+            "FROM planned_activities WHERE date BETWEEN ? AND ?",
             (start, end),
         ).fetchall()
         planned_map = {r["date"]: dict(r) for r in planned_rows}
@@ -458,10 +658,30 @@ def create_app(config=None):
             daily_dist[a["date"]] = daily_dist.get(a["date"], 0) + dist
             daily_iscore[a["date"]] = daily_iscore.get(a["date"], 0) + (a.get("intensity_score") or 0)
 
-        # Add planned distances to daily_dist for 7d MA (only for dates without real activities)
+        # Add planned distances and estimated I-scores to daily totals
+        # (only for dates without real activities)
+        _vdot_cache = {}
+        _epace_cache = {}
         for p_date, p_data in planned_map.items():
             if p_date not in by_date and p_data.get("distance_mi"):
                 daily_dist[p_date] = daily_dist.get(p_date, 0) + p_data["distance_mi"]
+                # Compute estimated I-score
+                if p_date not in _vdot_cache:
+                    from runbase.analysis.vdot import get_current_vdot
+                    _vdot_cache[p_date] = get_current_vdot(conn, p_date)
+                if p_date not in _epace_cache:
+                    _epace_cache[p_date] = _get_avg_e_pace(conn, p_date, _vdot_cache[p_date])
+                est = _estimate_planned_iscore(
+                    p_data["distance_mi"],
+                    p_data.get("workout_name"),
+                    p_data.get("workout_type_zone"),
+                    p_data.get("strides"),
+                    _vdot_cache[p_date],
+                    _epace_cache[p_date],
+                )
+                if est:
+                    daily_iscore[p_date] = daily_iscore.get(p_date, 0) + est
+                    p_data["estimated_iscore"] = est
 
         # Pre-compute ATL/CTL EMAs by walking all days from seed through year end
         lambda_a = 2.0 / (7 + 1)    # ATL: 7-day decay
@@ -927,8 +1147,12 @@ def create_app(config=None):
         a = dict(row)
         ovr = _get_overrides_for_activities(conn, [activity_id]).get(activity_id, {})
         overridden = list(_apply_overrides(a, ovr))
-        conn.close()
 
+        # Compute auto workout type zone from intervals
+        auto_zone = _get_workout_types(conn, [activity_id]).get(activity_id, "")
+        workout_type_zone = ovr.get("workout_type_zone", auto_zone)
+
+        conn.close()
         display_dist = a.get("adjusted_distance_mi") or a.get("distance_mi")
         return jsonify({
             "id": a["id"],
@@ -936,6 +1160,7 @@ def create_app(config=None):
             "shoe_id": a.get("shoe_id"),
             "shoe_name": a.get("shoe_name") or "",
             "workout_category": a.get("workout_category") or "",
+            "workout_type_zone": workout_type_zone,
             "distance_mi": a.get("distance_mi"),
             "adjusted_distance_mi": a.get("adjusted_distance_mi"),
             "display_distance": f"{display_dist:.2f}" if display_dist else "",
@@ -1245,23 +1470,47 @@ def create_app(config=None):
             return jsonify({"error": "JSON body required"}), 400
         distance_mi = data.get("distance_mi")
         workout_name = data.get("workout_name", "")
+        workout_type_zone = data.get("workout_type_zone") or None
+        strides = data.get("strides")
         if distance_mi is not None:
             try:
                 distance_mi = float(distance_mi)
             except (ValueError, TypeError):
                 distance_mi = None
+        if strides is not None:
+            try:
+                strides = int(strides)
+            except (ValueError, TypeError):
+                strides = None
         conn = get_db()
         conn.execute(
-            """INSERT INTO planned_activities (date, distance_mi, workout_name)
-               VALUES (?, ?, ?)
+            """INSERT INTO planned_activities (date, distance_mi, workout_name, workout_type_zone, strides)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(date) DO UPDATE SET
                    distance_mi = excluded.distance_mi,
-                   workout_name = excluded.workout_name""",
-            (date_str, distance_mi, workout_name),
+                   workout_name = excluded.workout_name,
+                   workout_type_zone = excluded.workout_type_zone,
+                   strides = excluded.strides""",
+            (date_str, distance_mi, workout_name, workout_type_zone, strides),
         )
         conn.commit()
+
+        # Compute estimated I-score
+        estimated_iscore = None
+        if distance_mi:
+            from runbase.analysis.vdot import get_current_vdot
+            vdot = get_current_vdot(conn, date_str)
+            e_pace = _get_avg_e_pace(conn, date_str, vdot)
+            estimated_iscore = _estimate_planned_iscore(
+                distance_mi, workout_name, workout_type_zone, strides, vdot, e_pace,
+            )
+
         conn.close()
-        return jsonify({"ok": True, "date": date_str, "distance_mi": distance_mi, "workout_name": workout_name})
+        return jsonify({
+            "ok": True, "date": date_str, "distance_mi": distance_mi,
+            "workout_name": workout_name, "workout_type_zone": workout_type_zone,
+            "strides": strides, "estimated_iscore": estimated_iscore,
+        })
 
     @app.route("/api/planned/<date_str>", methods=["DELETE"])
     def api_delete_planned(date_str):

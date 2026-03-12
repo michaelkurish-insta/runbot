@@ -90,7 +90,15 @@
                                         </td>
                                         <td class="col-dist planned-dist">{{ '%.1f' % day.planned.distance_mi if day.planned.distance_mi else '' }}</td>
                                         <td class="col-name planned-name">{{ day.planned.workout_name or '' }}</td>
-                                        <td colspan="9"></td>
+                                        <td class="col-type planned-type {{ 'zone-' ~ day.planned.workout_type_zone if day.planned.workout_type_zone }}">{{ day.planned.workout_type_zone or '' }}</td>
+                                        <td class="col-strides planned-strides">{{ day.planned.strides or '' }}</td>
+                                        <td class="col-dur"></td>
+                                        <td class="col-pace"></td>
+                                        <td class="col-hr"></td>
+                                        <td class="col-cad"></td>
+                                        <td class="col-iscore planned-iscore">{{ '%.1f' % day.planned.estimated_iscore if day.planned.estimated_iscore else '' }}</td>
+                                        <td class="col-notes"></td>
+                                        <td class="col-vdot"></td>
                                     </tr>
                                     {% else %}
                                     <tr class="blank-row month-{{ m }} week-{{ day.week_of_month }} {{ 'future-row' if day.is_future }}" data-date="{{ day.date_str }}">

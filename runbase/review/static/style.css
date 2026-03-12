@@ -299,6 +299,9 @@ header {
 .planned-row td:not(.col-7d):not(.col-date) { background: #fefdf5 !important; }
 .planned-dist { color: #b8960a; font-style: italic; }
 .planned-name { color: #b8960a; font-style: italic; }
+.planned-type { color: #b8960a; font-style: italic; }
+.planned-strides { color: #b8960a; font-style: italic; }
+.planned-iscore { color: #b8960a; font-style: italic; }
 
 /* Past blank rows are clickable (open modal) */
 .blank-row:not(.future-row):not(.planned-row) { cursor: pointer; }

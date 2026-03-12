@@ -193,6 +193,8 @@ CREATE TABLE IF NOT EXISTS planned_activities (
     date            TEXT NOT NULL UNIQUE,
     distance_mi     REAL,
     workout_name    TEXT,
+    workout_type_zone TEXT,
+    strides         INTEGER,
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -248,6 +250,9 @@ def _migrate_schema(conn):
         ("activities", "vdot", "REAL"),
         # Stream source tracking
         ("streams", "source_id", "INTEGER REFERENCES activity_sources(id)"),
+        # Planned activity enrichment
+        ("planned_activities", "workout_type_zone", "TEXT"),
+        ("planned_activities", "strides", "INTEGER"),
     ]
 
     existing = {}

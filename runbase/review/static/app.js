@@ -154,8 +154,12 @@
 
             const existingDist = row.querySelector(".planned-dist");
             const existingName = row.querySelector(".planned-name");
+            const existingType = row.querySelector(".planned-type");
+            const existingStrides = row.querySelector(".planned-strides");
             const oldDist = existingDist ? existingDist.textContent.trim() : "";
             const oldName = existingName ? existingName.textContent.trim() : "";
+            const oldType = existingType ? existingType.textContent.trim() : "";
+            const oldStrides = existingStrides ? existingStrides.textContent.trim() : "";
 
             const cells = row.querySelectorAll("td");
             while (cells.length > 5 && row.children.length > 5) {
@@ -183,8 +187,28 @@
             nameTd.appendChild(nameInput);
             row.appendChild(nameTd);
 
+            const typeTd = document.createElement("td");
+            typeTd.className = "col-type";
+            const typeSelect = document.createElement("input");
+            typeSelect.type = "text";
+            typeSelect.className = "planned-input";
+            typeSelect.placeholder = "zone";
+            typeSelect.value = oldType;
+            typeTd.appendChild(typeSelect);
+            row.appendChild(typeTd);
+
+            const stridesTd = document.createElement("td");
+            stridesTd.className = "col-strides";
+            const stridesInput = document.createElement("input");
+            stridesInput.type = "text";
+            stridesInput.className = "planned-input";
+            stridesInput.placeholder = "str";
+            stridesInput.value = oldStrides;
+            stridesTd.appendChild(stridesInput);
+            row.appendChild(stridesTd);
+
             const restTd = document.createElement("td");
-            restTd.colSpan = 9;
+            restTd.colSpan = 7;
             row.appendChild(restTd);
 
             distInput.focus();
@@ -207,12 +231,16 @@
                     }
                     return;
                 }
+                const type = typeSelect.value.trim().toUpperCase();
+                const stridesVal = stridesInput.value.trim();
                 fetch(`/api/planned/${dateStr}`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                         distance_mi: dist ? parseFloat(dist) : null,
                         workout_name: name,
+                        workout_type_zone: type || null,
+                        strides: stridesVal ? parseInt(stridesVal) : null,
                     }),
                 }).then(r => r.json()).then(d => {
                     if (d.ok) {
@@ -225,9 +253,23 @@
                         nTd.className = "col-name planned-name";
                         nTd.textContent = name;
                         row.appendChild(nTd);
-                        const rTd = document.createElement("td");
-                        rTd.colSpan = 9;
-                        row.appendChild(rTd);
+                        const tTd = document.createElement("td");
+                        tTd.className = "col-type planned-type" + (d.workout_type_zone ? " zone-" + d.workout_type_zone : "");
+                        tTd.textContent = d.workout_type_zone || "";
+                        row.appendChild(tTd);
+                        const sTd = document.createElement("td");
+                        sTd.className = "col-strides planned-strides";
+                        sTd.textContent = d.strides || "";
+                        row.appendChild(sTd);
+                        for (let i = 0; i < 4; i++) {
+                            row.appendChild(document.createElement("td"));
+                        }
+                        const iTd = document.createElement("td");
+                        iTd.className = "col-iscore planned-iscore";
+                        iTd.textContent = d.estimated_iscore ? d.estimated_iscore.toFixed(1) : "";
+                        row.appendChild(iTd);
+                        row.appendChild(document.createElement("td"));
+                        row.appendChild(document.createElement("td"));
                         row.classList.add("planned-row");
                         row.classList.remove("future-row");
                         refreshSevenDayMA(dateStr);
@@ -244,32 +286,28 @@
                 if (!row.classList.contains("future-row")) row.classList.add("future-row");
             }
 
-            [distInput, nameInput].forEach(input => {
+            const allInputs = [distInput, nameInput, typeSelect, stridesInput];
+            allInputs.forEach((input, idx) => {
                 input.addEventListener("keydown", (ev) => {
                     ev.stopPropagation();
                     if (ev.key === "Enter") savePlanned();
                     if (ev.key === "Escape") restoreBlanks();
-                    if (ev.key === "Tab" && input === distInput) {
+                    if (ev.key === "Tab" && idx < allInputs.length - 1) {
                         ev.preventDefault();
-                        nameInput.focus();
+                        allInputs[idx + 1].focus();
+                    } else if (ev.key === "Tab" && idx === allInputs.length - 1) {
+                        ev.preventDefault();
+                        savePlanned();
                     }
                 });
                 input.addEventListener("click", (ev) => ev.stopPropagation());
-            });
-
-            nameInput.addEventListener("blur", () => {
-                setTimeout(() => {
-                    if (!row.contains(document.activeElement) || !document.activeElement.classList.contains("planned-input")) {
-                        savePlanned();
-                    }
-                }, 100);
-            });
-            distInput.addEventListener("blur", () => {
-                setTimeout(() => {
-                    if (!row.contains(document.activeElement) || !document.activeElement.classList.contains("planned-input")) {
-                        savePlanned();
-                    }
-                }, 100);
+                input.addEventListener("blur", () => {
+                    setTimeout(() => {
+                        if (!row.contains(document.activeElement) || !document.activeElement.classList.contains("planned-input")) {
+                            savePlanned();
+                        }
+                    }, 100);
+                });
             });
         });
     });
@@ -990,8 +1028,6 @@
     function buildEditForm(meta) {
         const aid = meta.id;
         const ov = meta.overridden_fields || [];
-        const cats = ["", "easy", "long", "tempo", "interval", "race", "recovery", "other"];
-
         let shoeOptions = '<option value="">--</option>';
         if (window.SHOES) {
             for (const [shoeId, name] of Object.entries(window.SHOES)) {
@@ -1000,10 +1036,11 @@
             }
         }
 
-        let catOptions = "";
-        for (const cat of cats) {
-            const sel = meta.workout_category === cat ? " selected" : "";
-            catOptions += `<option value="${cat}"${sel}>${cat || "--"}</option>`;
+        const zones = ["", "E", "M", "T", "I", "R", "FR"];
+        let zoneOptions = "";
+        for (const z of zones) {
+            const sel = meta.workout_type_zone === z ? " selected" : "";
+            zoneOptions += `<option value="${z}"${sel}>${z || "--"}</option>`;
         }
 
         const durVal = formatDurationInput(meta.duration_s);
@@ -1023,10 +1060,10 @@
                 <input type="text" data-field="workout_name" value="${escapeHtml(meta.workout_name)}" placeholder="${escapeHtml(meta.workout_name)}">
                 ${resetBtn("workout_name")}
             </div>
-            <div class="edit-row" data-field-row="workout_category">
-                <label>Category</label>
-                <select data-field="workout_category">${catOptions}</select>
-                ${resetBtn("workout_category")}
+            <div class="edit-row" data-field-row="workout_type_zone">
+                <label>Type</label>
+                <select data-field="workout_type_zone">${zoneOptions}</select>
+                ${resetBtn("workout_type_zone")}
             </div>
             <div class="edit-row" data-field-row="distance_mi">
                 <label>Distance (mi)</label>
@@ -1655,7 +1692,7 @@
     function fieldToColClass(field) {
         const map = {
             distance_mi: "dist", duration_s: "dur", avg_pace_s_per_mi: "pace",
-            workout_name: "name", workout_category: "name",
+            workout_name: "name",
             notes: "notes", strides: "strides",
             workout_type_zone: "type", avg_hr: "hr", max_hr: "hr",
             avg_cadence: "cad",
@@ -1687,6 +1724,9 @@
             const m = Math.floor(s / 60);
             const sec = Math.round(s % 60);
             cell.textContent = `${m}:${sec < 10 ? "0" : ""}${sec}`;
+        } else if (field === "workout_type_zone") {
+            cell.textContent = value || "";
+            cell.className = "col-type" + (value ? ` zone-${value}` : "");
         } else if (field === "avg_hr" || field === "max_hr" || field === "avg_cadence") {
             cell.textContent = empty ? "" : Math.round(parseFloat(value));
         }
