@@ -12,7 +12,10 @@ def _load_orphaned_strava_sources(conn) -> list[dict]:
         """SELECT id, source_id, distance_mi, duration_s, workout_name, metadata_json,
                   avg_pace_s_per_mi, avg_hr, max_hr, avg_cadence, total_ascent_ft, calories
            FROM activity_sources
-           WHERE source = 'strava' AND activity_id IS NULL"""
+           WHERE source = 'strava' AND activity_id IS NULL
+             AND source_id NOT IN (
+                 SELECT source_identifier FROM suppressed_sources WHERE source = 'strava'
+             )"""
     ).fetchall()
 
     sources = []

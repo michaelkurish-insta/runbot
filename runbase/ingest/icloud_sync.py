@@ -158,12 +158,21 @@ def _scan_fit_files(icloud_path: str) -> list[Path]:
 
 
 def _is_already_processed(conn, file_path: str, file_hash: str) -> bool:
-    """Check if a file has already been processed (by path or hash)."""
+    """Check if a file has already been processed (by path or hash) or suppressed."""
     row = conn.execute(
         "SELECT id FROM processed_files WHERE file_path = ? OR file_hash = ?",
         (str(file_path), file_hash),
     ).fetchone()
-    return row is not None
+    if row is not None:
+        return True
+    # Also check suppressed sources (user-deleted activities)
+    suppressed = conn.execute(
+        """SELECT id FROM suppressed_sources
+           WHERE (source = 'healthfit' AND source_identifier = ?)
+              OR (source = 'healthfit_hash' AND source_identifier = ?)""",
+        (str(file_path), file_hash),
+    ).fetchone()
+    return suppressed is not None
 
 
 def _copy_to_raw_store(file_path: Path, raw_store_path: str) -> str:

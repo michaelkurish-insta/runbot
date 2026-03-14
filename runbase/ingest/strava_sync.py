@@ -174,7 +174,7 @@ def _build_activity_lookup(conn) -> dict:
 
 
 def _load_processed_strava_ids(conn) -> set:
-    """Load already-processed Strava IDs from processed_files table."""
+    """Load already-processed Strava IDs from processed_files + suppressed_sources."""
     rows = conn.execute(
         "SELECT file_path FROM processed_files WHERE source = 'strava'"
     ).fetchall()
@@ -184,6 +184,12 @@ def _load_processed_strava_ids(conn) -> set:
         path = r[0]
         if path.startswith("strava:"):
             ids.add(path[7:])
+    # Also skip suppressed (user-deleted) Strava IDs
+    suppressed = conn.execute(
+        "SELECT source_identifier FROM suppressed_sources WHERE source = 'strava'"
+    ).fetchall()
+    for r in suppressed:
+        ids.add(r[0])
     return ids
 
 

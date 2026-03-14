@@ -207,15 +207,86 @@ def create_app(config=None):
         # to avoid double-counting the same time period.
         has_manual_laps = set()
         has_fit = set()
+        has_manual_splits = set()
         for aid, intervals in by_act.items():
             for iv in intervals:
-                if iv["source"] != "pace_segment":
+                if iv["source"] == "manual_split":
+                    has_manual_splits.add(aid)
+                elif iv["source"] != "pace_segment":
                     has_manual_laps.add(aid)
                 if iv["source"] is None:
                     has_fit.add(aid)
 
+        # Pre-fetch activity distance/duration for manual_split remainder calculation
+        act_info = {}
+        if has_manual_splits:
+            ms_ph = ",".join("?" * len(has_manual_splits))
+            ms_ids = list(has_manual_splits)
+            for ar in conn.execute(
+                f"""SELECT id, COALESCE(adjusted_distance_mi, distance_mi, 0) as dist,
+                           duration_s, date
+                    FROM activities WHERE id IN ({ms_ph})""",
+                ms_ids,
+            ).fetchall():
+                act_info[ar["id"]] = dict(ar)
+
         result = {}
         for aid, intervals in by_act.items():
+            # Manual splits override all other interval sources for I-score
+            if aid in has_manual_splits:
+                splits = [iv for iv in intervals if iv["source"] == "manual_split"]
+                # Also collect strides from other intervals
+                other = [iv for iv in intervals if iv["source"] != "manual_split"
+                         and iv["source"] != "pace_segment"]
+                if aid in has_fit:
+                    other = [iv for iv in other if iv["source"] != "strava_lap"]
+
+                score = 0.0
+                split_dist = 0.0
+                split_dur = 0.0
+
+                # Score each split
+                for iv in splits:
+                    dur_min = (iv["duration_s"] or 0) / 60.0
+                    dist = iv.get("canonical_distance_mi") or 0
+                    split_dist += dist
+                    split_dur += iv["duration_s"] or 0
+                    if dur_min <= 0:
+                        continue
+                    zone = iv["pace_zone"] or "E"
+                    if zone == "walk":
+                        zone = "E"
+                    score += INTENSITY_PTS_PER_MIN.get(zone, 0.2) * dur_min
+
+                # Strides from other intervals
+                for iv in other:
+                    if iv["is_stride"]:
+                        score += STRIDE_PTS
+                    elif iv["is_hill_sprint"]:
+                        score += HILL_PTS
+
+                # Compute remainder (warmup/cooldown not covered by splits)
+                info = act_info.get(aid)
+                if info:
+                    remainder_dist = (info["dist"] or 0) - split_dist
+                    remainder_dur = (info["duration_s"] or 0) - split_dur
+                    if remainder_dist > 0 and remainder_dur > 0:
+                        remainder_pace = remainder_dur / remainder_dist
+                        # Classify remainder pace
+                        act_date = info["date"]
+                        vdot = get_current_vdot(conn, act_date)
+                        if vdot:
+                            bounds = vdot_to_boundaries(vdot)
+                            r_zone = classify_pace(remainder_pace, bounds)
+                        else:
+                            r_zone = "E"
+                        if r_zone == "walk":
+                            r_zone = "E"
+                        score += INTENSITY_PTS_PER_MIN.get(r_zone, 0.2) * (remainder_dur / 60.0)
+
+                result[aid] = round(score, 1) if score > 0 else None
+                continue
+
             # Skip pace_segments when manual laps exist (avoid double-counting)
             if aid in has_manual_laps:
                 visible = [iv for iv in intervals if iv["source"] != "pace_segment"]
@@ -1178,6 +1249,90 @@ def create_app(config=None):
             "overridden_fields": overridden,
         })
 
+    @app.route("/api/activity/<int:activity_id>/splits", methods=["POST"])
+    def api_create_split(activity_id):
+        from runbase.analysis.vdot import classify_pace, vdot_to_boundaries, get_current_vdot
+
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        distance_mi = data.get("distance_mi")
+        duration_s = data.get("duration_s")
+        pace_zone = data.get("pace_zone")
+
+        if not distance_mi or not duration_s:
+            return jsonify({"error": "distance_mi and duration_s required"}), 400
+
+        try:
+            distance_mi = float(distance_mi)
+            duration_s = float(duration_s)
+        except (ValueError, TypeError):
+            return jsonify({"error": "invalid distance or duration"}), 400
+
+        if distance_mi <= 0 or duration_s <= 0:
+            return jsonify({"error": "distance and duration must be positive"}), 400
+
+        avg_pace = duration_s / distance_mi
+
+        conn = get_db()
+
+        # Auto-classify zone if not provided
+        if not pace_zone:
+            row = conn.execute(
+                "SELECT date FROM activities WHERE id = ?", (activity_id,)
+            ).fetchone()
+            if row:
+                vdot = get_current_vdot(conn, row["date"])
+                if vdot:
+                    bounds = vdot_to_boundaries(vdot)
+                    pace_zone = classify_pace(avg_pace, bounds)
+                    if pace_zone == "walk":
+                        pace_zone = "E"
+
+        # Find next rep_number for this activity's manual_split intervals
+        max_rep = conn.execute(
+            "SELECT MAX(rep_number) as mr FROM intervals "
+            "WHERE activity_id = ? AND source = 'manual_split'",
+            (activity_id,),
+        ).fetchone()["mr"]
+        rep_number = (max_rep or 0) + 1
+
+        cursor = conn.execute(
+            """INSERT INTO intervals
+               (activity_id, rep_number, canonical_distance_mi, duration_s,
+                avg_pace_s_per_mi, avg_pace_display, pace_zone, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'manual_split')""",
+            (activity_id, rep_number, distance_mi, duration_s,
+             avg_pace, _format_pace(avg_pace), pace_zone),
+        )
+        interval_id = cursor.lastrowid
+        conn.commit()
+
+        # Fetch and format the new interval
+        row = conn.execute(
+            "SELECT * FROM intervals WHERE id = ?", (interval_id,)
+        ).fetchone()
+        conn.close()
+
+        return jsonify({"ok": True, "interval": _format_interval(row)})
+
+    @app.route("/api/activity/<int:activity_id>/splits/<int:interval_id>", methods=["DELETE"])
+    def api_delete_split(activity_id, interval_id):
+        conn = get_db()
+        row = conn.execute(
+            "SELECT id FROM intervals WHERE id = ? AND activity_id = ? AND source = 'manual_split'",
+            (interval_id, activity_id),
+        ).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({"error": "manual_split interval not found"}), 404
+
+        conn.execute("DELETE FROM intervals WHERE id = ?", (interval_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True})
+
     @app.route("/api/activity/<int:activity_id>/override", methods=["POST"])
     def api_override(activity_id):
         data = request.get_json()
@@ -1528,10 +1683,54 @@ def create_app(config=None):
         if not row:
             conn.close()
             return jsonify({"error": "not found"}), 404
+
+        # Collect source identifiers before deleting, then suppress them
+        strava_sources = conn.execute(
+            "SELECT source_id FROM activity_sources WHERE activity_id = ? AND source = 'strava' AND source_id IS NOT NULL",
+            (activity_id,),
+        ).fetchall()
+        fit_sources = conn.execute(
+            "SELECT raw_file_path FROM activity_sources WHERE activity_id = ? AND source = 'healthfit' AND raw_file_path IS NOT NULL",
+            (activity_id,),
+        ).fetchall()
+        pf_rows = conn.execute(
+            "SELECT file_hash FROM processed_files WHERE activity_id = ? AND file_hash IS NOT NULL",
+            (activity_id,),
+        ).fetchall()
+
+        for r in strava_sources:
+            conn.execute(
+                "INSERT OR IGNORE INTO suppressed_sources (source, source_identifier, reason) VALUES ('strava', ?, 'user_delete')",
+                (r["source_id"],),
+            )
+        for r in fit_sources:
+            conn.execute(
+                "INSERT OR IGNORE INTO suppressed_sources (source, source_identifier, reason) VALUES ('healthfit', ?, 'user_delete')",
+                (r["raw_file_path"],),
+            )
+        for r in pf_rows:
+            conn.execute(
+                "INSERT OR IGNORE INTO suppressed_sources (source, source_identifier, reason) VALUES ('healthfit_hash', ?, 'user_delete')",
+                (r["file_hash"],),
+            )
+
+        # Clean up matching orphaned Strava sources
+        for r in strava_sources:
+            conn.execute(
+                "DELETE FROM activity_sources WHERE source = 'strava' AND source_id = ? AND activity_id IS NULL",
+                (r["source_id"],),
+            )
+
+        # Cascade delete — clear all FK references before deleting the activity
         conn.execute("DELETE FROM streams WHERE activity_id = ?", (activity_id,))
         conn.execute("DELETE FROM intervals WHERE activity_id = ?", (activity_id,))
         conn.execute("DELETE FROM activity_sources WHERE activity_id = ?", (activity_id,))
         conn.execute("DELETE FROM activity_overrides WHERE activity_id = ?", (activity_id,))
+        conn.execute("DELETE FROM conflicts WHERE activity_id = ?", (activity_id,))
+        conn.execute("DELETE FROM runalyze_metrics WHERE activity_id = ?", (activity_id,))
+        conn.execute("DELETE FROM vdot_history WHERE activity_id = ?", (activity_id,))
+        conn.execute("DELETE FROM detected_tracks WHERE detected_by_activity_id = ?", (activity_id,))
+        conn.execute("UPDATE processed_files SET activity_id = NULL WHERE activity_id = ?", (activity_id,))
         conn.execute("DELETE FROM activities WHERE id = ?", (activity_id,))
         conn.commit()
         conn.close()

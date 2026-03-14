@@ -198,6 +198,16 @@ CREATE TABLE IF NOT EXISTS planned_activities (
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
+-- Suppressed sources (blocklist for deleted activities)
+CREATE TABLE IF NOT EXISTS suppressed_sources (
+    id                INTEGER PRIMARY KEY,
+    source            TEXT NOT NULL,
+    source_identifier TEXT NOT NULL,
+    reason            TEXT,
+    suppressed_at     TEXT DEFAULT (datetime('now')),
+    UNIQUE(source, source_identifier)
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(date);
 CREATE INDEX IF NOT EXISTS idx_activity_sources_activity ON activity_sources(activity_id);
@@ -299,6 +309,14 @@ def _migrate_schema(conn):
             distance_mi     REAL,
             workout_name    TEXT,
             created_at      TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS suppressed_sources (
+            id                INTEGER PRIMARY KEY,
+            source            TEXT NOT NULL,
+            source_identifier TEXT NOT NULL,
+            reason            TEXT,
+            suppressed_at     TEXT DEFAULT (datetime('now')),
+            UNIQUE(source, source_identifier)
         );
     """)
 

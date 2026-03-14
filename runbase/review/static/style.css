@@ -221,6 +221,9 @@ header {
 }
 
 .grid thead th {
+    position: sticky;
+    top: 30px;
+    z-index: 19;
     background: #fafafa;
     color: #888;
     font-weight: 600;
@@ -829,6 +832,21 @@ header {
     cursor: pointer;
 }
 .btn-delete-activity:hover { background: #c05050; color: #fff; }
+
+/* ── Manual Splits ──────────────────────────────────────────── */
+.splits-section { margin: 6px 0; padding: 6px 0; border-top: 1px solid #eee; }
+.splits-list { margin: 4px 0; }
+.split-row { display: flex; gap: 8px; align-items: center; font-size: 12px; padding: 2px 0; }
+.split-row .split-delete { cursor: pointer; color: #c00; font-size: 14px; background: none; border: none; padding: 0 2px; }
+.split-row .split-delete:hover { color: #900; }
+.splits-add-row { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+.splits-add-row input, .splits-add-row select { font-size: 12px; padding: 2px 4px; border: 1px solid #ccc; border-radius: 3px; }
+.splits-add-row input:focus, .splits-add-row select:focus { border-color: #4a7ab5; outline: none; }
+.splits-add-row .btn-add-split { padding: 2px 8px; font-size: 11px; font-weight: 600; background: #4a7ab5; color: #fff; border: none; border-radius: 3px; cursor: pointer; }
+.splits-add-row .btn-add-split:hover { background: #3a6a9a; }
+.btn-add-splits { background: none; border: none; color: #555; cursor: pointer; font-size: 12px; padding: 0; }
+.btn-add-splits:hover { color: #007bff; }
+.split-zone { font-weight: 600; min-width: 20px; }
 
 /* ── Stats Panel (bottom) ────────────────────────────────────── */
 .stats-panel {

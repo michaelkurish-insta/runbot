@@ -502,6 +502,13 @@
             // title → charts → intervals → edit form, then next activity
             let html = "";
 
+            // Collect manual_split intervals per activity for the edit form
+            const manualSplitsMap = {};
+            for (const r of results) {
+                const allIvs = (r.intervals || []).concat(r.laps || []);
+                manualSplitsMap[r.aid] = allIvs.filter(iv => iv.source === "manual_split");
+            }
+
             for (let i = 0; i < results.length; i++) {
                 const r = results[i];
                 const meta = r.meta;
@@ -552,9 +559,23 @@
             wireIntervalCheckboxes(modalIntervalsEl);
             wireIntervalEditing(modalIntervalsEl);
 
-            // Wire edit forms for dirty tracking
+            // Wire edit forms for dirty tracking + splits
             for (const r of results) {
                 wireEditForm(modalIntervalsEl, r.meta);
+
+                // If manual splits exist, auto-expand the splits section
+                const splits = manualSplitsMap[r.aid] || [];
+                if (splits.length > 0) {
+                    const placeholder = modalIntervalsEl.querySelector(`[data-splits-placeholder-aid="${r.aid}"]`);
+                    if (placeholder) {
+                        placeholder.style.display = "";
+                        placeholder.innerHTML = buildSplitsSection(r.aid, splits);
+                        wireSplitsSection(modalIntervalsEl, r.aid);
+                        // Hide the "Add Splits" button
+                        const btn = modalIntervalsEl.querySelector(`.btn-add-splits[data-aid="${r.aid}"]`);
+                        if (btn) btn.style.display = "none";
+                    }
+                }
             }
         });
 
@@ -676,6 +697,7 @@
 
             const setLabel = iv.set_number ? ` S${iv.set_number}` : "";
             const locLabel = iv.location_type ? ` [${iv.location_type}]` : "";
+            const manualLabel = iv.source === "manual_split" ? " (manual)" : "";
 
             const rawDist = iv.canonical_distance_mi || iv.gps_measured_distance_mi || iv.prescribed_distance_mi || 0;
 
@@ -692,7 +714,7 @@
                 <td class="iv-editable" data-field="duration_s" data-raw="${iv.duration_s || ""}">${iv.display_duration}</td>
                 <td>${iv.display_pace}</td>
                 <td class="iv-editable" data-field="avg_hr" data-raw="${iv.avg_hr || ""}">${iv.display_hr}</td>
-                <td class="iv-editable ${zoneClass}" data-field="pace_zone" data-raw="${zone}">${zone}${setLabel}</td>`;
+                <td class="iv-editable ${zoneClass}" data-field="pace_zone" data-raw="${zone}">${zone}${setLabel}${manualLabel}</td>`;
             const strideChecked = iv.is_stride ? "checked" : "";
             const recoveryChecked = iv.is_recovery ? "checked" : "";
             html += `<td class="iv-checkbox-cell"><input type="checkbox" class="iv-stride-cb" data-interval-id="${iv.id}" ${strideChecked}></td>`;
@@ -1025,6 +1047,201 @@
         return null;
     }
 
+    function formatSplitDistance(dist) {
+        if (!dist) return "";
+        if (dist < 1.0) return `${Math.round(dist * 1609.344)}m`;
+        return `${dist.toFixed(2)}mi`;
+    }
+
+    function formatSplitDuration(s) {
+        if (!s) return "";
+        const total = Math.round(s);
+        const m = Math.floor(total / 60);
+        const sec = total % 60;
+        return `${m}:${sec < 10 ? "0" : ""}${sec}`;
+    }
+
+    function buildSplitsSection(aid, splits) {
+        let html = `<div class="splits-section" data-splits-aid="${aid}">`;
+        html += `<div class="splits-list">`;
+        if (splits && splits.length) {
+            for (const sp of splits) {
+                const zone = sp.pace_zone || "";
+                const zoneClass = zone ? `zone-${zone}` : "";
+                html += `<div class="split-row" data-split-id="${sp.id}">`;
+                html += `<span>${formatSplitDistance(sp.canonical_distance_mi || sp.gps_measured_distance_mi || sp.prescribed_distance_mi)}</span>`;
+                html += `<span>${formatSplitDuration(sp.duration_s)}</span>`;
+                html += `<span>${sp.display_pace || ""}</span>`;
+                html += `<span class="split-zone ${zoneClass}">${zone}</span>`;
+                html += `<button class="split-delete" data-split-id="${sp.id}" data-aid="${aid}">&times;</button>`;
+                html += `</div>`;
+            }
+        } else {
+            html += `<div style="font-size:11px;color:#999">No splits yet</div>`;
+        }
+        html += `</div>`;
+
+        // Add row
+        html += `<div class="splits-add-row">`;
+        html += `<input type="number" step="0.01" class="split-dist-input" placeholder="mi" style="width:60px">`;
+        html += `<input type="text" class="split-time-input" placeholder="m:ss" style="width:60px">`;
+        html += `<select class="split-zone-select" style="width:50px">`;
+        html += `<option value="">--</option>`;
+        for (const z of ["E", "M", "T", "I", "R", "FR"]) {
+            html += `<option value="${z}">${z}</option>`;
+        }
+        html += `</select>`;
+        html += `<button class="btn-add-split" data-aid="${aid}">+ Add</button>`;
+        html += `</div>`;
+        html += `</div>`;
+        return html;
+    }
+
+    function wireSplitsSection(container, aid) {
+        const section = container.querySelector(`[data-splits-aid="${aid}"]`);
+        if (!section) return;
+
+        // Wire delete buttons
+        section.querySelectorAll(".split-delete").forEach(btn => {
+            btn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const splitId = btn.dataset.splitId;
+                const splitAid = btn.dataset.aid;
+                fetch(`/api/activity/${splitAid}/splits/${splitId}`, { method: "DELETE" })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.ok) {
+                            refreshSplitsSection(container, parseInt(splitAid));
+                        }
+                    });
+            });
+        });
+
+        // Wire add button
+        const addBtn = section.querySelector(".btn-add-split");
+        if (addBtn) {
+            addBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const distInput = section.querySelector(".split-dist-input");
+                const timeInput = section.querySelector(".split-time-input");
+                const zoneSelect = section.querySelector(".split-zone-select");
+
+                const distMi = parseFloat(distInput.value);
+                const durS = parseDuration(timeInput.value.trim());
+                const zone = zoneSelect.value;
+
+                if (!distMi || distMi <= 0 || !durS || durS <= 0) return;
+
+                addBtn.disabled = true;
+                fetch(`/api/activity/${aid}/splits`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        distance_mi: distMi,
+                        duration_s: durS,
+                        pace_zone: zone || null,
+                    }),
+                }).then(r => r.json()).then(d => {
+                    addBtn.disabled = false;
+                    if (d.ok) {
+                        distInput.value = "";
+                        timeInput.value = "";
+                        zoneSelect.value = "";
+                        refreshSplitsSection(container, aid);
+                    }
+                }).catch(() => { addBtn.disabled = false; });
+            });
+
+            // Enter key to submit
+            const inputs = section.querySelectorAll(".split-dist-input, .split-time-input, .split-zone-select");
+            inputs.forEach(inp => {
+                inp.addEventListener("keydown", (ev) => {
+                    ev.stopPropagation();
+                    if (ev.key === "Enter") addBtn.click();
+                });
+                inp.addEventListener("click", (ev) => ev.stopPropagation());
+            });
+        }
+    }
+
+    function refreshSplitsSection(container, aid) {
+        // Re-fetch intervals and rebuild the splits section
+        fetch(`/api/activity/${aid}/intervals`).then(r => r.json()).then(data => {
+            const allIntervals = (data.intervals || []).concat(data.laps || []);
+            const splits = allIntervals.filter(iv => iv.source === "manual_split");
+
+            const section = container.querySelector(`[data-splits-aid="${aid}"]`);
+            if (!section) return;
+
+            // Rebuild inline
+            const newSection = document.createElement("div");
+            newSection.innerHTML = buildSplitsSection(aid, splits);
+            const newContent = newSection.firstElementChild;
+            section.replaceWith(newContent);
+
+            wireSplitsSection(container, aid);
+
+            // Also update the intervals table if visible
+            refreshIntervalsTable(container, aid, data);
+        });
+    }
+
+    function refreshIntervalsTable(container, aid, data) {
+        // Find and refresh the intervals table for this activity
+        const intervals = data.intervals || [];
+        const laps = data.laps || [];
+        const summary = data.summary || [];
+
+        // Find the activity section or the whole container
+        const section = container.querySelector(`[data-activity-id="${aid}"]`) || container;
+
+        // Replace intervals table(s) — find existing h3 "Intervals" and its table
+        const h3s = section.querySelectorAll("h3");
+        let intervalsH3 = null;
+        let lapsH3 = null;
+        for (const h3 of h3s) {
+            if (h3.textContent === "Intervals") intervalsH3 = h3;
+            if (h3.textContent === "Laps") lapsH3 = h3;
+        }
+
+        // Remove old intervals table
+        if (intervalsH3) {
+            const nextEl = intervalsH3.nextElementSibling;
+            if (nextEl && nextEl.classList.contains("intervals-table")) nextEl.remove();
+            intervalsH3.remove();
+        }
+
+        // Remove old laps table
+        if (lapsH3) {
+            const nextEl = lapsH3.nextElementSibling;
+            if (nextEl && nextEl.classList.contains("intervals-table")) nextEl.remove();
+            lapsH3.remove();
+        }
+
+        // Find the chart placeholder or first h3 to insert before
+        const chartPlaceholder = section.querySelector(`.modal-chart-placeholder[data-chart-aid="${aid}"]`);
+        const insertBefore = chartPlaceholder ? chartPlaceholder.nextElementSibling : section.querySelector("h3");
+
+        if (intervals.length) {
+            const h3 = document.createElement("h3");
+            h3.textContent = "Intervals";
+            const tableDiv = document.createElement("div");
+            tableDiv.innerHTML = buildTable(intervals);
+            if (insertBefore) {
+                section.insertBefore(h3, insertBefore);
+                section.insertBefore(tableDiv.firstElementChild, insertBefore);
+            } else {
+                section.appendChild(h3);
+                section.appendChild(tableDiv.firstElementChild);
+            }
+        }
+
+        // Re-wire interaction handlers for new table
+        wireWalkingButtons(section);
+        wireIntervalCheckboxes(section);
+        wireIntervalEditing(section);
+    }
+
     function buildEditForm(meta) {
         const aid = meta.id;
         const ov = meta.overridden_fields || [];
@@ -1133,6 +1350,11 @@
                 <textarea data-field="notes" rows="2" placeholder="${escapeHtml(meta.notes)}">${escapeHtml(meta.notes)}</textarea>
                 ${resetBtn("notes")}
             </div>
+            <div class="edit-row" data-field-row="splits">
+                <label>Splits</label>
+                <button class="btn-add-splits" data-aid="${aid}">+ Add Splits</button>
+            </div>
+            <div class="splits-placeholder" data-splits-placeholder-aid="${aid}" style="display:none"></div>
             <div class="edit-row edit-row-delete">
                 <button class="btn-delete-activity" data-aid="${aid}">Delete Activity</button>
             </div>
@@ -1302,6 +1524,22 @@
             vdotInput.addEventListener("change", vdotHandler);
         }
 
+        // "Add Splits" button — reveals the splits section
+        const splitsBtn = form.querySelector(".btn-add-splits");
+        if (splitsBtn) {
+            splitsBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const btnAid = parseInt(splitsBtn.dataset.aid);
+                const placeholder = container.querySelector(`[data-splits-placeholder-aid="${btnAid}"]`);
+                if (placeholder && placeholder.style.display === "none") {
+                    placeholder.style.display = "";
+                    placeholder.innerHTML = buildSplitsSection(btnAid, []);
+                    wireSplitsSection(container, btnAid);
+                    splitsBtn.style.display = "none";
+                }
+            });
+        }
+
         // Delete activity button
         const deleteBtn = form.querySelector(".btn-delete-activity");
         if (deleteBtn) {
@@ -1311,11 +1549,42 @@
                 fetch(`/api/activity/${aid}`, { method: "DELETE" })
                     .then(r => r.json())
                     .then(d => {
-                        if (d.ok) {
+                        if (!d.ok) return;
+                        // Remove from modalActivityIds
+                        modalActivityIds = modalActivityIds.filter(id => id !== aid);
+
+                        if (modalActivityIds.length === 0) {
+                            // Last activity deleted — close modal and reload
                             closeModal();
                             sessionStorage.setItem("runbase_scroll_to", modalDate);
                             location.reload();
+                            return;
                         }
+
+                        // Multi-activity: remove this activity's section from DOM
+                        const section = form.closest(".activity-section");
+                        if (section) {
+                            // Remove adjacent divider (before or after)
+                            const prev = section.previousElementSibling;
+                            const next = section.nextElementSibling;
+                            if (prev && prev.classList.contains("activity-divider")) {
+                                prev.remove();
+                            } else if (next && next.classList.contains("activity-divider")) {
+                                next.remove();
+                            }
+                            section.remove();
+                        }
+
+                        // Clean up dirty/vdot state for deleted activity
+                        delete modalDirtyState[aid];
+                        delete modalOriginalValues[aid];
+                        delete modalClearQueue[aid];
+                        delete modalVdotState[aid];
+                        updateModalButtons();
+                    })
+                    .catch(err => {
+                        console.error("Delete failed:", err);
+                        alert("Failed to delete activity. Check console for details.");
                     });
             });
         }
@@ -1443,11 +1712,8 @@
                     body: JSON.stringify({ activity_ids: modalActivityIds }),
                 }).then(r => r.json());
                 closeModal();
-                // Reload page if new activities were created (grid needs server re-render)
-                if (modalNewActivityIds.size > 0) {
-                    sessionStorage.setItem("runbase_scroll_to", modalDate);
-                    location.reload();
-                }
+                sessionStorage.setItem("runbase_scroll_to", modalDate);
+                location.reload();
             }
         } catch (err) {
             console.error("Save error:", err);
