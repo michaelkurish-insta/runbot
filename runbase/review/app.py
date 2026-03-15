@@ -2055,4 +2055,175 @@ def create_app(config=None):
         conn.close()
         return jsonify({"ok": True, "vdot": round(vdot, 2), "affected_count": affected_count})
 
+    # ── Shoes API ─────────────────────────────────────────────────
+
+    @app.route("/api/shoes")
+    def api_shoes_summary():
+        conn = get_db()
+        rows = conn.execute(
+            """SELECT s.id, s.name, s.brand, s.model, s.purchase_date, s.retired,
+                      COUNT(a.id) as activity_count,
+                      COALESCE(SUM(COALESCE(a.adjusted_distance_mi, a.distance_mi, 0)), 0) as total_miles,
+                      MIN(a.date) as first_use,
+                      MAX(a.date) as last_use,
+                      CASE WHEN SUM(COALESCE(a.adjusted_distance_mi, a.distance_mi, 0)) > 0
+                           AND SUM(COALESCE(a.duration_s, 0)) > 0
+                           THEN SUM(COALESCE(a.duration_s, 0)) / SUM(COALESCE(a.adjusted_distance_mi, a.distance_mi, 0))
+                           ELSE NULL END as avg_pace
+               FROM shoes s
+               LEFT JOIN activities a ON a.shoe_id = s.id
+               GROUP BY s.id
+               ORDER BY s.retired ASC, last_use DESC""",
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+
+    @app.route("/api/shoes/monthly")
+    def api_shoes_monthly():
+        conn = get_db()
+        rows = conn.execute(
+            """SELECT a.shoe_id,
+                      s.name as shoe_name,
+                      substr(a.date, 1, 7) as month,
+                      SUM(COALESCE(a.adjusted_distance_mi, a.distance_mi, 0)) as miles
+               FROM activities a
+               JOIN shoes s ON a.shoe_id = s.id
+               WHERE a.shoe_id IS NOT NULL
+               GROUP BY a.shoe_id, substr(a.date, 1, 7)
+               ORDER BY month, a.shoe_id""",
+        ).fetchall()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+
+    # ── Trends API ───────────────────────────────────────────────
+
+    @app.route("/api/trends")
+    def api_trends():
+        range_str = request.args.get("range", "1y")
+        today_d = date.today()
+
+        range_map = {"6m": 180, "1y": 365, "2y": 730}
+        if range_str == "all":
+            range_start = date(2000, 1, 1)
+        else:
+            days = range_map.get(range_str, 365)
+            range_start = today_d - timedelta(days=days)
+
+        conn = get_db()
+
+        # ── Weekly aggregates (Sun-Sat) ────────────
+        rows = conn.execute(
+            """SELECT date,
+                      COALESCE(adjusted_distance_mi, distance_mi, 0) as dist,
+                      COALESCE(duration_s, 0) as dur,
+                      avg_hr
+               FROM activities
+               WHERE date >= ?
+               ORDER BY date""",
+            (range_start.isoformat(),),
+        ).fetchall()
+
+        week_buckets = {}
+        for r in rows:
+            dt = datetime.strptime(r["date"], "%Y-%m-%d")
+            days_since_sunday = (dt.weekday() + 1) % 7
+            sunday = (dt - timedelta(days=days_since_sunday)).date()
+            key = sunday.isoformat()
+            if key not in week_buckets:
+                week_buckets[key] = {"distance": 0.0, "duration": 0.0, "hr_sum": 0.0, "hr_dist": 0.0}
+            dist = r["dist"]
+            dur = r["dur"]
+            week_buckets[key]["distance"] += dist
+            week_buckets[key]["duration"] += dur
+            if r["avg_hr"] and dist > 0:
+                week_buckets[key]["hr_sum"] += r["avg_hr"] * dist
+                week_buckets[key]["hr_dist"] += dist
+
+        weekly = []
+        for week_key in sorted(week_buckets.keys()):
+            b = week_buckets[week_key]
+            avg_pace = (b["duration"] / b["distance"]) if b["distance"] > 0 else None
+            avg_hr = (b["hr_sum"] / b["hr_dist"]) if b["hr_dist"] > 0 else None
+            weekly.append({
+                "week": week_key,
+                "distance": round(b["distance"], 1),
+                "avg_pace": round(avg_pace, 1) if avg_pace else None,
+                "avg_hr": round(avg_hr, 1) if avg_hr else None,
+            })
+
+        # ── ATL / CTL / TSB ────────────
+        # Seed 90 days before range start
+        seed_start = (range_start - timedelta(days=90)).isoformat()
+        iscore_rows = conn.execute(
+            """SELECT id, date FROM activities WHERE date >= ? ORDER BY date""",
+            (seed_start,),
+        ).fetchall()
+        iscore_ids = [r["id"] for r in iscore_rows]
+        iscores = _compute_intensity_scores(conn, iscore_ids) if iscore_ids else {}
+
+        daily_iscore = {}
+        for r in iscore_rows:
+            daily_iscore[r["date"]] = daily_iscore.get(r["date"], 0) + (iscores.get(r["id"], 0) or 0)
+
+        lambda_a = 2.0 / (7 + 1)
+        lambda_f = 2.0 / (42 + 1)
+        atl = 0.0
+        ctl = 0.0
+        atl_ctl = []
+        d_cursor = date.fromisoformat(seed_start)
+        while d_cursor <= today_d:
+            trimp = daily_iscore.get(d_cursor.isoformat(), 0)
+            atl = trimp * lambda_a + (1 - lambda_a) * atl
+            ctl = trimp * lambda_f + (1 - lambda_f) * ctl
+            if d_cursor >= range_start:
+                atl_ctl.append({
+                    "date": d_cursor.isoformat(),
+                    "atl": round(atl, 1),
+                    "ctl": round(ctl, 1),
+                    "tsb": round(ctl - atl, 1),
+                })
+            d_cursor += timedelta(days=1)
+
+        # Downsample ATL/CTL to ~200 points for performance
+        if len(atl_ctl) > 200:
+            step = len(atl_ctl) / 200
+            downsampled = []
+            i = 0.0
+            while int(i) < len(atl_ctl):
+                downsampled.append(atl_ctl[int(i)])
+                i += step
+            atl_ctl = downsampled
+
+        # ── Races ────────────
+        race_rows = conn.execute(
+            """SELECT id, date, workout_name,
+                      COALESCE(adjusted_distance_mi, distance_mi, 0) as distance_mi,
+                      duration_s, avg_pace_s_per_mi, vdot
+               FROM activities
+               WHERE date >= ?
+                 AND (workout_category = 'race' OR workout_type = 'race')
+               ORDER BY date""",
+            (range_start.isoformat(),),
+        ).fetchall()
+        races = [dict(r) for r in race_rows]
+
+        # ── VDOT timeline ────────────
+        vdot_rows = conn.execute(
+            """SELECT effective_date, vdot, source, notes
+               FROM vdot_history
+               WHERE effective_date >= ?
+               ORDER BY effective_date""",
+            (range_start.isoformat(),),
+        ).fetchall()
+        vdot_timeline = [dict(r) for r in vdot_rows]
+
+        conn.close()
+
+        return jsonify({
+            "weekly": weekly,
+            "atl_ctl": atl_ctl,
+            "races": races,
+            "vdot_timeline": vdot_timeline,
+        })
+
     return app

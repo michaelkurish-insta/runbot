@@ -10,10 +10,16 @@
 <body>
     <header>
         <h1 class="header-title">RunBase</h1>
+        <nav class="tab-nav">
+            <button class="tab-btn active" data-tab="calendar">Calendar</button>
+            <button class="tab-btn" data-tab="shoes">Shoes</button>
+            <button class="tab-btn" data-tab="trends">Trends</button>
+        </nav>
         <button id="btn-import" class="btn-import" title="Run import pipeline">Import</button>
         <span id="import-status" class="import-status"></span>
     </header>
 
+    <div class="tab-content active" id="tab-calendar">
     <div class="layout">
         <!-- ── Sidebar ──────────────────────────────────────── -->
         <aside class="sidebar">
@@ -197,6 +203,15 @@
             </div>
         </div>
     </footer>
+    </div><!-- /tab-calendar -->
+
+    <div class="tab-content" id="tab-shoes">
+        <div class="tab-page shoes-page"></div>
+    </div>
+
+    <div class="tab-content" id="tab-trends">
+        <div class="tab-page trends-page"></div>
+    </div>
 
     <!-- ── Activity Detail Modal ─────────────────────────────── -->
     <div class="modal-overlay" id="activity-modal" style="display:none">

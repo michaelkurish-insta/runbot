@@ -2277,4 +2277,670 @@
         scrollToDate(weekAgo.toISOString().slice(0, 10));
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // ── Tab Navigation ─────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+
+    const tabButtons = document.querySelectorAll(".tab-btn");
+    const tabContents = document.querySelectorAll(".tab-content");
+    const tabLoaded = { calendar: true, shoes: false, trends: false };
+
+    function switchTab(tabName) {
+        tabButtons.forEach(btn => btn.classList.toggle("active", btn.dataset.tab === tabName));
+        tabContents.forEach(div => div.classList.toggle("active", div.id === `tab-${tabName}`));
+        sessionStorage.setItem("runbase_active_tab", tabName);
+
+        if (tabName === "shoes" && !tabLoaded.shoes) {
+            tabLoaded.shoes = true;
+            loadShoesTab();
+        }
+        if (tabName === "trends" && !tabLoaded.trends) {
+            tabLoaded.trends = true;
+            loadTrendsTab("1y");
+        }
+    }
+
+    tabButtons.forEach(btn => {
+        btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+    });
+
+    // Restore tab state
+    const savedTab = sessionStorage.getItem("runbase_active_tab");
+    if (savedTab && savedTab !== "calendar") {
+        switchTab(savedTab);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ── Shared Chart Helpers ───────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+
+    const SHOE_COLORS = [
+        "#4a7ab5", "#c05050", "#50a050", "#d9a030", "#9060b0",
+        "#50b0b0", "#d06080", "#808040", "#b07040", "#6080c0",
+        "#40b070", "#c07090",
+    ];
+
+    function formatPaceLabel(v) {
+        const m = Math.floor(v / 60);
+        const s = Math.round(v % 60);
+        return `${m}:${s < 10 ? "0" : ""}${s}`;
+    }
+
+    function initCanvas(canvas) {
+        const ctx = canvas.getContext("2d");
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
+        return { ctx, w: rect.width, h: rect.height, dpr };
+    }
+
+    function dateXPositioner(dates, pad, cw) {
+        const first = dates[0], last = dates[dates.length - 1];
+        const range = last - first || 1;
+        return d => pad.left + ((d - first) / range) * cw;
+    }
+
+    function drawDateXLabels(ctx, dates, xPos, h, pad) {
+        ctx.fillStyle = "#aaa";
+        ctx.font = "9px -apple-system, sans-serif";
+        ctx.textAlign = "center";
+        // Show ~6 labels evenly spaced
+        const count = Math.min(dates.length, 6);
+        const step = Math.max(1, Math.floor(dates.length / count));
+        const shown = new Set();
+        for (let i = 0; i < dates.length; i += step) {
+            const d = new Date(dates[i]);
+            const label = `${d.getMonth() + 1}/${d.getDate()}`;
+            if (!shown.has(label)) {
+                ctx.fillText(label, xPos(dates[i]), h - 4);
+                shown.add(label);
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ── Shoes Tab ──────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+
+    function loadShoesTab() {
+        const page = document.querySelector(".shoes-page");
+        page.innerHTML = '<p class="loading">Loading shoe data...</p>';
+
+        Promise.all([
+            fetch("/api/shoes").then(r => r.json()),
+            fetch("/api/shoes/monthly").then(r => r.json()),
+        ]).then(([shoes, monthly]) => {
+            let html = "";
+
+            // ── Shoe Summary Table ──
+            html += '<h3 style="margin-bottom:8px">Shoe Summary</h3>';
+            html += `<table class="shoes-table"><thead><tr>
+                <th></th><th>Shoe</th><th>Miles</th><th>Runs</th>
+                <th>Avg Pace</th><th>First Use</th><th>Last Use</th>
+            </tr></thead><tbody>`;
+
+            // Sort: active first by last_use desc, then retired
+            shoes.sort((a, b) => {
+                if (a.retired !== b.retired) return a.retired ? 1 : -1;
+                return (b.last_use || "").localeCompare(a.last_use || "");
+            });
+
+            for (const s of shoes) {
+                if (!s.activity_count) continue;
+                const statusClass = s.retired ? "retired" : "active";
+                const pace = s.avg_pace ? formatPaceLabel(s.avg_pace) : "";
+                html += `<tr>
+                    <td><span class="shoe-status ${statusClass}"></span></td>
+                    <td>${escapeHtml(s.name || "Unknown")}</td>
+                    <td>${s.total_miles.toFixed(1)}</td>
+                    <td>${s.activity_count}</td>
+                    <td>${pace}</td>
+                    <td>${s.first_use || ""}</td>
+                    <td>${s.last_use || ""}</td>
+                </tr>`;
+            }
+            html += "</tbody></table>";
+
+            // ── Charts ──
+            html += '<div class="shoes-charts">';
+            html += '<div class="shoes-chart-wrap"><h3>Cumulative Mileage</h3><canvas id="shoes-cumulative-chart" height="250"></canvas><div id="shoes-cumulative-legend" class="chart-legend"></div></div>';
+            html += '<div class="shoes-chart-wrap"><h3>Monthly Shoe Mileage</h3><canvas id="shoes-monthly-chart" height="250"></canvas><div id="shoes-monthly-legend" class="chart-legend"></div></div>';
+            html += '</div>';
+
+            page.innerHTML = html;
+
+            // Assign colors to shoes
+            const activeShoes = shoes.filter(s => s.activity_count > 0);
+            const shoeColorMap = {};
+            activeShoes.forEach((s, i) => { shoeColorMap[s.id] = SHOE_COLORS[i % SHOE_COLORS.length]; });
+
+            drawCumulativeMileageChart(shoes, shoeColorMap);
+            drawMonthlyShoeChart(monthly, shoeColorMap, shoes);
+        });
+    }
+
+    function drawCumulativeMileageChart(shoes, colorMap) {
+        const canvas = document.getElementById("shoes-cumulative-chart");
+        if (!canvas) return;
+        const { ctx, w, h } = initCanvas(canvas);
+        const pad = { top: 10, right: 10, bottom: 22, left: 40 };
+        const cw = w - pad.left - pad.right;
+        const ch = h - pad.top - pad.bottom;
+
+        // Build cumulative data per shoe from /api/shoes/monthly
+        // We need per-shoe monthly data — reuse the shoes summary for cumulative
+        // Actually, fetch cumulative from monthly endpoint data already loaded
+        // For cumulative, we need activity-level data. Use monthly as proxy.
+        // Better: build from shoes summary — we have total_miles and first/last use
+        // Simplest: just fetch monthly and accumulate
+
+        fetch("/api/shoes/monthly").then(r => r.json()).then(monthly => {
+            // Group by shoe
+            const byShoe = {};
+            for (const row of monthly) {
+                if (!byShoe[row.shoe_id]) byShoe[row.shoe_id] = { name: row.shoe_name, data: [] };
+                byShoe[row.shoe_id].data.push(row);
+            }
+
+            // Get all months sorted
+            const allMonths = [...new Set(monthly.map(r => r.month))].sort();
+            if (!allMonths.length) return;
+
+            const allDates = allMonths.map(m => new Date(m + "-15").getTime());
+            const xPos = dateXPositioner(allDates, pad, cw);
+
+            // Build cumulative series
+            let maxCum = 0;
+            const series = [];
+            for (const [shoeId, info] of Object.entries(byShoe)) {
+                const monthMap = {};
+                for (const d of info.data) monthMap[d.month] = d.miles;
+                let cum = 0;
+                const pts = [];
+                for (const m of allMonths) {
+                    cum += monthMap[m] || 0;
+                    pts.push({ date: new Date(m + "-15").getTime(), value: cum });
+                }
+                if (cum > 0) {
+                    series.push({ id: parseInt(shoeId), name: info.name, pts, total: cum });
+                    if (cum > maxCum) maxCum = cum;
+                }
+            }
+
+            if (!maxCum) return;
+            const yPos = v => pad.top + (1 - v / (maxCum * 1.1)) * ch;
+
+            // Y grid
+            ctx.fillStyle = "#aaa";
+            ctx.font = "9px -apple-system, sans-serif";
+            ctx.textAlign = "right";
+            for (let i = 0; i <= 4; i++) {
+                const v = (maxCum * 1.1 * i) / 4;
+                const y = yPos(v);
+                ctx.beginPath();
+                ctx.moveTo(pad.left, y);
+                ctx.lineTo(w - pad.right, y);
+                ctx.strokeStyle = "#eee";
+                ctx.lineWidth = 0.5;
+                ctx.stroke();
+                ctx.fillText(Math.round(v).toString(), pad.left - 4, y + 3);
+            }
+
+            // Draw lines
+            series.sort((a, b) => b.total - a.total);
+            for (const s of series) {
+                const color = colorMap[s.id] || "#999";
+                ctx.beginPath();
+                for (let i = 0; i < s.pts.length; i++) {
+                    const x = xPos(s.pts[i].date);
+                    const y = yPos(s.pts[i].value);
+                    if (i === 0) ctx.moveTo(x, y);
+                    else ctx.lineTo(x, y);
+                }
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            }
+
+            // X labels
+            drawDateXLabels(ctx, allDates, xPos, h, pad);
+
+            // Legend
+            const legend = document.getElementById("shoes-cumulative-legend");
+            if (legend) {
+                legend.innerHTML = series.map(s =>
+                    `<span class="chart-legend-item"><span class="chart-legend-swatch" style="background:${colorMap[s.id] || '#999'}"></span>${escapeHtml(s.name)}</span>`
+                ).join("");
+            }
+        });
+    }
+
+    function drawMonthlyShoeChart(monthly, colorMap, shoes) {
+        const canvas = document.getElementById("shoes-monthly-chart");
+        if (!canvas || !monthly.length) return;
+        const { ctx, w, h } = initCanvas(canvas);
+        const pad = { top: 10, right: 10, bottom: 22, left: 40 };
+        const cw = w - pad.left - pad.right;
+        const ch = h - pad.top - pad.bottom;
+
+        // Group by month
+        const allMonths = [...new Set(monthly.map(r => r.month))].sort();
+        const byMonth = {};
+        for (const m of allMonths) byMonth[m] = {};
+        for (const r of monthly) {
+            byMonth[r.month][r.shoe_id] = r.miles;
+        }
+
+        // Get shoe IDs that appear
+        const shoeIds = [...new Set(monthly.map(r => r.shoe_id))];
+
+        // Max stacked height
+        let maxStack = 0;
+        for (const m of allMonths) {
+            let sum = 0;
+            for (const sid of shoeIds) sum += byMonth[m][sid] || 0;
+            if (sum > maxStack) maxStack = sum;
+        }
+        if (!maxStack) return;
+
+        const barWidth = Math.max(4, Math.min(20, (cw / allMonths.length) * 0.7));
+        const gap = (cw - barWidth * allMonths.length) / (allMonths.length + 1);
+        const yPos = v => pad.top + (1 - v / (maxStack * 1.1)) * ch;
+
+        // Y grid
+        ctx.fillStyle = "#aaa";
+        ctx.font = "9px -apple-system, sans-serif";
+        ctx.textAlign = "right";
+        for (let i = 0; i <= 4; i++) {
+            const v = (maxStack * 1.1 * i) / 4;
+            const y = yPos(v);
+            ctx.beginPath();
+            ctx.moveTo(pad.left, y);
+            ctx.lineTo(w - pad.right, y);
+            ctx.strokeStyle = "#eee";
+            ctx.lineWidth = 0.5;
+            ctx.stroke();
+            ctx.fillText(Math.round(v).toString(), pad.left - 4, y + 3);
+        }
+
+        // Draw stacked bars
+        for (let mi = 0; mi < allMonths.length; mi++) {
+            const m = allMonths[mi];
+            const x = pad.left + gap + mi * (barWidth + gap);
+            let stackY = pad.top + ch; // bottom
+
+            for (const sid of shoeIds) {
+                const miles = byMonth[m][sid] || 0;
+                if (miles <= 0) continue;
+                const barH = (miles / (maxStack * 1.1)) * ch;
+                const color = colorMap[sid] || "#999";
+                ctx.fillStyle = color;
+                ctx.fillRect(x, stackY - barH, barWidth, barH);
+                stackY -= barH;
+            }
+        }
+
+        // X labels
+        ctx.fillStyle = "#aaa";
+        ctx.font = "8px -apple-system, sans-serif";
+        ctx.textAlign = "center";
+        const labelStep = Math.max(1, Math.floor(allMonths.length / 8));
+        for (let i = 0; i < allMonths.length; i += labelStep) {
+            const x = pad.left + gap + i * (barWidth + gap) + barWidth / 2;
+            const parts = allMonths[i].split("-");
+            ctx.fillText(`${parseInt(parts[1])}/${parts[0].slice(2)}`, x, h - 4);
+        }
+
+        // Legend
+        const legend = document.getElementById("shoes-monthly-legend");
+        if (legend) {
+            const shoeMap = {};
+            shoes.forEach(s => { shoeMap[s.id] = s.name; });
+            legend.innerHTML = shoeIds.map(sid =>
+                `<span class="chart-legend-item"><span class="chart-legend-swatch" style="background:${colorMap[sid] || '#999'}"></span>${escapeHtml(shoeMap[sid] || "?")}</span>`
+            ).join("");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ── Trends Tab ─────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+
+    let trendsCurrentRange = "1y";
+
+    function loadTrendsTab(range) {
+        trendsCurrentRange = range;
+        const page = document.querySelector(".trends-page");
+
+        // Build range selector if not present
+        if (!page.querySelector(".trends-range-selector")) {
+            let html = '<div class="trends-range-selector">';
+            for (const r of ["6m", "1y", "2y", "all"]) {
+                html += `<button class="trends-range-btn ${r === range ? "active" : ""}" data-range="${r}">${r.toUpperCase()}</button>`;
+            }
+            html += '</div>';
+            html += '<div id="trends-charts-container"><p class="loading">Loading trends...</p></div>';
+            page.innerHTML = html;
+
+            // Wire range buttons
+            page.querySelectorAll(".trends-range-btn").forEach(btn => {
+                btn.addEventListener("click", () => {
+                    page.querySelectorAll(".trends-range-btn").forEach(b => b.classList.remove("active"));
+                    btn.classList.add("active");
+                    loadTrendsData(btn.dataset.range);
+                });
+            });
+        }
+
+        loadTrendsData(range);
+    }
+
+    function loadTrendsData(range) {
+        trendsCurrentRange = range;
+        const container = document.getElementById("trends-charts-container");
+        if (!container) return;
+        container.innerHTML = '<p class="loading">Loading trends...</p>';
+
+        fetch(`/api/trends?range=${range}`).then(r => r.json()).then(data => {
+            let html = "";
+
+            // Row 1: Weekly Volume + Pace Trend
+            html += '<div class="trends-row">';
+            html += '<div class="trends-chart-wrap"><h3>Weekly Volume</h3><canvas id="trends-volume-chart" height="200"></canvas></div>';
+            html += '<div class="trends-chart-wrap"><h3>Pace Trend</h3><canvas id="trends-pace-chart" height="200"></canvas></div>';
+            html += '</div>';
+
+            // Row 2: HR Trend + ATL/CTL/TSB
+            html += '<div class="trends-row">';
+            html += '<div class="trends-chart-wrap"><h3>Heart Rate Trend</h3><canvas id="trends-hr-chart" height="200"></canvas></div>';
+            html += '<div class="trends-chart-wrap"><h3>ATL / CTL / TSB</h3><canvas id="trends-fitness-chart" height="200"></canvas></div>';
+            html += '</div>';
+
+            // Row 3: Race table + VDOT
+            html += '<div class="trends-row">';
+            html += '<div class="trends-chart-wrap">';
+            if (data.races && data.races.length) {
+                html += '<h3>Race Performances</h3>';
+                html += `<table class="trends-race-table"><thead><tr>
+                    <th>Date</th><th>Race</th><th>Distance</th><th>Time</th><th>Pace</th><th>VDOT</th>
+                </tr></thead><tbody>`;
+                for (const r of data.races) {
+                    const dist = r.distance_mi < 1 ? `${(r.distance_mi * 1609.344).toFixed(0)}m` : `${r.distance_mi.toFixed(2)}mi`;
+                    const dur = r.duration_s ? formatDurationInput(r.duration_s) : "";
+                    const pace = r.avg_pace_s_per_mi ? formatPaceLabel(r.avg_pace_s_per_mi) : "";
+                    html += `<tr><td>${r.date}</td><td>${escapeHtml(r.workout_name || "")}</td><td>${dist}</td><td>${dur}</td><td>${pace}</td><td>${r.vdot ? r.vdot.toFixed(1) : ""}</td></tr>`;
+                }
+                html += "</tbody></table>";
+            } else {
+                html += '<h3>Race Performances</h3><p style="color:#999;font-size:12px">No races found</p>';
+            }
+            html += '</div>';
+            html += '<div class="trends-chart-wrap"><h3>VDOT Progression</h3><canvas id="trends-vdot-chart" height="200"></canvas></div>';
+            html += '</div>';
+
+            container.innerHTML = html;
+
+            // Draw charts
+            drawTrendsBarChart("trends-volume-chart", data.weekly || [], { title: "Weekly Miles", barColor: "#4a7ab5", maWindow: 6 });
+            drawTrendsLineChart("trends-pace-chart", [{ label: "Pace", data: (data.weekly || []).filter(w => w.avg_pace).map(w => ({ date: w.week, value: w.avg_pace })), color: "#4a7ab5", fill: true }], { invertY: true, formatY: formatPaceLabel });
+            drawTrendsLineChart("trends-hr-chart", [{ label: "HR", data: (data.weekly || []).filter(w => w.avg_hr).map(w => ({ date: w.week, value: w.avg_hr })), color: "#c05050", fill: true }], { formatY: v => Math.round(v).toString() });
+
+            // ATL/CTL/TSB
+            const atlCtl = data.atl_ctl || [];
+            drawTrendsLineChart("trends-fitness-chart", [
+                { label: "CTL", data: atlCtl.map(d => ({ date: d.date, value: d.ctl })), color: "#4a7ab5" },
+                { label: "ATL", data: atlCtl.map(d => ({ date: d.date, value: d.atl })), color: "#d9a030" },
+                { label: "TSB", data: atlCtl.map(d => ({ date: d.date, value: d.tsb })), color: "#50a050" },
+            ], { formatY: v => v.toFixed(0), zeroLine: true, legend: true });
+
+            // VDOT scatter
+            const vdotPts = (data.vdot_timeline || []).map(v => ({ date: v.effective_date, value: v.vdot, label: v.notes || "" }));
+            drawScatterChart("trends-vdot-chart", vdotPts);
+        });
+    }
+
+    function drawTrendsBarChart(canvasId, data, opts) {
+        const canvas = document.getElementById(canvasId);
+        if (!canvas || !data.length) return;
+        const { ctx, w, h } = initCanvas(canvas);
+        const pad = { top: 10, right: 10, bottom: 22, left: 40 };
+        const cw = w - pad.left - pad.right;
+        const ch = h - pad.top - pad.bottom;
+
+        const values = data.map(d => d.distance);
+        const maxV = Math.max(...values) * 1.1 || 1;
+
+        const barWidth = Math.max(3, Math.min(16, (cw / data.length) * 0.75));
+        const gap = (cw - barWidth * data.length) / (data.length + 1);
+        const yPos = v => pad.top + (1 - v / maxV) * ch;
+
+        // Y grid
+        ctx.fillStyle = "#aaa";
+        ctx.font = "9px -apple-system, sans-serif";
+        ctx.textAlign = "right";
+        for (let i = 0; i <= 4; i++) {
+            const v = (maxV * i) / 4;
+            const y = yPos(v);
+            ctx.beginPath();
+            ctx.moveTo(pad.left, y);
+            ctx.lineTo(w - pad.right, y);
+            ctx.strokeStyle = "#eee";
+            ctx.lineWidth = 0.5;
+            ctx.stroke();
+            ctx.fillText(Math.round(v).toString(), pad.left - 4, y + 3);
+        }
+
+        // Bars
+        for (let i = 0; i < data.length; i++) {
+            const x = pad.left + gap + i * (barWidth + gap);
+            const barH = (data[i].distance / maxV) * ch;
+            ctx.fillStyle = opts.barColor || "#4a7ab5";
+            ctx.fillRect(x, pad.top + ch - barH, barWidth, barH);
+        }
+
+        // MA line
+        if (opts.maWindow && data.length >= opts.maWindow) {
+            ctx.beginPath();
+            let started = false;
+            for (let i = opts.maWindow - 1; i < data.length; i++) {
+                let sum = 0;
+                for (let j = i - opts.maWindow + 1; j <= i; j++) sum += data[j].distance;
+                const avg = sum / opts.maWindow;
+                const x = pad.left + gap + i * (barWidth + gap) + barWidth / 2;
+                if (!started) { ctx.moveTo(x, yPos(avg)); started = true; }
+                else ctx.lineTo(x, yPos(avg));
+            }
+            ctx.strokeStyle = "#c05050";
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([4, 3]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
+        // X labels
+        ctx.fillStyle = "#aaa";
+        ctx.font = "8px -apple-system, sans-serif";
+        ctx.textAlign = "center";
+        const labelStep = Math.max(1, Math.floor(data.length / 6));
+        for (let i = 0; i < data.length; i += labelStep) {
+            const x = pad.left + gap + i * (barWidth + gap) + barWidth / 2;
+            const d = new Date(data[i].week + "T00:00:00");
+            ctx.fillText(`${d.getMonth() + 1}/${d.getDate()}`, x, h - 4);
+        }
+    }
+
+    function drawTrendsLineChart(canvasId, series, opts) {
+        const canvas = document.getElementById(canvasId);
+        if (!canvas) return;
+
+        // Filter out empty series
+        const validSeries = series.filter(s => s.data && s.data.length > 0);
+        if (!validSeries.length) return;
+
+        const { ctx, w, h } = initCanvas(canvas);
+        const pad = { top: 10, right: 10, bottom: 22, left: 40 };
+        const cw = w - pad.left - pad.right;
+        const ch = h - pad.top - pad.bottom;
+
+        // Collect all dates and values
+        const allDates = [];
+        let vMin = Infinity, vMax = -Infinity;
+        for (const s of validSeries) {
+            for (const d of s.data) {
+                allDates.push(new Date(d.date + "T00:00:00").getTime());
+                if (d.value < vMin) vMin = d.value;
+                if (d.value > vMax) vMax = d.value;
+            }
+        }
+        if (vMin === Infinity) return;
+
+        const vPad = (vMax - vMin) * 0.1 || 1;
+        vMin -= vPad;
+        vMax += vPad;
+        if (opts.zeroLine && vMin > 0) vMin = -vPad;
+
+        const uniqueDates = [...new Set(allDates)].sort((a, b) => a - b);
+        const xPos = dateXPositioner(uniqueDates, pad, cw);
+        function yPos(v) {
+            const norm = (v - vMin) / (vMax - vMin || 1);
+            return opts.invertY ? pad.top + norm * ch : pad.top + (1 - norm) * ch;
+        }
+
+        // Y grid
+        ctx.fillStyle = "#aaa";
+        ctx.font = "9px -apple-system, sans-serif";
+        ctx.textAlign = "right";
+        const formatY = opts.formatY || (v => v.toFixed(0));
+        for (let i = 0; i <= 4; i++) {
+            const v = vMin + ((vMax - vMin) * i) / 4;
+            const y = yPos(v);
+            ctx.beginPath();
+            ctx.moveTo(pad.left, y);
+            ctx.lineTo(w - pad.right, y);
+            ctx.strokeStyle = "#eee";
+            ctx.lineWidth = 0.5;
+            ctx.stroke();
+            ctx.fillText(formatY(v), pad.left - 4, y + 3);
+        }
+
+        // Zero line
+        if (opts.zeroLine) {
+            ctx.beginPath();
+            ctx.moveTo(pad.left, yPos(0));
+            ctx.lineTo(w - pad.right, yPos(0));
+            ctx.strokeStyle = "rgba(0,0,0,0.15)";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        }
+
+        // Draw series
+        for (const s of validSeries) {
+            const pts = s.data.map(d => ({
+                x: xPos(new Date(d.date + "T00:00:00").getTime()),
+                y: yPos(d.value),
+            }));
+
+            if (s.fill) {
+                ctx.beginPath();
+                ctx.moveTo(pts[0].x, pts[0].y);
+                for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+                ctx.lineTo(pts[pts.length - 1].x, pad.top + ch);
+                ctx.lineTo(pts[0].x, pad.top + ch);
+                ctx.closePath();
+                ctx.fillStyle = s.color.replace(")", ",0.1)").replace("rgb", "rgba");
+                ctx.fill();
+            }
+
+            ctx.beginPath();
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+            ctx.strokeStyle = s.color;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
+
+        // X labels
+        drawDateXLabels(ctx, uniqueDates, xPos, h, pad);
+
+        // Legend
+        if (opts.legend && validSeries.length > 1) {
+            const parent = canvas.parentElement;
+            let legendDiv = parent.querySelector(".chart-legend");
+            if (!legendDiv) {
+                legendDiv = document.createElement("div");
+                legendDiv.className = "chart-legend";
+                parent.appendChild(legendDiv);
+            }
+            legendDiv.innerHTML = validSeries.map(s =>
+                `<span class="chart-legend-item"><span class="chart-legend-swatch" style="background:${s.color}"></span>${s.label}</span>`
+            ).join("");
+        }
+    }
+
+    function drawScatterChart(canvasId, points) {
+        const canvas = document.getElementById(canvasId);
+        if (!canvas || !points.length) return;
+        const { ctx, w, h } = initCanvas(canvas);
+        const pad = { top: 10, right: 10, bottom: 22, left: 40 };
+        const cw = w - pad.left - pad.right;
+        const ch = h - pad.top - pad.bottom;
+
+        const dates = points.map(p => new Date(p.date + "T00:00:00").getTime());
+        const values = points.map(p => p.value);
+        let vMin = Math.min(...values);
+        let vMax = Math.max(...values);
+        const vPad = (vMax - vMin) * 0.15 || 1;
+        vMin -= vPad;
+        vMax += vPad;
+
+        const xPos = dateXPositioner(dates, pad, cw);
+        const yPos = v => pad.top + (1 - (v - vMin) / (vMax - vMin || 1)) * ch;
+
+        // Y grid
+        ctx.fillStyle = "#aaa";
+        ctx.font = "9px -apple-system, sans-serif";
+        ctx.textAlign = "right";
+        for (let i = 0; i <= 4; i++) {
+            const v = vMin + ((vMax - vMin) * i) / 4;
+            const y = yPos(v);
+            ctx.beginPath();
+            ctx.moveTo(pad.left, y);
+            ctx.lineTo(w - pad.right, y);
+            ctx.strokeStyle = "#eee";
+            ctx.lineWidth = 0.5;
+            ctx.stroke();
+            ctx.fillText(v.toFixed(1), pad.left - 4, y + 3);
+        }
+
+        // Connecting line
+        ctx.beginPath();
+        for (let i = 0; i < points.length; i++) {
+            const x = xPos(dates[i]);
+            const y = yPos(values[i]);
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = "rgba(74,122,181,0.4)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Dots
+        for (let i = 0; i < points.length; i++) {
+            const x = xPos(dates[i]);
+            const y = yPos(values[i]);
+            ctx.beginPath();
+            ctx.arc(x, y, 4, 0, Math.PI * 2);
+            ctx.fillStyle = "#4a7ab5";
+            ctx.fill();
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
+
+        // X labels
+        drawDateXLabels(ctx, dates, xPos, h, pad);
+    }
+
 })();
