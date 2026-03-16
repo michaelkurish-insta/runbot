@@ -523,7 +523,8 @@
                     html += `<div class="activity-section-header">`;
                     html += `<span class="activity-title">${escapeHtml(meta.workout_name || "Activity #" + r.aid)}</span>`;
                     const hrPart = meta.display_hr ? ` &middot; ${meta.display_hr}bpm` : "";
-                    html += `<span class="activity-meta">${meta.display_distance}mi &middot; ${meta.display_pace}/mi &middot; ${meta.display_duration}${hrPart}</span>`;
+                    const gapPart = meta.display_gap ? ` &middot; GAP ${meta.display_gap}` : "";
+                    html += `<span class="activity-meta">${meta.display_distance}mi &middot; ${meta.display_pace}/mi${gapPart} &middot; ${meta.display_duration}${hrPart}</span>`;
                     html += `</div>`;
                 }
 
@@ -1297,9 +1298,17 @@
                 <input type="text" data-field="avg_pace_s_per_mi" data-type="pace" value="${paceVal}" placeholder="${paceVal || "m:ss"}">
                 ${resetBtn("avg_pace_s_per_mi")}
             </div>
+            <div class="edit-row">
+                <label>GAP</label>
+                <span style="padding:3px 6px;font-size:12px">${meta.display_gap || "\u2014"}</span>
+            </div>
+            <div class="edit-row">
+                <label>Elevation</label>
+                <span style="padding:3px 6px;font-size:12px">${meta.total_ascent_ft != null || meta.total_descent_ft != null ? `\u25B2${Math.round(meta.total_ascent_ft || 0)}ft \u25BC${Math.round(meta.total_descent_ft || 0)}ft` : "\u2014"}</span>
+            </div>
             <div class="edit-row" data-field-row="avg_hr">
                 <label>Avg HR</label>
-                <input type="number" step="1" data-field="avg_hr" value="${meta.avg_hr != null ? Math.round(meta.avg_hr) : ""}" placeholder="${meta.avg_hr != null ? Math.round(meta.avg_hr) : ""}">
+                <input type="number" step="0.1" data-field="avg_hr" value="${meta.avg_hr != null ? parseFloat(meta.avg_hr).toFixed(1) : ""}" placeholder="${meta.avg_hr != null ? parseFloat(meta.avg_hr).toFixed(1) : ""}">
                 ${resetBtn("avg_hr")}
             </div>
             <div class="edit-row" data-field-row="avg_cadence">

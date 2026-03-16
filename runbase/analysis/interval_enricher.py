@@ -23,6 +23,110 @@ from runbase.analysis.pace_segments import is_structured, segment_by_pace
 from runbase.analysis.locations import find_matching_courses, best_course_for_interval
 
 METERS_PER_MILE = 1609.344
+FT_PER_M = 3.28084
+
+
+def _minetti_cost_ratio(grade: float) -> float:
+    """Minetti 2002 energy cost ratio vs flat running.
+
+    grade: decimal gradient (0.10 = 10%).
+    Returns cost_ratio clamped to a minimum of 0.785 (Strava's revised
+    downhill cap, ~12% max benefit peaking around -9% grade).
+    """
+    i = max(-0.5, min(0.5, grade))
+    cr = 155.4*i**5 - 30.4*i**4 - 43.3*i**3 + 46.3*i**2 + 19.5*i + 3.6
+    ratio = cr / 3.6
+    return max(0.785, ratio)
+
+
+def _compute_gap(streams: list[dict]) -> float | None:
+    """Compute grade-adjusted pace from stream altitude + distance data.
+
+    Uses 30-meter distance windows for grade smoothing and the Minetti 2002
+    energy cost polynomial with a capped downhill benefit.
+
+    Returns gap_s_per_mi or None if insufficient data.
+    """
+    # Filter to points with valid altitude and distance
+    pts = [
+        s for s in streams
+        if s.get("altitude_ft") is not None and s.get("distance_mi") is not None
+            and s.get("timestamp_s") is not None
+    ]
+    if len(pts) < 10:
+        return None
+
+    total_time = 0.0
+    total_adj_dist = 0.0
+    WINDOW_M = 30.0  # grade smoothing window in meters
+
+    for idx in range(1, len(pts)):
+        d_mi = pts[idx]["distance_mi"] - pts[idx - 1]["distance_mi"]
+        dt = pts[idx]["timestamp_s"] - pts[idx - 1]["timestamp_s"]
+        if d_mi <= 0 or dt <= 0:
+            continue
+
+        d_m = d_mi * METERS_PER_MILE
+
+        # Compute grade over ~30m window ending at this point
+        alt_m = pts[idx]["altitude_ft"] / FT_PER_M
+        # Walk backwards to find a point ~30m earlier
+        window_start = idx
+        accum_m = 0.0
+        for j in range(idx - 1, -1, -1):
+            seg_m = (pts[j + 1]["distance_mi"] - pts[j]["distance_mi"]) * METERS_PER_MILE
+            accum_m += seg_m
+            window_start = j
+            if accum_m >= WINDOW_M:
+                break
+
+        if accum_m > 0:
+            alt_start_m = pts[window_start]["altitude_ft"] / FT_PER_M
+            grade = (alt_m - alt_start_m) / accum_m
+            grade = max(-0.5, min(0.5, grade))
+        else:
+            grade = 0.0
+
+        cost_ratio = _minetti_cost_ratio(grade)
+        total_adj_dist += d_mi * cost_ratio
+        total_time += dt
+
+    if total_adj_dist <= 0 or total_time <= 0:
+        return None
+
+    return total_time / total_adj_dist  # seconds per adjusted mile
+
+
+def _compute_elevation(streams: list[dict]) -> tuple[float | None, float | None]:
+    """Compute total elevation gain and loss from stream altitude data.
+
+    Returns (gain_ft, loss_ft) or (None, None) if insufficient data.
+    Uses a 3-point smoothing to reduce GPS altitude noise.
+    """
+    alts = [s["altitude_ft"] for s in streams if s.get("altitude_ft") is not None]
+    if len(alts) < 10:
+        return None, None
+
+    # 3-point moving average to smooth GPS noise
+    smoothed = []
+    for i in range(len(alts)):
+        if i == 0:
+            smoothed.append((alts[0] + alts[1]) / 2)
+        elif i == len(alts) - 1:
+            smoothed.append((alts[-2] + alts[-1]) / 2)
+        else:
+            smoothed.append((alts[i - 1] + alts[i] + alts[i + 1]) / 3)
+
+    gain = 0.0
+    loss = 0.0
+    for i in range(1, len(smoothed)):
+        diff = smoothed[i] - smoothed[i - 1]
+        if diff > 0:
+            gain += diff
+        else:
+            loss -= diff  # loss stored as positive
+
+    return round(gain, 1), round(loss, 1)
 
 
 def _recalc_pace(iv: dict) -> None:
@@ -179,7 +283,8 @@ def _get_paces_config(config: dict) -> dict:
 def _load_activity(conn, activity_id: int) -> dict | None:
     """Load activity row as a dict."""
     row = conn.execute(
-        """SELECT id, date, distance_mi, duration_s, workout_category, workout_name
+        """SELECT id, date, distance_mi, duration_s, workout_category, workout_name,
+                  total_ascent_ft, total_descent_ft
            FROM activities WHERE id = ?""",
         (activity_id,),
     ).fetchone()
@@ -188,6 +293,7 @@ def _load_activity(conn, activity_id: int) -> dict | None:
     return {
         "id": row[0], "date": row[1], "distance_mi": row[2],
         "duration_s": row[3], "workout_category": row[4], "workout_name": row[5],
+        "total_ascent_ft": row[6], "total_descent_ft": row[7],
     }
 
 
@@ -1001,19 +1107,29 @@ def enrich_activity(conn, activity_id: int, config: dict,
         avg_pace = activity.get("avg_pace_s_per_mi")
         avg_pace_display = None
 
+    # --- Compute grade-adjusted pace (GAP) from stream altitude data ---
+    gap = _compute_gap(streams)
+
+    # --- Compute elevation gain/loss from streams to fill missing values ---
+    stream_gain, stream_loss = _compute_elevation(streams)
+    ascent = activity.get("total_ascent_ft") or stream_gain
+    descent = activity.get("total_descent_ft") or stream_loss
+
     if "distance_mi" in overrides:
         conn.execute(
             "UPDATE activities SET vdot = ?, duration_s = ?, "
-            "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ? WHERE id = ?",
+            "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ?, "
+            "gap_s_per_mi = ?, total_ascent_ft = ?, total_descent_ft = ? WHERE id = ?",
             (vdot, act_dur or activity.get("duration_s"), avg_pace, avg_pace_display,
-             stride_count, activity_id),
+             stride_count, gap, ascent, descent, activity_id),
         )
     else:
         conn.execute(
             "UPDATE activities SET adjusted_distance_mi = ?, vdot = ?, duration_s = ?, "
-            "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ? WHERE id = ?",
+            "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ?, "
+            "gap_s_per_mi = ?, total_ascent_ft = ?, total_descent_ft = ? WHERE id = ?",
             (adjusted_distance, vdot, act_dur or activity.get("duration_s"),
-             avg_pace, avg_pace_display, stride_count, activity_id),
+             avg_pace, avg_pace_display, stride_count, gap, ascent, descent, activity_id),
         )
 
     conn.commit()

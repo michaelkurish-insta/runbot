@@ -48,6 +48,14 @@ def create_app(config=None):
         m, s = divmod(int(seconds_per_mile), 60)
         return f"{m}:{s:02d}"
 
+    def _format_pace_tenths(seconds_per_mile):
+        """Format pace as M:SS.s with one decimal."""
+        if seconds_per_mile is None:
+            return ""
+        m = int(seconds_per_mile // 60)
+        s = seconds_per_mile - m * 60
+        return f"{m}:{s:04.1f}"
+
     def _format_duration(seconds):
         if seconds is None:
             return ""
@@ -1246,6 +1254,10 @@ def create_app(config=None):
             "strides": a.get("strides"),
             "notes": a.get("notes") or "",
             "vdot": a.get("vdot"),
+            "gap_s_per_mi": a.get("gap_s_per_mi"),
+            "display_gap": _format_pace_tenths(a.get("gap_s_per_mi")),
+            "total_ascent_ft": a.get("total_ascent_ft"),
+            "total_descent_ft": a.get("total_descent_ft"),
             "overridden_fields": overridden,
         })
 

@@ -263,6 +263,8 @@ def _migrate_schema(conn):
         # Planned activity enrichment
         ("planned_activities", "workout_type_zone", "TEXT"),
         ("planned_activities", "strides", "INTEGER"),
+        # Grade-adjusted pace
+        ("activities", "gap_s_per_mi", "REAL"),
     ]
 
     existing = {}
