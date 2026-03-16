@@ -2292,7 +2292,7 @@
 
     const tabButtons = document.querySelectorAll(".tab-btn");
     const tabContents = document.querySelectorAll(".tab-content");
-    const tabLoaded = { calendar: true, shoes: false, trends: false };
+    const tabLoaded = { calendar: true, shoes: false, trends: false, "race-prediction": false };
 
     function switchTab(tabName) {
         tabButtons.forEach(btn => btn.classList.toggle("active", btn.dataset.tab === tabName));
@@ -2306,6 +2306,10 @@
         if (tabName === "trends" && !tabLoaded.trends) {
             tabLoaded.trends = true;
             loadTrendsTab("1y");
+        }
+        if (tabName === "race-prediction" && !tabLoaded["race-prediction"]) {
+            tabLoaded["race-prediction"] = true;
+            loadRacePredictionTab();
         }
     }
 
@@ -2689,6 +2693,11 @@
             html += '<div class="trends-chart-wrap"><h3>VDOT Progression</h3><canvas id="trends-vdot-chart" height="200"></canvas></div>';
             html += '</div>';
 
+            // Row 4: Predicted Race VDOT
+            html += '<div class="trends-row">';
+            html += '<div class="trends-chart-wrap"><h3>Current Race VDOT</h3><canvas id="trends-predicted-vdot-chart" height="200"></canvas></div>';
+            html += '</div>';
+
             container.innerHTML = html;
 
             // Draw charts
@@ -2707,6 +2716,15 @@
             // VDOT scatter
             const vdotPts = (data.vdot_timeline || []).map(v => ({ date: v.effective_date, value: v.vdot, label: v.notes || "" }));
             drawScatterChart("trends-vdot-chart", vdotPts);
+
+            // Predicted Race VDOT line + race actuals as scatter overlay
+            const predVdot = (data.predicted_vdot || []);
+            if (predVdot.length > 0) {
+                const raceScatter = (data.vdot_timeline || [])
+                    .filter(v => v.source === "race")
+                    .map(v => ({ date: v.effective_date, value: v.vdot }));
+                drawPredictedVdotChart("trends-predicted-vdot-chart", predVdot, raceScatter);
+            }
         });
     }
 
@@ -2950,6 +2968,286 @@
 
         // X labels
         drawDateXLabels(ctx, dates, xPos, h, pad);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ── Predicted VDOT Chart (Trends tab) ─────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+
+    function drawPredictedVdotChart(canvasId, linePts, scatterPts) {
+        const canvas = document.getElementById(canvasId);
+        if (!canvas || !linePts.length) return;
+        const { ctx, w, h } = initCanvas(canvas);
+        const pad = { top: 10, right: 10, bottom: 22, left: 40 };
+        const cw = w - pad.left - pad.right;
+        const ch = h - pad.top - pad.bottom;
+
+        // Merge all values for Y range
+        const allVals = linePts.map(p => p.value).concat(scatterPts.map(p => p.value));
+        let vMin = Math.min(...allVals);
+        let vMax = Math.max(...allVals);
+        const vPad = (vMax - vMin) * 0.15 || 1;
+        vMin -= vPad;
+        vMax += vPad;
+
+        // Merge all dates for X range
+        const allDates = linePts.map(p => new Date(p.date + "T00:00:00").getTime())
+            .concat(scatterPts.map(p => new Date(p.date + "T00:00:00").getTime()));
+        const uniqueDates = [...new Set(allDates)].sort((a, b) => a - b);
+
+        const xPos = dateXPositioner(uniqueDates, pad, cw);
+        const yPos = v => pad.top + (1 - (v - vMin) / (vMax - vMin || 1)) * ch;
+
+        // Y grid
+        ctx.fillStyle = "#aaa";
+        ctx.font = "9px -apple-system, sans-serif";
+        ctx.textAlign = "right";
+        for (let i = 0; i <= 4; i++) {
+            const v = vMin + ((vMax - vMin) * i) / 4;
+            const y = yPos(v);
+            ctx.beginPath();
+            ctx.moveTo(pad.left, y);
+            ctx.lineTo(w - pad.right, y);
+            ctx.strokeStyle = "#eee";
+            ctx.lineWidth = 0.5;
+            ctx.stroke();
+            ctx.fillText(v.toFixed(1), pad.left - 4, y + 3);
+        }
+
+        // Predicted line
+        ctx.beginPath();
+        const lpts = linePts.map(p => ({
+            x: xPos(new Date(p.date + "T00:00:00").getTime()),
+            y: yPos(p.value),
+        }));
+        ctx.moveTo(lpts[0].x, lpts[0].y);
+        for (let i = 1; i < lpts.length; i++) ctx.lineTo(lpts[i].x, lpts[i].y);
+        ctx.strokeStyle = "#4a7ab5";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        // Fill under line
+        ctx.beginPath();
+        ctx.moveTo(lpts[0].x, lpts[0].y);
+        for (let i = 1; i < lpts.length; i++) ctx.lineTo(lpts[i].x, lpts[i].y);
+        ctx.lineTo(lpts[lpts.length - 1].x, pad.top + ch);
+        ctx.lineTo(lpts[0].x, pad.top + ch);
+        ctx.closePath();
+        ctx.fillStyle = "rgba(74, 122, 181, 0.08)";
+        ctx.fill();
+
+        // Race VDOT scatter dots
+        for (const p of scatterPts) {
+            const x = xPos(new Date(p.date + "T00:00:00").getTime());
+            const y = yPos(p.value);
+            ctx.beginPath();
+            ctx.arc(x, y, 5, 0, Math.PI * 2);
+            ctx.fillStyle = "#c05050";
+            ctx.fill();
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
+
+        // X labels
+        drawDateXLabels(ctx, uniqueDates, xPos, h, pad);
+
+        // Legend
+        const parent = canvas.parentElement;
+        let legendDiv = parent.querySelector(".chart-legend");
+        if (!legendDiv) {
+            legendDiv = document.createElement("div");
+            legendDiv.className = "chart-legend";
+            parent.appendChild(legendDiv);
+        }
+        legendDiv.innerHTML = [
+            `<span class="chart-legend-item"><span class="chart-legend-swatch" style="background:#4a7ab5"></span>Predicted</span>`,
+            `<span class="chart-legend-item"><span class="chart-legend-swatch" style="background:#c05050;border-radius:50%;width:8px;height:8px"></span>Race Actual</span>`,
+        ].join("");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ── Race Prediction Tab ───────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+
+    async function loadRacePredictionTab() {
+        const page = document.querySelector(".race-prediction-page");
+        page.innerHTML = "<p style='color:#888;font-size:12px'>Loading…</p>";
+
+        const resp = await fetch("/api/race-predictions");
+        const data = await resp.json();
+
+        const fmtVdot = v => v != null ? v.toFixed(1) : "\u2014";
+        const fmtErr = v => {
+            if (v == null) return "\u2014";
+            const sign = v >= 0 ? "+" : "";
+            const cls = v >= 0 ? "rp-error-pos" : "rp-error-neg";
+            return `<span class="${cls}">${sign}${v.toFixed(2)}</span>`;
+        };
+
+        let html = "";
+
+        // ── Model Description ──
+        html += `<div class="rp-section">
+            <h3>Model</h3>
+            <p class="rp-desc">
+                Predict race VDOT from training data using per-activity computed VDOT (CVD)
+                values derived from grade-adjusted pace and heart rate via the
+                Daniels-Gilbert / Runalyze formula.<br><br>
+                <strong>Step 1:</strong> Compute a duration-weighted exponential moving average
+                of CVD values over the ${data.window_days} days before the race.
+                Half-life = ${data.half_life} days (3 half-lives span the window).<br>
+                <strong>Step 2:</strong> Multiply by a calibration coefficient (least-squares
+                optimized to minimize prediction error across all races).
+            </p>
+        </div>`;
+
+        // ── Calibrated Parameters ──
+        html += `<div class="rp-section">
+            <h3>Calibrated Parameters</h3>
+            <div class="rp-params">
+                <div class="rp-param">
+                    <div class="rp-param-label">Window</div>
+                    <div class="rp-param-value">${data.window_days}d</div>
+                </div>
+                <div class="rp-param">
+                    <div class="rp-param-label">Half-life</div>
+                    <div class="rp-param-value">${data.half_life}d</div>
+                </div>
+                <div class="rp-param">
+                    <div class="rp-param-label">Multiplier</div>
+                    <div class="rp-param-value">${data.multiplier.toFixed(4)}</div>
+                </div>
+                <div class="rp-param">
+                    <div class="rp-param-label">RMSE</div>
+                    <div class="rp-param-value">${data.rmse != null ? data.rmse.toFixed(2) : "\u2014"}</div>
+                </div>
+                <div class="rp-param">
+                    <div class="rp-param-label">MAE</div>
+                    <div class="rp-param-value">${data.mae != null ? data.mae.toFixed(2) : "\u2014"}</div>
+                </div>
+            </div>
+        </div>`;
+
+        // ── Predictions Table ──
+        html += `<div class="rp-section">
+            <h3>Predictions vs Actual</h3>
+            <table class="rp-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Race</th>
+                        <th style="text-align:right">Prior Runs</th>
+                        <th style="text-align:right">21d EWA</th>
+                        <th style="text-align:right">Predicted</th>
+                        <th style="text-align:right">Actual</th>
+                        <th style="text-align:right">Error</th>
+                    </tr>
+                </thead>
+                <tbody>`;
+
+        for (const r of data.races) {
+            html += `<tr>
+                <td>${r.date}</td>
+                <td>${r.name}</td>
+                <td class="num">${r.prior_count}</td>
+                <td class="num">${fmtVdot(r.ewa)}</td>
+                <td class="num">${fmtVdot(r.predicted)}</td>
+                <td class="num">${fmtVdot(r.race_vdot)}</td>
+                <td class="num">${fmtErr(r.error)}</td>
+            </tr>`;
+        }
+
+        html += `</tbody></table></div>`;
+
+        // ── Chart: Predicted vs Actual scatter ──
+        html += `<div class="rp-section">
+            <h3>Predicted vs Actual</h3>
+            <canvas id="rp-scatter" width="500" height="400" style="max-width:100%"></canvas>
+        </div>`;
+
+        page.innerHTML = html;
+
+        // Draw scatter chart
+        const valid = data.races.filter(r => r.predicted != null);
+        if (valid.length > 0) {
+            drawRPScatter(valid);
+        }
+    }
+
+    function drawRPScatter(races) {
+        const canvas = document.getElementById("rp-scatter");
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        const w = canvas.width, h = canvas.height;
+        const pad = { top: 20, right: 20, bottom: 40, left: 50 };
+
+        const actuals = races.map(r => r.race_vdot);
+        const preds = races.map(r => r.predicted);
+        const all = actuals.concat(preds);
+        const lo = Math.floor(Math.min(...all) - 2);
+        const hi = Math.ceil(Math.max(...all) + 2);
+
+        const xPos = v => pad.left + (v - lo) / (hi - lo) * (w - pad.left - pad.right);
+        const yPos = v => h - pad.bottom - (v - lo) / (hi - lo) * (h - pad.top - pad.bottom);
+
+        ctx.clearRect(0, 0, w, h);
+
+        // Perfect prediction line
+        ctx.beginPath();
+        ctx.moveTo(xPos(lo), yPos(lo));
+        ctx.lineTo(xPos(hi), yPos(hi));
+        ctx.strokeStyle = "#ddd";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Grid lines
+        ctx.fillStyle = "#aaa";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "center";
+        for (let v = Math.ceil(lo); v <= hi; v += 2) {
+            ctx.beginPath();
+            ctx.moveTo(xPos(v), h - pad.bottom);
+            ctx.lineTo(xPos(v), pad.top);
+            ctx.strokeStyle = "#f0f0f0";
+            ctx.stroke();
+            ctx.fillText(v, xPos(v), h - pad.bottom + 14);
+        }
+        ctx.textAlign = "right";
+        for (let v = Math.ceil(lo); v <= hi; v += 2) {
+            ctx.beginPath();
+            ctx.moveTo(pad.left, yPos(v));
+            ctx.lineTo(w - pad.right, yPos(v));
+            ctx.strokeStyle = "#f0f0f0";
+            ctx.stroke();
+            ctx.fillText(v, pad.left - 6, yPos(v) + 3);
+        }
+
+        // Axis labels
+        ctx.fillStyle = "#888";
+        ctx.font = "11px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("Actual VDOT", (pad.left + w - pad.right) / 2, h - 4);
+        ctx.save();
+        ctx.translate(12, (pad.top + h - pad.bottom) / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillText("Predicted VDOT", 0, 0);
+        ctx.restore();
+
+        // Points
+        for (let i = 0; i < races.length; i++) {
+            const x = xPos(races[i].race_vdot);
+            const y = yPos(races[i].predicted);
+            ctx.beginPath();
+            ctx.arc(x, y, 5, 0, Math.PI * 2);
+            ctx.fillStyle = "#4a7ab5";
+            ctx.fill();
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
     }
 
 })();

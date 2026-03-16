@@ -1,3 +1,4 @@
+import math
 import re
 import sqlite3
 import subprocess
@@ -41,6 +42,68 @@ def create_app(config=None):
         "", "January", "February", "March", "April", "May", "June",
         "July", "August", "September", "October", "November", "December",
     ]
+
+    # ── AVD (Adjusted VDOT) helpers ─────────────────────────────────
+
+    AVD_WINDOW_DAYS = 21
+    AVD_HALF_LIFE = 7
+    _AVD_LN2 = math.log(2)
+
+    def _avd_ewa(target_date_str, cvd_list, inclusive=False):
+        """Duration-weighted exponential moving average of CVDs.
+
+        Args:
+            target_date_str: date to compute EWA for.
+            cvd_list: sorted list of (date_str, computed_vdot, duration_s).
+            inclusive: if True, include target_date (for AVD);
+                       if False, exclude it (for race prediction).
+        Returns:
+            (ewa_value, count) or (None, 0).
+        """
+        td = date.fromisoformat(target_date_str)
+        ws = td - timedelta(days=AVD_WINDOW_DAYS)
+        tw = 0.0
+        twv = 0.0
+        count = 0
+        for ds, cvd, dur in cvd_list:
+            d = date.fromisoformat(ds)
+            if d < ws:
+                continue
+            if d > td:
+                break
+            if not inclusive and d >= td:
+                break
+            days_before = (td - d).days
+            w = math.exp(-_AVD_LN2 * days_before / AVD_HALF_LIFE) * max(dur, 60)
+            tw += w
+            twv += w * cvd
+            count += 1
+        if tw == 0 or count == 0:
+            return None, 0
+        return twv / tw, count
+
+    def _avd_multiplier(conn):
+        """Compute the least-squares calibrated multiplier from race history."""
+        races = conn.execute(
+            "SELECT vh.effective_date, vh.vdot FROM vdot_history vh "
+            "WHERE vh.source = 'race' ORDER BY vh.effective_date",
+        ).fetchall()
+        all_cvd = conn.execute(
+            "SELECT date, computed_vdot, duration_s FROM activities "
+            "WHERE computed_vdot IS NOT NULL ORDER BY date",
+        ).fetchall()
+        cvd_list = [(r[0], r[1], r[2] or 0) for r in all_cvd]
+
+        pairs = []
+        for r in races:
+            ewa, _ = _avd_ewa(r[0], cvd_list, inclusive=False)
+            if ewa is not None:
+                pairs.append((ewa, r[1]))
+        if len(pairs) >= 2:
+            num = sum(a * e for e, a in pairs)
+            den = sum(e * e for e, _ in pairs)
+            return num / den if den > 0 else 1.0
+        return 1.0
 
     def _format_pace(seconds_per_mile):
         if seconds_per_mile is None:
@@ -736,6 +799,20 @@ def create_app(config=None):
             dist = a.get("adjusted_distance_mi") or a.get("distance_mi") or 0
             daily_dist[a["date"]] = daily_dist.get(a["date"], 0) + dist
             daily_iscore[a["date"]] = daily_iscore.get(a["date"], 0) + (a.get("intensity_score") or 0)
+
+        # Compute AVD (Adjusted VDOT) for each activity
+        mult = _avd_multiplier(conn)
+        # Load CVDs: seed 21 days before Jan 1 for early-year activities
+        avd_seed = (date(year, 1, 1) - timedelta(days=AVD_WINDOW_DAYS)).isoformat()
+        avd_cvd_rows = conn.execute(
+            "SELECT date, computed_vdot, duration_s FROM activities "
+            "WHERE computed_vdot IS NOT NULL AND date >= ? ORDER BY date",
+            (avd_seed,),
+        ).fetchall()
+        avd_cvd_list = [(r[0], r[1], r[2] or 0) for r in avd_cvd_rows]
+        for a in activities:
+            ewa, _ = _avd_ewa(a["date"], avd_cvd_list, inclusive=True)
+            a["adjusted_vdot"] = round(ewa * mult, 1) if ewa is not None else None
 
         # Add planned distances and estimated I-scores to daily totals
         # (only for dates without real activities)
@@ -2229,13 +2306,109 @@ def create_app(config=None):
         ).fetchall()
         vdot_timeline = [dict(r) for r in vdot_rows]
 
+        # ── Daily predicted race VDOT ────────────
+        cvd_seed = (range_start - timedelta(days=AVD_WINDOW_DAYS)).isoformat()
+        cvd_rows = conn.execute(
+            "SELECT date, computed_vdot, duration_s FROM activities "
+            "WHERE computed_vdot IS NOT NULL AND date >= ? ORDER BY date",
+            (cvd_seed,),
+        ).fetchall()
+        mult = _avd_multiplier(conn)
         conn.close()
+
+        cvd_list = [(r[0], r[1], r[2] or 0) for r in cvd_rows]
+        predicted_vdot = []
+        d_cursor = range_start
+        while d_cursor <= today_d:
+            ds = d_cursor.isoformat()
+            ewa, _ = _avd_ewa(ds, cvd_list, inclusive=False)
+            if ewa is not None:
+                predicted_vdot.append({
+                    "date": ds,
+                    "value": round(ewa * mult, 1),
+                })
+            d_cursor += timedelta(days=1)
+
+        # Downsample to ~300 points
+        if len(predicted_vdot) > 300:
+            step = len(predicted_vdot) / 300
+            ds = []
+            i = 0.0
+            while int(i) < len(predicted_vdot):
+                ds.append(predicted_vdot[int(i)])
+                i += step
+            predicted_vdot = ds
 
         return jsonify({
             "weekly": weekly,
             "atl_ctl": atl_ctl,
             "races": races,
             "vdot_timeline": vdot_timeline,
+            "predicted_vdot": predicted_vdot,
+        })
+
+    @app.route("/api/race-predictions")
+    def api_race_predictions():
+        conn = get_db()
+
+        # Load races from vdot_history
+        races = conn.execute(
+            """SELECT vh.effective_date, vh.vdot, vh.activity_id, a.workout_name
+               FROM vdot_history vh
+               LEFT JOIN activities a ON vh.activity_id = a.id
+               WHERE vh.source = 'race'
+               ORDER BY vh.effective_date""",
+        ).fetchall()
+
+        # Load all activities with computed_vdot
+        cvd_rows = conn.execute(
+            "SELECT date, computed_vdot, duration_s FROM activities "
+            "WHERE computed_vdot IS NOT NULL ORDER BY date",
+        ).fetchall()
+
+        cvd_data = [(r[0], r[1], r[2] or 0) for r in cvd_rows]
+        best_mult = _avd_multiplier(conn)
+        conn.close()
+
+        # Build results
+        results = []
+        for r in races:
+            race_date, race_vdot, activity_id, workout_name = r[0], r[1], r[2], r[3]
+            ewa, cnt = _avd_ewa(race_date, cvd_data, inclusive=False)
+            if ewa is None:
+                results.append({
+                    "date": race_date,
+                    "name": workout_name or "",
+                    "race_vdot": race_vdot,
+                    "ewa": None,
+                    "predicted": None,
+                    "error": None,
+                    "prior_count": 0,
+                })
+                continue
+            predicted = round(ewa * best_mult, 2)
+            error = round(predicted - race_vdot, 2)
+            results.append({
+                "date": race_date,
+                "name": workout_name or "",
+                "race_vdot": race_vdot,
+                "ewa": round(ewa, 2),
+                "predicted": predicted,
+                "error": error,
+                "prior_count": cnt,
+            })
+
+        valid = [r for r in results if r["error"] is not None]
+        rmse = math.sqrt(sum(r["error"] ** 2 for r in valid) / len(valid)) if valid else None
+        mae = sum(abs(r["error"]) for r in valid) / len(valid) if valid else None
+
+        return jsonify({
+            "window_days": AVD_WINDOW_DAYS,
+            "half_life": AVD_HALF_LIFE,
+            "multiplier": round(best_mult, 4),
+            "rmse": round(rmse, 2) if rmse else None,
+            "mae": round(mae, 2) if mae else None,
+            "races": results,
         })
 
     return app

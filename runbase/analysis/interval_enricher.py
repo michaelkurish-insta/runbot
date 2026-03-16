@@ -15,6 +15,7 @@ import re
 
 from runbase.analysis.vdot import (
     get_current_vdot, vdot_to_boundaries, vdot_to_paces, classify_pace,
+    effective_vdot_from_gap_and_hr,
 )
 from runbase.analysis.track_detect import (
     detect_track_activity, snap_to_100m,
@@ -284,7 +285,7 @@ def _load_activity(conn, activity_id: int) -> dict | None:
     """Load activity row as a dict."""
     row = conn.execute(
         """SELECT id, date, distance_mi, duration_s, workout_category, workout_name,
-                  total_ascent_ft, total_descent_ft
+                  total_ascent_ft, total_descent_ft, avg_hr
            FROM activities WHERE id = ?""",
         (activity_id,),
     ).fetchone()
@@ -293,7 +294,7 @@ def _load_activity(conn, activity_id: int) -> dict | None:
     return {
         "id": row[0], "date": row[1], "distance_mi": row[2],
         "duration_s": row[3], "workout_category": row[4], "workout_name": row[5],
-        "total_ascent_ft": row[6], "total_descent_ft": row[7],
+        "total_ascent_ft": row[6], "total_descent_ft": row[7], "avg_hr": row[8],
     }
 
 
@@ -1115,21 +1116,30 @@ def enrich_activity(conn, activity_id: int, config: dict,
     ascent = activity.get("total_ascent_ft") or stream_gain
     descent = activity.get("total_descent_ft") or stream_loss
 
+    # --- Compute per-activity VDOT estimate from GAP + HR ---
+    hr_max = config.get("athlete", {}).get("hr_max")
+    computed_vdot = effective_vdot_from_gap_and_hr(
+        gap, activity.get("avg_hr"), hr_max,
+    )
+
     if "distance_mi" in overrides:
         conn.execute(
             "UPDATE activities SET vdot = ?, duration_s = ?, "
             "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ?, "
-            "gap_s_per_mi = ?, total_ascent_ft = ?, total_descent_ft = ? WHERE id = ?",
+            "gap_s_per_mi = ?, total_ascent_ft = ?, total_descent_ft = ?, "
+            "computed_vdot = ? WHERE id = ?",
             (vdot, act_dur or activity.get("duration_s"), avg_pace, avg_pace_display,
-             stride_count, gap, ascent, descent, activity_id),
+             stride_count, gap, ascent, descent, computed_vdot, activity_id),
         )
     else:
         conn.execute(
             "UPDATE activities SET adjusted_distance_mi = ?, vdot = ?, duration_s = ?, "
             "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ?, "
-            "gap_s_per_mi = ?, total_ascent_ft = ?, total_descent_ft = ? WHERE id = ?",
+            "gap_s_per_mi = ?, total_ascent_ft = ?, total_descent_ft = ?, "
+            "computed_vdot = ? WHERE id = ?",
             (adjusted_distance, vdot, act_dur or activity.get("duration_s"),
-             avg_pace, avg_pace_display, stride_count, gap, ascent, descent, activity_id),
+             avg_pace, avg_pace_display, stride_count, gap, ascent, descent,
+             computed_vdot, activity_id),
         )
 
     conn.commit()

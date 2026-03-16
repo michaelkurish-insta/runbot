@@ -14,6 +14,7 @@
             <button class="tab-btn active" data-tab="calendar">Calendar</button>
             <button class="tab-btn" data-tab="shoes">Shoes</button>
             <button class="tab-btn" data-tab="trends">Trends</button>
+            <button class="tab-btn" data-tab="race-prediction">Race Prediction</button>
         </nav>
         <button id="btn-import" class="btn-import" title="Run import pipeline">Import</button>
         <span id="import-status" class="import-status"></span>
@@ -75,6 +76,8 @@
                                 <th class="col-cad">Cad</th>
                                 <th class="col-iscore">I</th>
                                 <th class="col-notes">Notes</th>
+                                <th class="col-avd">AVD</th>
+                                <th class="col-cvd">CVD</th>
                                 <th class="col-vdot">VDOT</th>
                             </tr>
                         </thead>
@@ -104,6 +107,8 @@
                                         <td class="col-cad"></td>
                                         <td class="col-iscore planned-iscore">{{ '%.1f' % day.planned.estimated_iscore if day.planned.estimated_iscore else '' }}</td>
                                         <td class="col-notes"></td>
+                                        <td class="col-avd"></td>
+                                        <td class="col-cvd"></td>
                                         <td class="col-vdot"></td>
                                     </tr>
                                     {% else %}
@@ -116,7 +121,7 @@
                                             <span class="day-name">{{ day.day_of_week }}</span>
                                             <span class="date-num">{{ day.date_short }}</span>
                                         </td>
-                                        <td colspan="11"></td>
+                                        <td colspan="13"></td>
                                     </tr>
                                     {% endif %}
                                 {% endif %}
@@ -211,6 +216,10 @@
 
     <div class="tab-content" id="tab-trends">
         <div class="tab-page trends-page"></div>
+    </div>
+
+    <div class="tab-content" id="tab-race-prediction">
+        <div class="tab-page race-prediction-page"></div>
     </div>
 
     <!-- ── Activity Detail Modal ─────────────────────────────── -->

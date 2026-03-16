@@ -161,6 +161,52 @@ def get_current_vdot(conn, date: str) -> float | None:
     return row[0] if row else None
 
 
+def effective_vdot_from_gap_and_hr(gap_s_per_mi: float, avg_hr: float,
+                                   hr_max: float) -> float | None:
+    """Compute per-activity VDOT estimate from grade-adjusted pace and heart rate.
+
+    Uses the Runalyze/Daniels-Gilbert approach:
+    1. Derive %VO2max from %HRmax via log regression (Daniels Table 2.2)
+    2. Extrapolate 100%-effort speed from actual GAP and %VO2max
+    3. Convert that speed to VO2max via the Daniels oxygen cost polynomial
+
+    Args:
+        gap_s_per_mi: Grade-adjusted pace in seconds per mile.
+        avg_hr: Average heart rate for the activity.
+        hr_max: Athlete's max heart rate.
+
+    Returns:
+        Estimated VDOT, or None if inputs are insufficient.
+    """
+    if not gap_s_per_mi or not avg_hr or not hr_max or hr_max <= 0:
+        return None
+    if gap_s_per_mi <= 0:
+        return None
+
+    hr_pct = avg_hr / hr_max
+    # Sanity bounds: below ~60% HRmax the regression breaks down,
+    # above 100% is possible but cap at 105% for outlier protection
+    if hr_pct < 0.55 or hr_pct > 1.05:
+        return None
+
+    # %VO2max from %HRmax (Daniels log regression)
+    pct_vo2max = math.exp((hr_pct - 1.00466) / 0.68725)
+    if pct_vo2max <= 0:
+        return None
+
+    # GAP → velocity in m/min
+    velocity = METERS_PER_MILE / gap_s_per_mi * 60
+
+    # If running at this velocity but only at pct_vo2max effort,
+    # the 100%-effort velocity would be:
+    speed_at_100 = velocity / pct_vo2max
+
+    # Daniels oxygen cost at that extrapolated speed
+    vo2max = -4.60 + 0.182258 * speed_at_100 + 0.000104 * speed_at_100 ** 2
+
+    return round(vo2max, 2) if vo2max > 0 else None
+
+
 def set_vdot(conn, vdot: float, effective_date: str, source: str = "manual",
              activity_id: int | None = None, notes: str | None = None):
     """Insert a new VDOT history entry."""

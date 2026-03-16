@@ -57,7 +57,7 @@ runbase/
 │   ├── matcher.py         # Find orphaned Strava sources matching date+distance, backfill dates
 │   └── enricher.py        # Apply shoe/name/category from matched Strava source to activity
 ├── analysis/
-│   ├── vdot.py            # VDOT calculator (Daniels-Gilbert), pace zones, zone boundaries
+│   ├── vdot.py            # VDOT calculator (Daniels-Gilbert), pace zones, per-activity VDOT estimation
 │   ├── track_detect.py    # GPS-based track detection, 100m distance snapping
 │   ├── pace_segments.py   # Stream-based pace segmentation for unstructured runs
 │   ├── locations.py       # Workout location clustering, measured course detection
@@ -78,6 +78,7 @@ runbase/
 - Paths support `~` expansion and `$ENV_VAR` substitution
 - Default DB path: `~/runbase/data/runbase.db`
 - Strava credentials: set `STRAVA_CLIENT_ID` and `STRAVA_CLIENT_SECRET` env vars, or edit config directly
+- `athlete.hr_max`: max heart rate (used for computed VDOT estimation)
 
 ## Build Phases
 
@@ -108,8 +109,11 @@ different Strava activity that just happened to match on date + distance.
 - Strava sync matches existing activities by date + distance tolerance, fills missing fields
 - XLSX note parsing uses a 5-pattern regex cascade (splits/full/pace+HR/pace-only/@pattern/fallback)
 - FIT and Strava cadence for running is per-foot (half strides) — double for full strides/min
-- Enrichment waterfall: track detection → measured course → workout tagging → walking scrub → stride detection → pace zones → elapsed pace zone
+- Enrichment waterfall: track detection → measured course → workout tagging → walking scrub → stride detection → pace zones → elapsed pace zone → GAP → elevation → computed VDOT
 - VDOT stored in `vdot_history` table; current VDOT = most recent entry on or before activity date
+- Grade-adjusted pace (GAP) computed from stream altitude data using Minetti 2002 energy cost polynomial with capped downhill (0.785 min ratio)
+- Computed VDOT (CVD): per-activity VO2max estimate from GAP + HR using the Daniels-Gilbert/Runalyze formula
+- Adjusted VDOT (AVD): 21-day duration-weighted exponential moving average of CVDs (half-life 7 days) × calibrated multiplier
 - Unstructured runs (easy/long/recovery) get pace segments from stream data; structured workouts keep FIT laps
 - Auto-enrichment runs on new FIT imports if a VDOT is set
 
@@ -146,6 +150,36 @@ The Flask review UI (`python -m runbase review`) provides:
 - **Nullable fields**: HR, cadence, pace, duration can be set to NULL by saving an empty value
 - **Planned activities**: Click future blank rows to enter planned distance/workout
 - **Import button**: Triggers the full pipeline from the UI
+- **Tabs**: Calendar (main grid), Shoes (mileage tracking), Trends (charts + race table), Race Prediction (model calibration)
+
+### VDOT Estimation Pipeline
+
+Three VDOT-related columns appear in the activity grid (right side):
+
+| Column | Name | Description |
+|--------|------|-------------|
+| **AVD** | Adjusted VDOT | 21-day EWA of CVDs × multiplier, inclusive of that day's workout. Smoothed "race-ready" estimate. Computed on-the-fly in the grid endpoint. |
+| **CVD** | Computed VDOT | Per-activity VO2max estimate from GAP + avg HR via Daniels-Gilbert formula with Runalyze's HR-to-%VO2max log regression. Stored on `activities.computed_vdot`. |
+| **VDOT** | Timeline VDOT | Current VDOT from `vdot_history` table (race-derived or manual). Used for pace zone classification. |
+
+**CVD formula** (Runalyze/Daniels-Gilbert approach):
+1. `%VO2max = exp((avg_hr/hr_max - 1.00466) / 0.68725)` — HR-to-effort mapping
+2. `speed_at_100% = GAP_velocity / %VO2max` — extrapolate max-effort speed
+3. `VO2max = -4.60 + 0.182258 * speed + 0.000104 * speed^2` — Daniels oxygen cost
+4. Requires `athlete.hr_max` in config.yaml; rejects HR% < 55% or > 105%
+
+**AVD formula** (race prediction model):
+1. 21-day window, 7-day half-life exponential decay, duration-weighted
+2. Multiplier calibrated via least-squares against race VDOTs from `vdot_history`
+3. Shared helpers: `_avd_ewa()` and `_avd_multiplier()` in `app.py`
+
+### Race Prediction Tab
+
+The Race Prediction tab documents calibration of the VDOT prediction model:
+- Shows model description, calibrated parameters (window, half-life, multiplier, RMSE, MAE)
+- Table of all races: 21-day EWA, predicted VDOT, actual race VDOT, error
+- Predicted vs actual scatter chart
+- The Trends tab also shows a "Current Race VDOT" daily line chart using the same model
 
 ### Group-Matched Activity Split
 

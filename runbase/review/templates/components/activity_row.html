@@ -21,5 +21,7 @@
     <td class="col-cad">{{ a.display_cadence }}</td>
     <td class="col-iscore">{{ '%.1f' % a.intensity_score if a.intensity_score else '' }}</td>
     <td class="col-notes {{ 'overridden' if 'notes' in a.overridden_fields }}" title="{{ a.notes or '' }}">{{ a.notes or '' }}</td>
+    <td class="col-avd">{{ '%.1f' % a.adjusted_vdot if a.adjusted_vdot else '' }}</td>
+    <td class="col-cvd">{{ '%.1f' % a.computed_vdot if a.computed_vdot else '' }}</td>
     <td class="col-vdot">{{ '%.1f' % a.vdot if a.vdot else '' }}</td>
 </tr>

@@ -51,7 +51,8 @@ header {
 .tab-content { display: none; }
 .tab-content.active#tab-calendar { display: contents; }
 .tab-content.active#tab-shoes,
-.tab-content.active#tab-trends { display: block; }
+.tab-content.active#tab-trends,
+.tab-content.active#tab-race-prediction { display: block; }
 
 .tab-page {
     height: calc(100vh - 36px);
@@ -203,6 +204,86 @@ header {
     height: 3px;
     border-radius: 1px;
 }
+
+/* ── Race Prediction Tab ────────────────────────────────────── */
+.race-prediction-page { max-width: 900px; margin: 0 auto; }
+
+.rp-section {
+    margin-bottom: 28px;
+}
+
+.rp-section h3 {
+    font-size: 13px;
+    font-weight: 700;
+    color: #333;
+    margin: 0 0 8px;
+}
+
+.rp-desc {
+    font-size: 12px;
+    color: #666;
+    line-height: 1.5;
+    margin: 0 0 12px;
+}
+
+.rp-params {
+    display: flex;
+    gap: 24px;
+    margin-bottom: 16px;
+}
+
+.rp-param {
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    padding: 10px 16px;
+    text-align: center;
+}
+
+.rp-param-label {
+    font-size: 10px;
+    font-weight: 600;
+    color: #888;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}
+
+.rp-param-value {
+    font-size: 18px;
+    font-weight: 700;
+    color: #333;
+}
+
+.rp-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    margin-bottom: 16px;
+}
+
+.rp-table th {
+    background: #f0f2f5;
+    color: #888;
+    font-weight: 600;
+    font-size: 10px;
+    text-transform: uppercase;
+    padding: 5px 8px;
+    text-align: left;
+    border-bottom: 1px solid #ddd;
+}
+
+.rp-table td {
+    padding: 5px 8px;
+    border-bottom: 1px solid #f0f0f0;
+}
+
+.rp-table td.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.rp-error-pos { color: #c44; }
+.rp-error-neg { color: #4a7ab5; }
 
 .btn-import {
     margin-left: auto;
@@ -428,6 +509,8 @@ header {
 .col-cad     { width: 40px; text-align: right; }
 .col-iscore  { width: 42px; text-align: right; }
 .col-notes   { width: auto; }
+.col-avd     { width: 42px; text-align: right; }
+.col-cvd     { width: 42px; text-align: right; }
 .col-vdot    { width: 42px; text-align: right; }
 
 /* 7-day MA styling */
@@ -1183,7 +1266,7 @@ header {
 @media (max-width: 1100px) {
     .modal-sections { flex-direction: column; }
     .modal-right { width: 100%; }
-    .col-notes, .col-vdot, .col-cad, .col-ctl, .col-atl, .col-7di { display: none; }
+    .col-notes, .col-avd, .col-cvd, .col-vdot, .col-cad, .col-ctl, .col-atl, .col-7di { display: none; }
     .stats-inner { flex-direction: column; }
     .stats-cards { grid-template-columns: repeat(3, 1fr); width: 100%; }
     .monthly-table-wrap { width: 100%; }

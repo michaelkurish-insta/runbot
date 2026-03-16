@@ -265,6 +265,8 @@ def _migrate_schema(conn):
         ("planned_activities", "strides", "INTEGER"),
         # Grade-adjusted pace
         ("activities", "gap_s_per_mi", "REAL"),
+        # Computed VDOT (per-activity estimate from GAP + HR)
+        ("activities", "computed_vdot", "REAL"),
     ]
 
     existing = {}
