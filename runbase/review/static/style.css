@@ -50,6 +50,7 @@ header {
 
 .tab-content { display: none; }
 .tab-content.active#tab-calendar { display: contents; }
+.tab-content.active#tab-planning,
 .tab-content.active#tab-shoes,
 .tab-content.active#tab-trends,
 .tab-content.active#tab-race-prediction { display: block; }
@@ -466,7 +467,7 @@ header {
 .month-hdr-5  { border-left: 4px solid #5890B8; }
 .month-hdr-6  { border-left: 4px solid #D99B45; }
 .month-hdr-7  { border-left: 4px solid #48B070; }
-.month-hdr-8  { border-left: 4px solid #8EA488; }
+.month-hdr-8  { border-left: 4px solid #999999; }
 .month-hdr-9  { border-left: 4px solid #D9C070; }
 .month-hdr-10 { border-left: 4px solid #C08050; }
 .month-hdr-11 { border-left: 4px solid #A08060; }
@@ -649,11 +650,11 @@ header {
 .month-7.week-4 td.col-date { background: #30A860; color: #fff; }
 .month-7.week-5 td.col-date { background: #108840; color: #fff; }
 
-.month-8.week-1 td.col-date { background: #E8EEE0; }
-.month-8.week-2 td.col-date { background: #D0DCC8; }
-.month-8.week-3 td.col-date { background: #B0C0A8; }
-.month-8.week-4 td.col-date { background: #88A078; }
-.month-8.week-5 td.col-date { background: #607850; color: #fff; }
+.month-8.week-1 td.col-date { background: #E8E8E8; }
+.month-8.week-2 td.col-date { background: #D0D0D0; }
+.month-8.week-3 td.col-date { background: #B0B0B0; }
+.month-8.week-4 td.col-date { background: #909090; }
+.month-8.week-5 td.col-date { background: #707070; color: #fff; }
 
 .month-9.week-1 td.col-date { background: #FFF0C8; }
 .month-9.week-2 td.col-date { background: #FFE098; }
@@ -1218,7 +1219,7 @@ header {
 .month-bar-5  { background: #80B0E0; }
 .month-bar-6  { background: #F0B060; }
 .month-bar-7  { background: #58D088; }
-.month-bar-8  { background: #B0C0A8; }
+.month-bar-8  { background: #B0B0B0; }
 .month-bar-9  { background: #F0C860; }
 .month-bar-10 { background: #E0B090; }
 .month-bar-11 { background: #C8B090; }
@@ -1253,6 +1254,117 @@ header {
 .monthly-table td {
     padding: 3px 6px;
     border-bottom: 1px solid #f0f0f0;
+}
+
+/* ── Planning Tab ────────────────────────────────────────────── */
+.planning-page { max-width: 900px; margin: 0 auto; }
+
+.planning-year-nav {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.planning-year-nav .cal-year {
+    font-size: 18px;
+    font-weight: 700;
+    min-width: 50px;
+    text-align: center;
+    color: #333;
+}
+
+.planning-year-nav .cal-arrow {
+    color: #555;
+    text-decoration: none;
+    font-size: 18px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    background: none;
+    border: none;
+}
+.planning-year-nav .cal-arrow:hover { background: #eee; }
+
+.planning-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.planning-table thead th {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: #f0f2f5;
+    color: #888;
+    font-weight: 600;
+    font-size: 10px;
+    text-transform: uppercase;
+    padding: 5px 8px;
+    text-align: left;
+    border-bottom: 1px solid #ddd;
+}
+
+.planning-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid #f0f0f0;
+}
+
+.planning-table td.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.planning-table tr:hover { background: #f5f8fc; }
+
+.planning-current-week { background: #eef5ff !important; }
+.planning-current-week:hover { background: #e0edff !important; }
+
+.planning-future td { color: #999; }
+.planning-future td.planning-editable { color: #555; }
+
+.planning-week-label {
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.planning-target {
+    font-weight: 600;
+}
+
+.planning-actual {
+    color: #999;
+    font-size: 10px;
+    margin-left: 3px;
+}
+
+.planning-editable {
+    cursor: pointer;
+    min-width: 80px;
+}
+.planning-editable:hover { background: rgba(74,122,181,0.08); }
+
+.planning-inline-input {
+    width: 100%;
+    border: 1px solid #4a7ab5;
+    border-radius: 2px;
+    padding: 1px 4px;
+    font-size: 12px;
+    font-family: inherit;
+    background: #fff;
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(74,122,181,0.2);
+}
+
+.planning-month-sep td {
+    background: #f0f2f5;
+    font-weight: 700;
+    font-size: 11px;
+    color: #555;
+    padding: 4px 8px;
+    border-bottom: 1px solid #ddd;
 }
 
 /* ── Loading ─────────────────────────────────────────────────── */

@@ -268,8 +268,9 @@
                         iTd.className = "col-iscore planned-iscore";
                         iTd.textContent = d.estimated_iscore ? d.estimated_iscore.toFixed(1) : "";
                         row.appendChild(iTd);
-                        row.appendChild(document.createElement("td"));
-                        row.appendChild(document.createElement("td"));
+                        for (let j = 0; j < 4; j++) {
+                            row.appendChild(document.createElement("td"));
+                        }
                         row.classList.add("planned-row");
                         row.classList.remove("future-row");
                         refreshSevenDayMA(dateStr);
@@ -280,7 +281,7 @@
             function restoreBlanks() {
                 while (row.children.length > 5) row.removeChild(row.lastChild);
                 const td = document.createElement("td");
-                td.colSpan = 11;
+                td.colSpan = 13;
                 row.appendChild(td);
                 row.classList.remove("planned-row");
                 if (!row.classList.contains("future-row")) row.classList.add("future-row");
@@ -2190,20 +2191,20 @@
     // ── Refresh 7d MA after planned activity change ────────────
 
     function refreshSevenDayMA(changedDate) {
-        const d = new Date(changedDate + "T00:00:00");
-        const start = changedDate;
-        const endD = new Date(d);
-        endD.setDate(endD.getDate() + 6);
-        const end = endD.toISOString().slice(0, 10);
-
-        fetch(`/api/seven_day_ma?start=${start}&end=${end}`)
+        fetch(`/api/training_load?from=${changedDate}`)
             .then(r => r.json())
-            .then(maData => {
-                for (const [dateStr, maValue] of Object.entries(maData)) {
+            .then(data => {
+                for (const [dateStr, vals] of Object.entries(data)) {
                     const rows = mainContent.querySelectorAll(`[data-date="${dateStr}"]`);
                     for (const row of rows) {
-                        const maCell = row.querySelector(".col-7d");
-                        if (maCell) maCell.textContent = maValue.toFixed(1);
+                        const c7d = row.querySelector(".col-7d");
+                        if (c7d) c7d.textContent = vals.seven_d.toFixed(1);
+                        const c7di = row.querySelector(".col-7di");
+                        if (c7di) c7di.textContent = vals.seven_di.toFixed(1);
+                        const catl = row.querySelector(".col-atl");
+                        if (catl) catl.textContent = vals.atl.toFixed(1);
+                        const cctl = row.querySelector(".col-ctl");
+                        if (cctl) cctl.textContent = vals.ctl.toFixed(1);
                     }
                 }
             });
@@ -2292,13 +2293,17 @@
 
     const tabButtons = document.querySelectorAll(".tab-btn");
     const tabContents = document.querySelectorAll(".tab-content");
-    const tabLoaded = { calendar: true, shoes: false, trends: false, "race-prediction": false };
+    const tabLoaded = { calendar: true, planning: false, shoes: false, trends: false, "race-prediction": false };
 
     function switchTab(tabName) {
         tabButtons.forEach(btn => btn.classList.toggle("active", btn.dataset.tab === tabName));
         tabContents.forEach(div => div.classList.toggle("active", div.id === `tab-${tabName}`));
         sessionStorage.setItem("runbase_active_tab", tabName);
 
+        if (tabName === "planning" && !tabLoaded.planning) {
+            tabLoaded.planning = true;
+            loadPlanningTab();
+        }
         if (tabName === "shoes" && !tabLoaded.shoes) {
             tabLoaded.shoes = true;
             loadShoesTab();
@@ -3248,6 +3253,211 @@
             ctx.lineWidth = 1.5;
             ctx.stroke();
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // ── Planning Tab ─────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════
+
+    async function loadPlanningTab(year) {
+        const page = document.querySelector(".planning-page");
+        if (!year) {
+            const params = new URLSearchParams(window.location.search);
+            year = parseInt(params.get("year")) || new Date().getFullYear();
+        }
+        page.innerHTML = "<p style='color:#888;font-size:12px'>Loading\u2026</p>";
+
+        const resp = await fetch(`/api/planning?year=${year}`);
+        const data = await resp.json();
+        const weeks = data.weeks;
+
+        const todayStr = new Date().toISOString().slice(0, 10);
+
+        let html = "";
+
+        // Year nav
+        html += `<div class="planning-year-nav">
+            <button class="cal-arrow" data-planning-year="${year - 1}">&larr;</button>
+            <span class="cal-year">${year}</span>
+            <button class="cal-arrow" data-planning-year="${year + 1}">&rarr;</button>
+        </div>`;
+
+        // Month color palette (week-2 shade from calendar)
+        const MONTH_COLORS = {
+            1:  "#FFA8A8", 2:  "#F0A0F0", 3:  "#90E890", 4:  "#FFFF99",
+            5:  "#B0D0F0", 6:  "#FCD098", 7:  "#90E8B0", 8:  "#D0D0D0",
+            9:  "#FFE098", 10: "#F0D0B8", 11: "#E0D0B8", 12: "#B0D8B0",
+        };
+
+        // Table
+        html += `<table class="planning-table">
+            <thead>
+                <tr>
+                    <th>Week</th>
+                    <th style="text-align:right">Miles</th>
+                    <th style="text-align:right">Intensity</th>
+                    <th style="text-align:right">Runs</th>
+                    <th>Phase</th>
+                    <th>Note</th>
+                </tr>
+            </thead>
+            <tbody>`;
+
+        let lastMonth = null;
+        for (const w of weeks) {
+            // Month separator
+            const month = w.month; // 1-indexed from backend
+            if (lastMonth !== null && month !== lastMonth) {
+                const monthNames = ["","January","February","March","April","May","June",
+                    "July","August","September","October","November","December"];
+                html += `<tr class="planning-month-sep"><td colspan="6">${monthNames[month]}</td></tr>`;
+            }
+            lastMonth = month;
+
+            // Determine if this is the current week
+            const isCurrent = w.week_start <= todayStr && w.week_end >= todayStr;
+            const isFuture = w.is_future;
+            let rowClass = "";
+            if (isCurrent) rowClass = "planning-current-week";
+            else if (isFuture) rowClass = "planning-future";
+
+            const milesEditable = isFuture ? ' class="planning-editable num" data-field="target_mileage"' : ' class="num"';
+            const phaseEditable = ' class="planning-editable" data-field="phase"';
+            const noteEditable = ' class="planning-editable" data-field="note"';
+            const dateColor = MONTH_COLORS[month] || "";
+
+            // Show actual mileage for past, target for future (with actual in parens if both)
+            let milesDisplay = "";
+            if (!isFuture) {
+                milesDisplay = w.total_mileage > 0 ? w.total_mileage.toFixed(1) : "";
+            } else if (w.target_mileage != null) {
+                if (w.total_mileage > 0) {
+                    milesDisplay = `<span class="planning-target">${w.target_mileage.toFixed(1)}</span>`
+                        + `<span class="planning-actual">(${w.total_mileage.toFixed(1)})</span>`;
+                } else {
+                    milesDisplay = w.target_mileage.toFixed(1);
+                }
+            } else {
+                milesDisplay = w.total_mileage > 0 ? w.total_mileage.toFixed(1) : "";
+            }
+
+            html += `<tr class="${rowClass}" data-week-start="${w.week_start}">
+                <td class="planning-week-label" style="background:${dateColor}">${escapeHtml(w.label)}</td>
+                <td${milesEditable} data-target="${w.target_mileage != null ? w.target_mileage : ""}" data-actual="${w.total_mileage}">${milesDisplay}</td>
+                <td class="num">${w.total_intensity > 0 ? w.total_intensity.toFixed(1) : ""}</td>
+                <td class="num">${w.run_count || ""}</td>
+                <td${phaseEditable}>${escapeHtml(w.phase || "")}</td>
+                <td${noteEditable}>${escapeHtml(w.note || "")}</td>
+            </tr>`;
+        }
+
+        html += "</tbody></table>";
+        page.innerHTML = html;
+
+        // Year nav click handlers
+        page.querySelectorAll("[data-planning-year]").forEach(btn => {
+            btn.addEventListener("click", () => {
+                const y = parseInt(btn.dataset.planningYear);
+                tabLoaded.planning = true;
+                loadPlanningTab(y);
+            });
+        });
+
+        // Inline editing for phase/note
+        page.querySelectorAll(".planning-editable").forEach(cell => {
+            cell.addEventListener("dblclick", () => startPlanningEdit(cell));
+        });
+    }
+
+    function startPlanningEdit(cell) {
+        if (cell.querySelector(".planning-inline-input")) return;
+
+        const field = cell.dataset.field;
+        const row = cell.closest("tr");
+        const weekStart = row.dataset.weekStart;
+        const oldHtml = cell.innerHTML;
+
+        // For target_mileage, use data-target as the editable value
+        const editValue = field === "target_mileage"
+            ? (cell.dataset.target || "")
+            : cell.textContent.trim();
+
+        const input = document.createElement("input");
+        input.type = "text";
+        input.className = "planning-inline-input";
+        input.value = editValue;
+        cell.innerHTML = "";
+        cell.appendChild(input);
+        input.focus();
+        input.select();
+
+        function save() {
+            const newValue = input.value.trim();
+            if (field === "target_mileage") {
+                const numVal = newValue ? parseFloat(newValue) : null;
+                cell.dataset.target = numVal != null && !isNaN(numVal) ? numVal : "";
+                const actual = parseFloat(cell.dataset.actual) || 0;
+                if (numVal != null && !isNaN(numVal)) {
+                    if (actual > 0) {
+                        cell.innerHTML = `<span class="planning-target">${numVal.toFixed(1)}</span>`
+                            + `<span class="planning-actual">(${actual.toFixed(1)})</span>`;
+                    } else {
+                        cell.textContent = numVal.toFixed(1);
+                    }
+                } else {
+                    cell.textContent = actual > 0 ? actual.toFixed(1) : "";
+                }
+            } else {
+                cell.textContent = newValue;
+            }
+            savePlanningField(weekStart, row);
+        }
+
+        function cancel() {
+            cell.innerHTML = oldHtml;
+        }
+
+        function advanceToNext() {
+            // Tab: save and move to next editable cell
+            save();
+            const cells = Array.from(row.querySelectorAll(".planning-editable"));
+            const idx = cells.indexOf(cell);
+            if (idx >= 0 && idx < cells.length - 1) {
+                startPlanningEdit(cells[idx + 1]);
+            }
+        }
+
+        input.addEventListener("keydown", e => {
+            if (e.key === "Enter") { e.preventDefault(); save(); }
+            else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+            else if (e.key === "Tab") { e.preventDefault(); advanceToNext(); }
+        });
+
+        input.addEventListener("blur", () => {
+            // Only save on blur if the input is still in the DOM (not already handled)
+            if (cell.contains(input)) save();
+        });
+    }
+
+    function savePlanningField(weekStart, row) {
+        // Read current values from the row's editable cells
+        const cells = row.querySelectorAll(".planning-editable");
+        const payload = {};
+        cells.forEach(c => {
+            const f = c.dataset.field;
+            if (f === "target_mileage") {
+                const v = c.dataset.target;
+                payload[f] = v ? parseFloat(v) : null;
+            } else {
+                payload[f] = c.textContent.trim() || null;
+            }
+        });
+
+        fetch(`/api/planning/${weekStart}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        }).catch(() => {});
     }
 
 })();

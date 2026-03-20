@@ -288,6 +288,30 @@ def create_app(config=None):
                 if iv["source"] is None:
                     has_fit.add(aid)
 
+        # Pre-fetch activity durations for interval coverage checks
+        act_dur_map = {}
+        if by_act:
+            dur_ids = list(by_act.keys())
+            dur_ph = ",".join("?" * len(dur_ids))
+            for ar in conn.execute(
+                f"SELECT id, duration_s FROM activities WHERE id IN ({dur_ph})",
+                dur_ids,
+            ).fetchall():
+                act_dur_map[ar["id"]] = ar["duration_s"] or 0
+
+        # Coverage check: if manual laps cover < 10% of activity duration,
+        # treat as if no manual laps exist (use pace_segments or fallback).
+        # Handles cases like a FIT file that only captured a few seconds.
+        for aid in list(has_manual_laps):
+            manual_dur = sum(
+                (iv["duration_s"] or 0)
+                for iv in by_act[aid]
+                if iv["source"] != "pace_segment"
+            )
+            act_dur = act_dur_map.get(aid, 0)
+            if act_dur > 60 and manual_dur / act_dur < 0.10:
+                has_manual_laps.discard(aid)
+
         # Pre-fetch activity distance/duration for manual_split remainder calculation
         act_info = {}
         if has_manual_splits:
@@ -368,6 +392,7 @@ def create_app(config=None):
                 visible = [iv for iv in visible if iv["source"] != "strava_lap"]
 
             score = 0.0
+            scored_dur = 0.0
             for iv in visible:
                 if iv["is_walking"]:
                     continue  # 0 points
@@ -380,6 +405,7 @@ def create_app(config=None):
                 duration_min = (iv["duration_s"] or 0) / 60.0
                 if duration_min <= 0:
                     continue
+                scored_dur += iv["duration_s"] or 0
                 zone = iv["pace_zone"]
                 if zone == "walk":
                     # Manually marked as running (not is_walking) — count as E
@@ -387,6 +413,10 @@ def create_app(config=None):
                 else:
                     score += INTENSITY_PTS_PER_MIN.get(zone, 0) * duration_min
 
+            # If intervals cover < 10% of activity duration, skip to fallback
+            act_dur = act_dur_map.get(aid, 0)
+            if act_dur > 60 and scored_dur / act_dur < 0.10:
+                continue  # result[aid] not set → fallback will handle
             result[aid] = round(score, 1) if score > 0 else None
 
         # Fallback: activities with no intervals — use activity-level pace + duration
@@ -1872,6 +1902,118 @@ def create_app(config=None):
 
         return jsonify(result)
 
+    @app.route("/api/training_load")
+    def api_training_load():
+        """Return 7d mileage, 7dI, ATL, CTL for dates from `from` to end of year.
+
+        Used for live updates after planned activity changes.
+        """
+        from_str = request.args.get("from")
+        if not from_str:
+            return jsonify({"error": "from required"}), 400
+
+        from_d = date.fromisoformat(from_str)
+        year_end = date(from_d.year, 12, 31)
+        # Seed 90 days before year start for ATL/CTL EMA seeding
+        seed_start = date(from_d.year, 1, 1) - timedelta(days=90)
+        conn = get_db()
+
+        # ── Daily distances (activities + planned) ──
+        dist_rows = conn.execute(
+            """SELECT date, COALESCE(adjusted_distance_mi, distance_mi, 0) as dist
+               FROM activities WHERE date BETWEEN ? AND ?""",
+            (seed_start.isoformat(), year_end.isoformat()),
+        ).fetchall()
+        daily_dist = {}
+        act_dates = set()
+        for r in dist_rows:
+            daily_dist[r["date"]] = daily_dist.get(r["date"], 0) + r["dist"]
+            act_dates.add(r["date"])
+
+        planned_rows = conn.execute(
+            "SELECT date, distance_mi, workout_name, workout_type_zone, strides "
+            "FROM planned_activities WHERE date BETWEEN ? AND ?",
+            (seed_start.isoformat(), year_end.isoformat()),
+        ).fetchall()
+        for r in planned_rows:
+            if r["date"] not in act_dates and r["distance_mi"]:
+                daily_dist[r["date"]] = daily_dist.get(r["date"], 0) + r["distance_mi"]
+
+        # ── Daily I-scores (activities + planned estimates) ──
+        act_rows = conn.execute(
+            "SELECT id, date FROM activities WHERE date BETWEEN ? AND ?",
+            (seed_start.isoformat(), year_end.isoformat()),
+        ).fetchall()
+        act_ids = [r["id"] for r in act_rows]
+        iscores = _compute_intensity_scores(conn, act_ids) if act_ids else {}
+
+        daily_iscore = {}
+        for r in act_rows:
+            daily_iscore[r["date"]] = daily_iscore.get(r["date"], 0) + (iscores.get(r["id"], 0) or 0)
+
+        # Add estimated I-scores from planned activities
+        _vdot_cache = {}
+        _epace_cache = {}
+        for r in planned_rows:
+            pd = r["date"]
+            if pd in act_dates or not r["distance_mi"]:
+                continue
+            if pd not in _vdot_cache:
+                from runbase.analysis.vdot import get_current_vdot
+                _vdot_cache[pd] = get_current_vdot(conn, pd)
+            if pd not in _epace_cache:
+                _epace_cache[pd] = _get_avg_e_pace(conn, pd, _vdot_cache[pd])
+            est = _estimate_planned_iscore(
+                r["distance_mi"], r["workout_name"],
+                r["workout_type_zone"], r["strides"],
+                _vdot_cache[pd], _epace_cache[pd],
+            )
+            if est:
+                daily_iscore[pd] = daily_iscore.get(pd, 0) + est
+
+        conn.close()
+
+        # ── Compute ATL/CTL EMAs ──
+        lambda_a = 2.0 / (7 + 1)
+        lambda_f = 2.0 / (42 + 1)
+        atl = 0.0
+        ctl = 0.0
+        atl_ctl_map = {}
+        d_cursor = seed_start
+        while d_cursor <= year_end:
+            trimp = daily_iscore.get(d_cursor.isoformat(), 0)
+            atl = trimp * lambda_a + (1 - lambda_a) * atl
+            ctl = trimp * lambda_f + (1 - lambda_f) * ctl
+            if d_cursor >= from_d:
+                atl_ctl_map[d_cursor.isoformat()] = (round(atl, 1), round(ctl, 1))
+            d_cursor += timedelta(days=1)
+
+        # ── Build result: 7d, 7dI, ATL, CTL for each day ──
+        result = {}
+        d_cursor = from_d
+        while d_cursor <= year_end:
+            ds = d_cursor.isoformat()
+            # 7-day trailing mileage
+            seven_d = 0.0
+            for offset in range(7):
+                dd = (d_cursor - timedelta(days=offset)).isoformat()
+                seven_d += daily_dist.get(dd, 0)
+            # 7-day trailing intensity
+            seven_di = 0.0
+            for offset in range(7):
+                dd = (d_cursor - timedelta(days=offset)).isoformat()
+                seven_di += daily_iscore.get(dd, 0)
+            day_atl, day_ctl = atl_ctl_map.get(ds, (0, 0))
+            result[ds] = {
+                "seven_d": round(seven_d, 1),
+                "seven_di": round(seven_di, 1),
+                "atl": day_atl,
+                "ctl": day_ctl,
+            }
+            d_cursor += timedelta(days=1)
+
+        return jsonify(result)
+
     @app.route("/api/footer_stats")
     def api_footer_stats():
         """Return yearly + monthly stats for live footer updates."""
@@ -2410,5 +2552,166 @@ def create_app(config=None):
             "mae": round(mae, 2) if mae else None,
             "races": results,
         })
+
+    # ── Planning Tab ────────────────────────────────────────────
+
+    @app.route("/api/planning")
+    def api_planning():
+        year = request.args.get("year", type=int, default=date.today().year)
+        conn = get_db()
+        today = date.today()
+
+        # Compute first Sunday on or before Jan 1 and last Saturday on or after Dec 31
+        jan1 = date(year, 1, 1)
+        days_since_sun = (jan1.weekday() + 1) % 7
+        first_sunday = jan1 - timedelta(days=days_since_sun)
+
+        dec31 = date(year, 12, 31)
+        days_until_sat = (5 - dec31.weekday()) % 7
+        last_saturday = dec31 + timedelta(days=days_until_sat)
+
+        range_start = first_sunday.isoformat()
+        range_end = last_saturday.isoformat()
+
+        # Fetch real activities in range
+        act_rows = conn.execute(
+            """SELECT id, date,
+                      COALESCE(adjusted_distance_mi, distance_mi, 0) as dist,
+                      duration_s
+               FROM activities
+               WHERE date BETWEEN ? AND ?""",
+            (range_start, range_end),
+        ).fetchall()
+
+        # Build daily distance + collect IDs per date
+        daily_dist = {}
+        daily_ids = {}
+        for r in act_rows:
+            daily_dist[r["date"]] = daily_dist.get(r["date"], 0) + r["dist"]
+            daily_ids.setdefault(r["date"], []).append(r["id"])
+
+        # Fetch planned activities
+        planned_rows = conn.execute(
+            "SELECT date, distance_mi, workout_name, workout_type_zone, strides "
+            "FROM planned_activities WHERE date BETWEEN ? AND ?",
+            (range_start, range_end),
+        ).fetchall()
+        planned_map = {r["date"]: dict(r) for r in planned_rows}
+
+        # Compute intensity scores for real activities
+        all_ids = [r["id"] for r in act_rows]
+        intensity_scores = _compute_intensity_scores(conn, all_ids) if all_ids else {}
+
+        # Daily intensity sums
+        daily_intensity = {}
+        for r in act_rows:
+            iscore = intensity_scores.get(r["id"], 0) or 0
+            daily_intensity[r["date"]] = daily_intensity.get(r["date"], 0) + iscore
+
+        # Add planned activity distances and estimated I-scores for dates without real activities
+        from runbase.analysis.vdot import get_current_vdot
+        _vdot_cache = {}
+        _epace_cache = {}
+        for p_date, p_data in planned_map.items():
+            if p_date not in daily_ids and p_data.get("distance_mi"):
+                daily_dist[p_date] = daily_dist.get(p_date, 0) + p_data["distance_mi"]
+                if p_date not in _vdot_cache:
+                    _vdot_cache[p_date] = get_current_vdot(conn, p_date)
+                if p_date not in _epace_cache:
+                    _epace_cache[p_date] = _get_avg_e_pace(conn, p_date, _vdot_cache[p_date])
+                est = _estimate_planned_iscore(
+                    p_data["distance_mi"],
+                    p_data.get("workout_name"),
+                    p_data.get("workout_type_zone"),
+                    p_data.get("strides"),
+                    _vdot_cache[p_date],
+                    _epace_cache[p_date],
+                )
+                if est:
+                    daily_intensity[p_date] = daily_intensity.get(p_date, 0) + est
+
+        # Bucket into Sun-Sat weeks
+        weeks = []
+        sunday = first_sunday
+        while sunday <= last_saturday:
+            saturday = sunday + timedelta(days=6)
+            total_mi = 0.0
+            total_i = 0.0
+            run_count = 0
+            for offset in range(7):
+                d = sunday + timedelta(days=offset)
+                ds = d.isoformat()
+                total_mi += daily_dist.get(ds, 0)
+                total_i += daily_intensity.get(ds, 0)
+                if ds in daily_ids:
+                    run_count += len(daily_ids[ds])
+                elif ds in planned_map and planned_map[ds].get("distance_mi"):
+                    run_count += 1
+
+            weeks.append({
+                "week_start": sunday.isoformat(),
+                "week_end": saturday.isoformat(),
+                "label": f"{sunday.strftime('%-m/%-d')} \u2013 {saturday.strftime('%-m/%-d')}",
+                "month": sunday.month,
+                "total_mileage": round(total_mi, 1),
+                "total_intensity": round(total_i, 1),
+                "run_count": run_count,
+                "phase": None,
+                "note": None,
+                "target_mileage": None,
+                "is_future": saturday >= today,
+            })
+            sunday += timedelta(days=7)
+
+        # Fetch weekly_plan rows and merge
+        plan_rows = conn.execute(
+            "SELECT week_start, phase, note, target_mileage FROM weekly_plan "
+            "WHERE week_start BETWEEN ? AND ?",
+            (range_start, range_end),
+        ).fetchall()
+        plan_map = {r["week_start"]: dict(r) for r in plan_rows}
+        for w in weeks:
+            plan = plan_map.get(w["week_start"])
+            if plan:
+                w["phase"] = plan.get("phase")
+                w["note"] = plan.get("note")
+                w["target_mileage"] = plan.get("target_mileage")
+
+        conn.close()
+        return jsonify({"weeks": weeks, "year": year})
+
+    @app.route("/api/planning/<week_start>", methods=["POST"])
+    def api_planning_save(week_start):
+        # Validate week_start is a Sunday
+        try:
+            ws = date.fromisoformat(week_start)
+        except ValueError:
+            return jsonify({"ok": False, "error": "Invalid date"}), 400
+        if (ws.weekday() + 1) % 7 != 0:
+            return jsonify({"ok": False, "error": "week_start must be a Sunday"}), 400
+
+        data = request.get_json(force=True)
+        phase = data.get("phase") or None
+        note = data.get("note") or None
+        target_mileage = None
+        if "target_mileage" in data and data["target_mileage"] is not None:
+            try:
+                target_mileage = float(data["target_mileage"])
+            except (ValueError, TypeError):
+                target_mileage = None
+
+        conn = get_db()
+        conn.execute(
+            """INSERT INTO weekly_plan (week_start, phase, note, target_mileage)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(week_start) DO UPDATE SET
+                   phase=excluded.phase, note=excluded.note,
+                   target_mileage=excluded.target_mileage""",
+            (week_start, phase, note, target_mileage),
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "week_start": week_start,
+                        "phase": phase, "note": note, "target_mileage": target_mileage})
 
     return app

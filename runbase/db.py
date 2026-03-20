@@ -198,6 +198,16 @@ CREATE TABLE IF NOT EXISTS planned_activities (
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
+-- Weekly training plan (phase/note/target annotations)
+CREATE TABLE IF NOT EXISTS weekly_plan (
+    id              INTEGER PRIMARY KEY,
+    week_start      TEXT NOT NULL UNIQUE,
+    phase           TEXT,
+    note            TEXT,
+    target_mileage  REAL,
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
 -- Suppressed sources (blocklist for deleted activities)
 CREATE TABLE IF NOT EXISTS suppressed_sources (
     id                INTEGER PRIMARY KEY,
@@ -267,6 +277,8 @@ def _migrate_schema(conn):
         ("activities", "gap_s_per_mi", "REAL"),
         # Computed VDOT (per-activity estimate from GAP + HR)
         ("activities", "computed_vdot", "REAL"),
+        # Weekly plan target mileage
+        ("weekly_plan", "target_mileage", "REAL"),
     ]
 
     existing = {}
@@ -280,6 +292,7 @@ def _migrate_schema(conn):
     # Column renames
     renames = [
         ("intervals", "actual_distance_mi", "gps_measured_distance_mi"),
+        ("weekly_plan", "season", "note"),
     ]
     for table, old_col, new_col in renames:
         if table not in existing:
@@ -312,6 +325,14 @@ def _migrate_schema(conn):
             date            TEXT NOT NULL UNIQUE,
             distance_mi     REAL,
             workout_name    TEXT,
+            created_at      TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS weekly_plan (
+            id              INTEGER PRIMARY KEY,
+            week_start      TEXT NOT NULL UNIQUE,
+            phase           TEXT,
+            note            TEXT,
+            target_mileage  REAL,
             created_at      TEXT DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS suppressed_sources (
