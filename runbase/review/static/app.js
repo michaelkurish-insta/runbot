@@ -16,6 +16,13 @@
     const modalBtnSaveClose = document.getElementById("modal-btn-save-close");
     const modalBtnNew = document.getElementById("modal-btn-new");
 
+    // ── Plan undo stack (Cmd/Ctrl+Z for planning edits) ────────
+    window.planUndoHistory = [];
+    function pushPlanUndo(entry) {
+        window.planUndoHistory.push(entry);
+        if (window.planUndoHistory.length > 50) window.planUndoHistory.shift();
+    }
+
     // ── Modal state ─────────────────────────────────────────────
     let modalMap = null;
     const modalChartRegistry = {};
@@ -64,6 +71,7 @@
                 const newValue = input.value.trim();
                 input.remove();
                 if (save && newValue !== currentValue) {
+                    pushPlanUndo({ type: "override", activityId: id, field: "workout_name", previous: currentValue, cell: cell });
                     cell.textContent = newValue;
                     saveOverride(id, "workout_name", newValue).then(ok => {
                         if (ok) cell.classList.add("overridden");
@@ -113,6 +121,7 @@
                 const newValue = select.value;
                 select.remove();
                 if (save && newValue !== currentValue) {
+                    pushPlanUndo({ type: "override", activityId: id, field: "workout_type_zone", previous: currentValue, cell: cell });
                     cell.textContent = newValue;
                     cell.className = "col-type" + (newValue ? ` zone-${newValue}` : "");
                     if (newValue) {
@@ -216,8 +225,13 @@
             function savePlanned() {
                 const dist = distInput.value.trim();
                 const name = nameInput.value.trim();
+                // Build previous state for undo
+                const prevData = (oldDist || oldName || oldType || oldStrides)
+                    ? { distance_mi: oldDist ? parseFloat(oldDist) : null, workout_name: oldName || null, workout_type_zone: oldType || null, strides: oldStrides ? parseInt(oldStrides) : null }
+                    : null;
                 if (!dist && !name) {
                     if (oldDist || oldName) {
+                        pushPlanUndo({ type: "planned", date: dateStr, previous: prevData });
                         fetch(`/api/planned/${dateStr}`, { method: "DELETE" })
                             .then(r => r.json())
                             .then(() => {
@@ -233,6 +247,7 @@
                 }
                 const type = typeSelect.value.trim().toUpperCase();
                 const stridesVal = stridesInput.value.trim();
+                pushPlanUndo({ type: "planned", date: dateStr, previous: prevData });
                 fetch(`/api/planned/${dateStr}`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
@@ -486,6 +501,132 @@
             }
         }
     });
+
+    // ── Cmd/Ctrl+Z: undo planning edits ──────────────────────────
+    document.addEventListener("keydown", (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === "z" && !e.shiftKey) {
+            if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
+            if (window.planUndoHistory.length === 0) return;
+            e.preventDefault();
+            planUndo();
+        }
+    });
+
+    function planUndo() {
+        const entry = window.planUndoHistory.pop();
+        if (!entry) return;
+
+        if (entry.type === "planned") {
+            if (!entry.previous) {
+                // Was empty before → delete the planned activity
+                fetch(`/api/planned/${entry.date}`, { method: "DELETE" })
+                    .then(r => r.json())
+                    .then(() => restorePlannedRow(entry.date, null));
+            } else {
+                // Had data before → restore it
+                fetch(`/api/planned/${entry.date}`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(entry.previous),
+                }).then(r => r.json())
+                  .then(d => { if (d.ok) restorePlannedRow(entry.date, d); });
+            }
+        } else if (entry.type === "weekly") {
+            // Restore weekly plan fields
+            fetch(`/api/planning/${entry.weekStart}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(entry.previous),
+            }).then(r => r.json())
+              .then(() => restoreWeeklyRow(entry.weekStart, entry.previous));
+        } else if (entry.type === "override") {
+            const prev = entry.previous;
+            const cell = entry.cell;
+            if (prev) {
+                saveOverride(entry.activityId, entry.field, prev).then(ok => {
+                    if (!ok) return;
+                    cell.textContent = prev;
+                    if (entry.field === "workout_type_zone") {
+                        cell.className = "col-type" + (prev ? ` zone-${prev}` : "");
+                    }
+                });
+            } else {
+                clearOverride(entry.activityId, entry.field).then(ok => {
+                    if (!ok) return;
+                    cell.textContent = "";
+                    cell.classList.remove("overridden");
+                    if (entry.field === "workout_type_zone") {
+                        cell.className = "col-type";
+                    }
+                });
+            }
+        }
+    }
+
+    function restorePlannedRow(dateStr, data) {
+        const row = document.querySelector(`tr[data-date="${dateStr}"]`);
+        if (!row) return;
+        // Remove everything after the first 5 columns (date, dow, wk-mi, 7d-mi, 30d-mi)
+        while (row.children.length > 5) row.removeChild(row.lastChild);
+        if (data && (data.distance_mi || data.workout_name)) {
+            const dTd = document.createElement("td");
+            dTd.className = "col-dist planned-dist";
+            dTd.textContent = data.distance_mi ? parseFloat(data.distance_mi).toFixed(1) : "";
+            row.appendChild(dTd);
+            const nTd = document.createElement("td");
+            nTd.className = "col-name planned-name";
+            nTd.textContent = data.workout_name || "";
+            row.appendChild(nTd);
+            const tTd = document.createElement("td");
+            tTd.className = "col-type planned-type" + (data.workout_type_zone ? " zone-" + data.workout_type_zone : "");
+            tTd.textContent = data.workout_type_zone || "";
+            row.appendChild(tTd);
+            const sTd = document.createElement("td");
+            sTd.className = "col-strides planned-strides";
+            sTd.textContent = data.strides || "";
+            row.appendChild(sTd);
+            for (let i = 0; i < 4; i++) row.appendChild(document.createElement("td"));
+            const iTd = document.createElement("td");
+            iTd.className = "col-iscore planned-iscore";
+            iTd.textContent = data.estimated_iscore ? data.estimated_iscore.toFixed(1) : "";
+            row.appendChild(iTd);
+            for (let j = 0; j < 4; j++) row.appendChild(document.createElement("td"));
+            row.classList.add("planned-row");
+            row.classList.remove("future-row");
+        } else {
+            const td = document.createElement("td");
+            td.colSpan = 13;
+            row.appendChild(td);
+            row.classList.remove("planned-row");
+            if (!row.classList.contains("future-row")) row.classList.add("future-row");
+        }
+        refreshSevenDayMA(dateStr);
+    }
+
+    function restoreWeeklyRow(weekStart, previous) {
+        const row = document.querySelector(`tr[data-week-start="${weekStart}"]`);
+        if (!row) return;
+        row.querySelectorAll(".planning-editable").forEach(cell => {
+            const f = cell.dataset.field;
+            const val = previous[f];
+            if (f === "target_mileage") {
+                cell.dataset.target = val != null ? val : "";
+                const actual = parseFloat(cell.dataset.actual) || 0;
+                if (val != null) {
+                    if (actual > 0) {
+                        cell.innerHTML = `<span class="planning-target">${parseFloat(val).toFixed(1)}</span>`
+                            + `<span class="planning-actual">(${actual.toFixed(1)})</span>`;
+                    } else {
+                        cell.textContent = parseFloat(val).toFixed(1);
+                    }
+                } else {
+                    cell.textContent = actual > 0 ? actual.toFixed(1) : "";
+                }
+            } else {
+                cell.textContent = val || "";
+            }
+        });
+    }
 
     // ── Load data into modal ────────────────────────────────────
 
@@ -3377,6 +3518,17 @@
         const weekStart = row.dataset.weekStart;
         const oldHtml = cell.innerHTML;
 
+        // Capture full row state before any edits (for undo)
+        const prevRowState = {};
+        row.querySelectorAll(".planning-editable").forEach(c => {
+            const f = c.dataset.field;
+            if (f === "target_mileage") {
+                prevRowState[f] = c.dataset.target ? parseFloat(c.dataset.target) : null;
+            } else {
+                prevRowState[f] = c.textContent.trim() || null;
+            }
+        });
+
         // For target_mileage, use data-target as the editable value
         const editValue = field === "target_mileage"
             ? (cell.dataset.target || "")
@@ -3393,6 +3545,10 @@
 
         function save() {
             const newValue = input.value.trim();
+            // Push undo entry before mutating DOM (only if value changed)
+            if (newValue !== editValue) {
+                pushPlanUndo({ type: "weekly", weekStart: weekStart, previous: prevRowState });
+            }
             if (field === "target_mileage") {
                 const numVal = newValue ? parseFloat(newValue) : null;
                 cell.dataset.target = numVal != null && !isNaN(numVal) ? numVal : "";
