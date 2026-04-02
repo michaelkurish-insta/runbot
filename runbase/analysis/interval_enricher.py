@@ -285,7 +285,8 @@ def _load_activity(conn, activity_id: int) -> dict | None:
     """Load activity row as a dict."""
     row = conn.execute(
         """SELECT id, date, distance_mi, duration_s, workout_category, workout_name,
-                  total_ascent_ft, total_descent_ft, avg_hr
+                  total_ascent_ft, total_descent_ft, avg_hr, start_time,
+                  temperature_f
            FROM activities WHERE id = ?""",
         (activity_id,),
     ).fetchone()
@@ -295,6 +296,7 @@ def _load_activity(conn, activity_id: int) -> dict | None:
         "id": row[0], "date": row[1], "distance_mi": row[2],
         "duration_s": row[3], "workout_category": row[4], "workout_name": row[5],
         "total_ascent_ft": row[6], "total_descent_ft": row[7], "avg_hr": row[8],
+        "start_time": row[9], "temperature_f": row[10],
     }
 
 
@@ -304,7 +306,8 @@ def _load_intervals(conn, activity_id: int) -> list[dict]:
         """SELECT id, rep_number, gps_measured_distance_mi, canonical_distance_mi,
                   duration_s, avg_pace_s_per_mi, avg_pace_display, avg_hr, avg_cadence,
                   is_recovery, start_timestamp_s, end_timestamp_s, source, is_race,
-                  set_number, elapsed_pace_zone
+                  set_number, elapsed_pace_zone, is_stride, is_walking, is_hill_sprint,
+                  pace_zone, location_type
            FROM intervals WHERE activity_id = ? ORDER BY rep_number""",
         (activity_id,),
     ).fetchall()
@@ -318,6 +321,11 @@ def _load_intervals(conn, activity_id: int) -> list[dict]:
             "is_race": bool(r[13]) if r[13] else False,
             "set_number": r[14],
             "elapsed_pace_zone": r[15],
+            "is_stride": bool(r[16]) if r[16] else False,
+            "is_walking": bool(r[17]) if r[17] else False,
+            "is_hill_sprint": bool(r[18]) if r[18] else False,
+            "pace_zone": r[19],
+            "location_type": r[20],
         }
         for r in rows
     ]
@@ -1111,10 +1119,21 @@ def enrich_activity(conn, activity_id: int, config: dict,
     # --- Compute grade-adjusted pace (GAP) from stream altitude data ---
     gap = _compute_gap(streams)
 
-    # --- Compute elevation gain/loss from streams to fill missing values ---
+    # --- Compute elevation gain/loss ---
+    # No ingest source provides descent (column doesn't exist on
+    # activity_sources), so any value already on the activity was written by a
+    # prior enrichment from noisy GPS stream altitude.  Use the device's
+    # barometric ascent as the canonical source; approximate descent = ascent
+    # (valid for loop / out-and-back runs).  Only fall back to stream-computed
+    # values when the device didn't report ascent at all.
     stream_gain, stream_loss = _compute_elevation(streams)
-    ascent = activity.get("total_ascent_ft") or stream_gain
-    descent = activity.get("total_descent_ft") or stream_loss
+    src_ascent = activity.get("total_ascent_ft")
+    if src_ascent is not None:
+        ascent = src_ascent
+        descent = src_ascent  # best available proxy
+    else:
+        ascent = stream_gain
+        descent = stream_loss
 
     # --- Compute per-activity VDOT estimate from GAP + HR ---
     hr_max = config.get("athlete", {}).get("hr_max")
@@ -1122,24 +1141,67 @@ def enrich_activity(conn, activity_id: int, config: dict,
         gap, activity.get("avg_hr"), hr_max,
     )
 
+    # --- Weather enrichment ---
+    # Only fetch if not already populated (skip re-enrichment overhead).
+    temperature_f = activity.get("temperature_f")
+    humidity_pct = None
+    weather_conditions = None
+    if temperature_f is None and activity.get("start_time") and activity.get("duration_s"):
+        from datetime import datetime, timedelta
+        from runbase.analysis.weather import fetch_weather
+
+        try:
+            start_dt = datetime.fromisoformat(activity["start_time"])
+        except (ValueError, TypeError):
+            start_dt = None
+
+        if start_dt and streams:
+            target_offset = activity["duration_s"] * 2 / 3
+            # Find GPS coords from streams at closest timestamp to 2/3 offset
+            first_ts = streams[0].get("timestamp_s") or 0
+            target_ts = first_ts + target_offset
+            best_pt = None
+            best_diff = float("inf")
+            for s in streams:
+                if s.get("lat") is None or s.get("timestamp_s") is None:
+                    continue
+                diff = abs(s["timestamp_s"] - target_ts)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_pt = s
+
+            if best_pt and best_pt.get("lat") is not None:
+                target_dt = start_dt + timedelta(seconds=target_offset)
+                weather = fetch_weather(
+                    best_pt["lat"], best_pt["lon"], target_dt, verbose=verbose,
+                )
+                if weather:
+                    temperature_f = weather["temperature_f"]
+                    humidity_pct = weather["humidity_pct"]
+                    weather_conditions = weather["weather_conditions"]
+
     if "distance_mi" in overrides:
         conn.execute(
             "UPDATE activities SET vdot = ?, duration_s = ?, "
             "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ?, "
             "gap_s_per_mi = ?, total_ascent_ft = ?, total_descent_ft = ?, "
-            "computed_vdot = ? WHERE id = ?",
+            "computed_vdot = ?, temperature_f = ?, humidity_pct = ?, "
+            "weather_conditions = ? WHERE id = ?",
             (vdot, act_dur or activity.get("duration_s"), avg_pace, avg_pace_display,
-             stride_count, gap, ascent, descent, computed_vdot, activity_id),
+             stride_count, gap, ascent, descent, computed_vdot,
+             temperature_f, humidity_pct, weather_conditions, activity_id),
         )
     else:
         conn.execute(
             "UPDATE activities SET adjusted_distance_mi = ?, vdot = ?, duration_s = ?, "
             "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ?, "
             "gap_s_per_mi = ?, total_ascent_ft = ?, total_descent_ft = ?, "
-            "computed_vdot = ? WHERE id = ?",
+            "computed_vdot = ?, temperature_f = ?, humidity_pct = ?, "
+            "weather_conditions = ? WHERE id = ?",
             (adjusted_distance, vdot, act_dur or activity.get("duration_s"),
              avg_pace, avg_pace_display, stride_count, gap, ascent, descent,
-             computed_vdot, activity_id),
+             computed_vdot, temperature_f, humidity_pct, weather_conditions,
+             activity_id),
         )
 
     conn.commit()

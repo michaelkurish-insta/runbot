@@ -1448,6 +1448,10 @@
                 <label>Elevation</label>
                 <span style="padding:3px 6px;font-size:12px">${meta.total_ascent_ft != null || meta.total_descent_ft != null ? `\u25B2${Math.round(meta.total_ascent_ft || 0)}ft \u25BC${Math.round(meta.total_descent_ft || 0)}ft` : "\u2014"}</span>
             </div>
+            <div class="edit-row">
+                <label>Weather</label>
+                <span style="padding:3px 6px;font-size:12px">${meta.temperature_f != null ? `${Math.round(meta.temperature_f)}\u00B0F` + (meta.humidity_pct != null ? `  ${Math.round(meta.humidity_pct)}%` : "") + (meta.weather_conditions ? `  ${meta.weather_conditions}` : "") : "\u2014"}</span>
+            </div>
             <div class="edit-row" data-field-row="avg_hr">
                 <label>Avg HR</label>
                 <input type="number" step="0.1" data-field="avg_hr" value="${meta.avg_hr != null ? parseFloat(meta.avg_hr).toFixed(1) : ""}" placeholder="${meta.avg_hr != null ? parseFloat(meta.avg_hr).toFixed(1) : ""}">

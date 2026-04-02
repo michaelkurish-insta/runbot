@@ -279,6 +279,10 @@ def _migrate_schema(conn):
         ("activities", "computed_vdot", "REAL"),
         # Weekly plan target mileage
         ("weekly_plan", "target_mileage", "REAL"),
+        # Weather data
+        ("activities", "temperature_f", "REAL"),
+        ("activities", "humidity_pct", "REAL"),
+        ("activities", "weather_conditions", "TEXT"),
     ]
 
     existing = {}

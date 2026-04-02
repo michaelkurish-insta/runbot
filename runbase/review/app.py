@@ -1365,6 +1365,9 @@ def create_app(config=None):
             "display_gap": _format_pace_tenths(a.get("gap_s_per_mi")),
             "total_ascent_ft": a.get("total_ascent_ft"),
             "total_descent_ft": a.get("total_descent_ft"),
+            "temperature_f": a.get("temperature_f"),
+            "humidity_pct": a.get("humidity_pct"),
+            "weather_conditions": a.get("weather_conditions") or "",
             "overridden_fields": overridden,
         })
 
@@ -1808,6 +1811,10 @@ def create_app(config=None):
             "SELECT source_id FROM activity_sources WHERE activity_id = ? AND source = 'strava' AND source_id IS NOT NULL",
             (activity_id,),
         ).fetchall()
+        garmin_sources = conn.execute(
+            "SELECT source_id FROM activity_sources WHERE activity_id = ? AND source = 'garmin' AND source_id IS NOT NULL",
+            (activity_id,),
+        ).fetchall()
         fit_sources = conn.execute(
             "SELECT raw_file_path FROM activity_sources WHERE activity_id = ? AND source = 'healthfit' AND raw_file_path IS NOT NULL",
             (activity_id,),
@@ -1822,6 +1829,11 @@ def create_app(config=None):
                 "INSERT OR IGNORE INTO suppressed_sources (source, source_identifier, reason) VALUES ('strava', ?, 'user_delete')",
                 (r["source_id"],),
             )
+        for r in garmin_sources:
+            conn.execute(
+                "INSERT OR IGNORE INTO suppressed_sources (source, source_identifier, reason) VALUES ('garmin', ?, 'user_delete')",
+                (r["source_id"],),
+            )
         for r in fit_sources:
             conn.execute(
                 "INSERT OR IGNORE INTO suppressed_sources (source, source_identifier, reason) VALUES ('healthfit', ?, 'user_delete')",
@@ -1833,10 +1845,15 @@ def create_app(config=None):
                 (r["file_hash"],),
             )
 
-        # Clean up matching orphaned Strava sources
+        # Clean up matching orphaned Strava/Garmin sources
         for r in strava_sources:
             conn.execute(
                 "DELETE FROM activity_sources WHERE source = 'strava' AND source_id = ? AND activity_id IS NULL",
+                (r["source_id"],),
+            )
+        for r in garmin_sources:
+            conn.execute(
+                "DELETE FROM activity_sources WHERE source = 'garmin' AND source_id = ? AND activity_id IS NULL",
                 (r["source_id"],),
             )
 
@@ -2297,9 +2314,9 @@ def create_app(config=None):
                       COALESCE(SUM(COALESCE(a.adjusted_distance_mi, a.distance_mi, 0)), 0) as total_miles,
                       MIN(a.date) as first_use,
                       MAX(a.date) as last_use,
-                      CASE WHEN SUM(COALESCE(a.adjusted_distance_mi, a.distance_mi, 0)) > 0
-                           AND SUM(COALESCE(a.duration_s, 0)) > 0
-                           THEN SUM(COALESCE(a.duration_s, 0)) / SUM(COALESCE(a.adjusted_distance_mi, a.distance_mi, 0))
+                      CASE WHEN SUM(CASE WHEN a.duration_s > 0 THEN COALESCE(a.adjusted_distance_mi, a.distance_mi, 0) ELSE 0 END) > 0
+                           THEN SUM(CASE WHEN a.duration_s > 0 THEN a.duration_s ELSE 0 END)
+                                / SUM(CASE WHEN a.duration_s > 0 THEN COALESCE(a.adjusted_distance_mi, a.distance_mi, 0) ELSE 0 END)
                            ELSE NULL END as avg_pace
                FROM shoes s
                LEFT JOIN activities a ON a.shoe_id = s.id
