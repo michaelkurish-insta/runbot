@@ -277,12 +277,18 @@ def _migrate_schema(conn):
         ("activities", "gap_s_per_mi", "REAL"),
         # Computed VDOT (per-activity estimate from GAP + HR)
         ("activities", "computed_vdot", "REAL"),
-        # Weekly plan target mileage
+        # Weekly plan target mileage / intensity
         ("weekly_plan", "target_mileage", "REAL"),
+        ("weekly_plan", "target_intensity", "REAL"),
         # Weather data
         ("activities", "temperature_f", "REAL"),
         ("activities", "humidity_pct", "REAL"),
         ("activities", "weather_conditions", "TEXT"),
+        ("activities", "cloud_cover_pct", "REAL"),
+        # Data quality flags
+        ("activities", "suppress_hr", "INTEGER"),
+        ("activities", "suppress_cadence", "INTEGER"),
+        ("activities", "exclude_from_vdot", "INTEGER"),
     ]
 
     existing = {}
@@ -337,6 +343,7 @@ def _migrate_schema(conn):
             phase           TEXT,
             note            TEXT,
             target_mileage  REAL,
+            target_intensity REAL,
             created_at      TEXT DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS suppressed_sources (

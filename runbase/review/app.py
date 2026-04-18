@@ -90,7 +90,7 @@ def create_app(config=None):
         ).fetchall()
         all_cvd = conn.execute(
             "SELECT date, computed_vdot, duration_s FROM activities "
-            "WHERE computed_vdot IS NOT NULL ORDER BY date",
+            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) ORDER BY date",
         ).fetchall()
         cvd_list = [(r[0], r[1], r[2] or 0) for r in all_cvd]
 
@@ -836,7 +836,7 @@ def create_app(config=None):
         avd_seed = (date(year, 1, 1) - timedelta(days=AVD_WINDOW_DAYS)).isoformat()
         avd_cvd_rows = conn.execute(
             "SELECT date, computed_vdot, duration_s FROM activities "
-            "WHERE computed_vdot IS NOT NULL AND date >= ? ORDER BY date",
+            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) AND date >= ? ORDER BY date",
             (avd_seed,),
         ).fetchall()
         avd_cvd_list = [(r[0], r[1], r[2] or 0) for r in avd_cvd_rows]
@@ -974,7 +974,8 @@ def create_app(config=None):
         monthly_stats = []
         yearly_distance = 0.0
         yearly_duration = 0.0
-        yearly_pace_distance = 0.0  # only from activities with duration
+        yearly_pace_distance = 0.0
+        yearly_pace_duration = 0.0
         yearly_count = 0
         longest_run = 0.0
         max_week_dist = 0.0
@@ -984,9 +985,18 @@ def create_app(config=None):
             dist = sum((a.get("adjusted_distance_mi") or a.get("distance_mi") or 0) for a in month_acts)
             dur = sum((a.get("duration_s") or 0) for a in month_acts)
             count = len(month_acts)
-            # Pace: only count distance from activities that have duration
-            pace_dist = sum((a.get("adjusted_distance_mi") or a.get("distance_mi") or 0) for a in month_acts if a.get("duration_s"))
-            avg_pace = (dur / pace_dist) if pace_dist > 0 else None
+            # Pace: distance-weighted average of per-activity pace (which
+            # already excludes walking time), so stride workouts don't inflate
+            # the monthly average with their walking duration.
+            pace_dist = 0.0
+            pace_dur = 0.0
+            for a in month_acts:
+                d = a.get("adjusted_distance_mi") or a.get("distance_mi") or 0
+                p = a.get("avg_pace_s_per_mi")
+                if a.get("duration_s") and p and d:
+                    pace_dist += d
+                    pace_dur += p * d
+            avg_pace = (pace_dur / pace_dist) if pace_dist > 0 else None
 
             # Average weekly mileage: total miles / number of weeks elapsed
             days_in_m = monthrange(year, m)[1]
@@ -1018,6 +1028,7 @@ def create_app(config=None):
             yearly_distance += dist
             yearly_duration += dur
             yearly_pace_distance += pace_dist
+            yearly_pace_duration += pace_dur
             yearly_count += count
             for a in month_acts:
                 d = a.get("adjusted_distance_mi") or a.get("distance_mi") or 0
@@ -1029,7 +1040,7 @@ def create_app(config=None):
                 max_week_dist = w["distance"]
 
         max_month_dist = max((s["distance"] for s in monthly_stats), default=1) or 1
-        yearly_avg_pace = (yearly_duration / yearly_pace_distance) if yearly_pace_distance > 0 else None
+        yearly_avg_pace = (yearly_pace_duration / yearly_pace_distance) if yearly_pace_distance > 0 else None
 
         # ── Weekly mileage chart data (prior 6 months) ──────────────
         chart_start = (today - timedelta(days=180)).isoformat()
@@ -1368,8 +1379,33 @@ def create_app(config=None):
             "temperature_f": a.get("temperature_f"),
             "humidity_pct": a.get("humidity_pct"),
             "weather_conditions": a.get("weather_conditions") or "",
+            "cloud_cover_pct": a.get("cloud_cover_pct"),
+            "suppress_hr": bool(a.get("suppress_hr")),
+            "suppress_cadence": bool(a.get("suppress_cadence")),
+            "exclude_from_vdot": bool(a.get("exclude_from_vdot")),
             "overridden_fields": overridden,
         })
+
+    @app.route("/api/activity/<int:activity_id>/flags", methods=["POST"])
+    def api_activity_flags(activity_id):
+        data = request.get_json(force=True)
+        conn = get_db()
+        allowed = {"suppress_hr", "suppress_cadence", "exclude_from_vdot"}
+        updates = {}
+        for k in allowed:
+            if k in data:
+                updates[k] = 1 if data[k] else 0
+        if not updates:
+            conn.close()
+            return jsonify({"ok": False, "error": "No valid flags"}), 400
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        conn.execute(
+            f"UPDATE activities SET {set_clause} WHERE id = ?",
+            (*updates.values(), activity_id),
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, **{k: bool(v) for k, v in updates.items()}})
 
     @app.route("/api/activity/<int:activity_id>/splits", methods=["POST"])
     def api_create_split(activity_id):
@@ -2042,7 +2078,8 @@ def create_app(config=None):
             """SELECT date,
                       COALESCE(adjusted_distance_mi, distance_mi, 0) as dist,
                       COALESCE(duration_s, 0) as dur,
-                      duration_s as raw_dur
+                      duration_s as raw_dur,
+                      avg_pace_s_per_mi as pace
                FROM activities
                WHERE date BETWEEN ? AND ?""",
             (f"{year}-01-01", f"{year}-12-31"),
@@ -2050,13 +2087,16 @@ def create_app(config=None):
         conn.close()
 
         # Monthly buckets
-        monthly = {m: {"distance": 0.0, "duration": 0.0, "pace_distance": 0.0, "count": 0, "longest": 0.0} for m in range(1, 13)}
+        # pace_duration uses per-activity pace × distance (running time only,
+        # excludes walking) so stride workouts don't inflate monthly averages.
+        monthly = {m: {"distance": 0.0, "duration": 0.0, "pace_distance": 0.0, "pace_duration": 0.0, "count": 0, "longest": 0.0} for m in range(1, 13)}
         for r in rows:
             m = int(r["date"][5:7])
             monthly[m]["distance"] += r["dist"]
             monthly[m]["duration"] += r["dur"]
-            if r["raw_dur"]:  # only count distance for pace when duration exists
+            if r["raw_dur"] and r["pace"] and r["dist"]:
                 monthly[m]["pace_distance"] += r["dist"]
+                monthly[m]["pace_duration"] += r["pace"] * r["dist"]
             monthly[m]["count"] += 1
             if r["dist"] > monthly[m]["longest"]:
                 monthly[m]["longest"] = r["dist"]
@@ -2064,9 +2104,10 @@ def create_app(config=None):
         yearly_distance = sum(monthly[m]["distance"] for m in range(1, 13))
         yearly_duration = sum(monthly[m]["duration"] for m in range(1, 13))
         yearly_pace_distance = sum(monthly[m]["pace_distance"] for m in range(1, 13))
+        yearly_pace_duration = sum(monthly[m]["pace_duration"] for m in range(1, 13))
         yearly_count = sum(monthly[m]["count"] for m in range(1, 13))
         longest_run = max(monthly[m]["longest"] for m in range(1, 13))
-        yearly_avg_pace = (yearly_duration / yearly_pace_distance) if yearly_pace_distance > 0 else None
+        yearly_avg_pace = (yearly_pace_duration / yearly_pace_distance) if yearly_pace_distance > 0 else None
 
         stats = []
         for m in range(1, 13):
@@ -2080,7 +2121,7 @@ def create_app(config=None):
                 elapsed_days = 0
             elapsed_weeks = elapsed_days / 7.0 if elapsed_days > 0 else 0
             avg_weekly = (s["distance"] / elapsed_weeks) if elapsed_weeks > 0 else 0
-            avg_pace = (s["duration"] / s["pace_distance"]) if s["pace_distance"] > 0 else None
+            avg_pace = (s["pace_duration"] / s["pace_distance"]) if s["pace_distance"] > 0 else None
 
             stats.append({
                 "month": m,
@@ -2469,7 +2510,7 @@ def create_app(config=None):
         cvd_seed = (range_start - timedelta(days=AVD_WINDOW_DAYS)).isoformat()
         cvd_rows = conn.execute(
             "SELECT date, computed_vdot, duration_s FROM activities "
-            "WHERE computed_vdot IS NOT NULL AND date >= ? ORDER BY date",
+            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) AND date >= ? ORDER BY date",
             (cvd_seed,),
         ).fetchall()
         mult = _avd_multiplier(conn)
@@ -2522,7 +2563,7 @@ def create_app(config=None):
         # Load all activities with computed_vdot
         cvd_rows = conn.execute(
             "SELECT date, computed_vdot, duration_s FROM activities "
-            "WHERE computed_vdot IS NOT NULL ORDER BY date",
+            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) ORDER BY date",
         ).fetchall()
 
         cvd_data = [(r[0], r[1], r[2] or 0) for r in cvd_rows]
@@ -2569,6 +2610,164 @@ def create_app(config=None):
             "mae": round(mae, 2) if mae else None,
             "races": results,
         })
+
+    # ── Weather-Adjusted CVD Model ────────────────────────────
+
+    def _wet_bulb_f(temp_f, humidity_pct):
+        """Wet-bulb temperature (Stull 2011 approximation). Input/output in °F."""
+        tc = (temp_f - 32) * 5 / 9
+        rh = humidity_pct
+        wb_c = (
+            tc * math.atan(0.151977 * (rh + 8.313659) ** 0.5)
+            + math.atan(tc + rh)
+            - math.atan(rh - 1.676331)
+            + 0.00391838 * rh ** 1.5 * math.atan(0.023101 * rh)
+            - 4.686035
+        )
+        return wb_c * 9 / 5 + 32
+
+    def _fit_weather_model(conn):
+        """Build training data, fit RandomForest, return results dict."""
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+        rows = conn.execute(
+            """SELECT date, computed_vdot, duration_s,
+                      COALESCE(adjusted_distance_mi, distance_mi) as dist_mi,
+                      temperature_f, humidity_pct, weather_conditions
+               FROM activities
+               WHERE computed_vdot IS NOT NULL
+                 AND NOT COALESCE(exclude_from_vdot, 0)
+                 AND temperature_f IS NOT NULL
+                 AND humidity_pct IS NOT NULL
+                 AND COALESCE(adjusted_distance_mi, distance_mi) >= 3.0
+               ORDER BY date""",
+        ).fetchall()
+
+        if len(rows) < 20:
+            return None
+
+        # Build feature rows with 7d avg CVD lookback
+        features = []
+        for i, r in enumerate(rows):
+            target_date = date.fromisoformat(r["date"])
+            # Compute 7d duration-weighted avg CVD from prior activities
+            tw = 0.0
+            twv = 0.0
+            count = 0
+            for j in range(i - 1, -1, -1):
+                d = date.fromisoformat(rows[j]["date"])
+                delta = (target_date - d).days
+                if delta > 7:
+                    break
+                if delta < 1:
+                    continue
+                dur = rows[j]["duration_s"] or 60
+                tw += dur
+                twv += dur * rows[j]["computed_vdot"]
+                count += 1
+            if count < 2:
+                continue
+            avg_7d_cvd = twv / tw
+
+            temp_f = r["temperature_f"]
+            hum = r["humidity_pct"]
+            wb = _wet_bulb_f(temp_f, hum)
+            cond = (r["weather_conditions"] or "").lower()
+            is_precip = 1 if any(w in cond for w in ("rain", "drizzle", "snow", "thunderstorm")) else 0
+
+            features.append({
+                "date": r["date"],
+                "actual_cvd": r["computed_vdot"],
+                "temperature_f": temp_f,
+                "humidity_pct": hum,
+                "is_precip": is_precip,
+                "avg_7d_cvd": round(avg_7d_cvd, 2),
+                "wet_bulb_f": round(wb, 1),
+                "distance_mi": round(r["dist_mi"], 2) if r["dist_mi"] else 0,
+            })
+
+        if len(features) < 20:
+            return None
+
+        import numpy as np
+        feature_names = ["temperature_f", "humidity_pct", "is_precip",
+                         "avg_7d_cvd", "wet_bulb_f", "distance_mi"]
+        display_names = ["Temperature (°F)", "Humidity (%)", "Precipitation",
+                         "7d Avg CVD", "Wet Bulb (°F)", "Distance (mi)"]
+        X = np.array([[f[k] for k in feature_names] for f in features])
+        y = np.array([f["actual_cvd"] for f in features])
+
+        # Train/test split (80/20)
+        n = len(features)
+        np.random.seed(42)
+        indices = np.random.permutation(n)
+        split = int(n * 0.8)
+        train_idx, test_idx = indices[:split], indices[split:]
+
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        model = RandomForestRegressor(
+            n_estimators=100, max_depth=4, random_state=42,
+        )
+        model.fit(X_train, y_train)
+
+        y_train_pred = model.predict(X_train)
+        y_test_pred = model.predict(X_test)
+
+        train_metrics = {
+            "r2": round(r2_score(y_train, y_train_pred), 4),
+            "rmse": round(mean_squared_error(y_train, y_train_pred) ** 0.5, 2),
+            "mae": round(mean_absolute_error(y_train, y_train_pred), 2),
+        }
+        test_metrics = {
+            "r2": round(r2_score(y_test, y_test_pred), 4),
+            "rmse": round(mean_squared_error(y_test, y_test_pred) ** 0.5, 2),
+            "mae": round(mean_absolute_error(y_test, y_test_pred), 2),
+        }
+
+        importances = model.feature_importances_
+        fi = [{"name": display_names[i], "importance": round(float(importances[i]), 4)}
+              for i in range(len(feature_names))]
+        fi.sort(key=lambda x: x["importance"], reverse=True)
+
+        # Build per-activity results
+        all_pred = model.predict(X)
+        train_set = set(train_idx.tolist())
+        activities = []
+        for i, f in enumerate(features):
+            activities.append({
+                "date": f["date"],
+                "actual_cvd": round(f["actual_cvd"], 2),
+                "predicted_cvd": round(float(all_pred[i]), 2),
+                "residual": round(float(all_pred[i]) - f["actual_cvd"], 2),
+                "split": "train" if i in train_set else "test",
+                "temperature_f": f["temperature_f"],
+                "humidity_pct": f["humidity_pct"],
+                "wet_bulb_f": f["wet_bulb_f"],
+                "avg_7d_cvd": f["avg_7d_cvd"],
+                "distance_mi": f["distance_mi"],
+                "is_precip": f["is_precip"],
+            })
+
+        return {
+            "n_train": int(len(train_idx)),
+            "n_test": int(len(test_idx)),
+            "train": train_metrics,
+            "test": test_metrics,
+            "feature_importances": fi,
+            "activities": activities,
+        }
+
+    @app.route("/api/weather-regression")
+    def api_weather_regression():
+        conn = get_db()
+        result = _fit_weather_model(conn)
+        conn.close()
+        if result is None:
+            return jsonify({"error": "Not enough data"}), 400
+        return jsonify(result)
 
     # ── Planning Tab ────────────────────────────────────────────
 
@@ -2676,13 +2875,14 @@ def create_app(config=None):
                 "phase": None,
                 "note": None,
                 "target_mileage": None,
+                "target_intensity": None,
                 "is_future": saturday >= today,
             })
             sunday += timedelta(days=7)
 
         # Fetch weekly_plan rows and merge
         plan_rows = conn.execute(
-            "SELECT week_start, phase, note, target_mileage FROM weekly_plan "
+            "SELECT week_start, phase, note, target_mileage, target_intensity FROM weekly_plan "
             "WHERE week_start BETWEEN ? AND ?",
             (range_start, range_end),
         ).fetchall()
@@ -2693,6 +2893,7 @@ def create_app(config=None):
                 w["phase"] = plan.get("phase")
                 w["note"] = plan.get("note")
                 w["target_mileage"] = plan.get("target_mileage")
+                w["target_intensity"] = plan.get("target_intensity")
 
         conn.close()
         return jsonify({"weeks": weeks, "year": year})
@@ -2716,19 +2917,28 @@ def create_app(config=None):
                 target_mileage = float(data["target_mileage"])
             except (ValueError, TypeError):
                 target_mileage = None
+        target_intensity = None
+        if "target_intensity" in data and data["target_intensity"] is not None:
+            try:
+                target_intensity = float(data["target_intensity"])
+            except (ValueError, TypeError):
+                target_intensity = None
 
         conn = get_db()
         conn.execute(
-            """INSERT INTO weekly_plan (week_start, phase, note, target_mileage)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO weekly_plan (week_start, phase, note, target_mileage, target_intensity)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(week_start) DO UPDATE SET
                    phase=excluded.phase, note=excluded.note,
-                   target_mileage=excluded.target_mileage""",
-            (week_start, phase, note, target_mileage),
+                   target_mileage=excluded.target_mileage,
+                   target_intensity=excluded.target_intensity""",
+            (week_start, phase, note, target_mileage, target_intensity),
         )
         conn.commit()
         conn.close()
         return jsonify({"ok": True, "week_start": week_start,
-                        "phase": phase, "note": note, "target_mileage": target_mileage})
+                        "phase": phase, "note": note,
+                        "target_mileage": target_mileage,
+                        "target_intensity": target_intensity})
 
     return app

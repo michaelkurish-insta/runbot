@@ -286,7 +286,8 @@ def _load_activity(conn, activity_id: int) -> dict | None:
     row = conn.execute(
         """SELECT id, date, distance_mi, duration_s, workout_category, workout_name,
                   total_ascent_ft, total_descent_ft, avg_hr, start_time,
-                  temperature_f
+                  temperature_f, humidity_pct, weather_conditions, cloud_cover_pct,
+                  suppress_hr
            FROM activities WHERE id = ?""",
         (activity_id,),
     ).fetchone()
@@ -296,7 +297,9 @@ def _load_activity(conn, activity_id: int) -> dict | None:
         "id": row[0], "date": row[1], "distance_mi": row[2],
         "duration_s": row[3], "workout_category": row[4], "workout_name": row[5],
         "total_ascent_ft": row[6], "total_descent_ft": row[7], "avg_hr": row[8],
-        "start_time": row[9], "temperature_f": row[10],
+        "start_time": row[9], "temperature_f": row[10], "humidity_pct": row[11],
+        "weather_conditions": row[12], "cloud_cover_pct": row[13],
+        "suppress_hr": row[14],
     }
 
 
@@ -1136,17 +1139,24 @@ def enrich_activity(conn, activity_id: int, config: dict,
         descent = stream_loss
 
     # --- Compute per-activity VDOT estimate from GAP + HR ---
+    # Skip if HR is suppressed (sensor failure) — CVD would be unreliable.
     hr_max = config.get("athlete", {}).get("hr_max")
-    computed_vdot = effective_vdot_from_gap_and_hr(
-        gap, activity.get("avg_hr"), hr_max,
-    )
+    if activity.get("suppress_hr"):
+        computed_vdot = None
+    else:
+        computed_vdot = effective_vdot_from_gap_and_hr(
+            gap, activity.get("avg_hr"), hr_max,
+        )
 
     # --- Weather enrichment ---
-    # Only fetch if not already populated (skip re-enrichment overhead).
+    # Fetch if any weather field is missing (not just temperature).
     temperature_f = activity.get("temperature_f")
-    humidity_pct = None
-    weather_conditions = None
-    if temperature_f is None and activity.get("start_time") and activity.get("duration_s"):
+    humidity_pct = activity.get("humidity_pct")
+    weather_conditions = activity.get("weather_conditions")
+    cloud_cover_pct = activity.get("cloud_cover_pct")
+    weather_incomplete = (temperature_f is None or humidity_pct is None
+                          or cloud_cover_pct is None)
+    if weather_incomplete and activity.get("start_time") and activity.get("duration_s"):
         from datetime import datetime, timedelta
         from runbase.analysis.weather import fetch_weather
 
@@ -1176,9 +1186,10 @@ def enrich_activity(conn, activity_id: int, config: dict,
                     best_pt["lat"], best_pt["lon"], target_dt, verbose=verbose,
                 )
                 if weather:
-                    temperature_f = weather["temperature_f"]
-                    humidity_pct = weather["humidity_pct"]
-                    weather_conditions = weather["weather_conditions"]
+                    temperature_f = weather.get("temperature_f") or temperature_f
+                    humidity_pct = weather.get("humidity_pct") or humidity_pct
+                    weather_conditions = weather.get("weather_conditions") or weather_conditions
+                    cloud_cover_pct = weather.get("cloud_cover_pct") or cloud_cover_pct
 
     if "distance_mi" in overrides:
         conn.execute(
@@ -1186,10 +1197,11 @@ def enrich_activity(conn, activity_id: int, config: dict,
             "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ?, "
             "gap_s_per_mi = ?, total_ascent_ft = ?, total_descent_ft = ?, "
             "computed_vdot = ?, temperature_f = ?, humidity_pct = ?, "
-            "weather_conditions = ? WHERE id = ?",
+            "weather_conditions = ?, cloud_cover_pct = ? WHERE id = ?",
             (vdot, act_dur or activity.get("duration_s"), avg_pace, avg_pace_display,
              stride_count, gap, ascent, descent, computed_vdot,
-             temperature_f, humidity_pct, weather_conditions, activity_id),
+             temperature_f, humidity_pct, weather_conditions, cloud_cover_pct,
+             activity_id),
         )
     else:
         conn.execute(
@@ -1197,11 +1209,11 @@ def enrich_activity(conn, activity_id: int, config: dict,
             "avg_pace_s_per_mi = ?, avg_pace_display = ?, strides = ?, "
             "gap_s_per_mi = ?, total_ascent_ft = ?, total_descent_ft = ?, "
             "computed_vdot = ?, temperature_f = ?, humidity_pct = ?, "
-            "weather_conditions = ? WHERE id = ?",
+            "weather_conditions = ?, cloud_cover_pct = ? WHERE id = ?",
             (adjusted_distance, vdot, act_dur or activity.get("duration_s"),
              avg_pace, avg_pace_display, stride_count, gap, ascent, descent,
              computed_vdot, temperature_f, humidity_pct, weather_conditions,
-             activity_id),
+             cloud_cover_pct, activity_id),
         )
 
     conn.commit()

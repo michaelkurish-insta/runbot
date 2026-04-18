@@ -609,7 +609,7 @@
         row.querySelectorAll(".planning-editable").forEach(cell => {
             const f = cell.dataset.field;
             const val = previous[f];
-            if (f === "target_mileage") {
+            if (f === "target_mileage" || f === "target_intensity") {
                 cell.dataset.target = val != null ? val : "";
                 const actual = parseFloat(cell.dataset.actual) || 0;
                 if (val != null) {
@@ -1161,6 +1161,41 @@
         return Math.round((vo2 / pctVO2max) * 100) / 100;
     }
 
+    // ── Weather display helper ──────────────────────────────────
+    function formatWeather(meta) {
+        if (meta.temperature_f == null) return "\u2014";
+        const t = Math.round(meta.temperature_f);
+        const parts = [`${t}\u00B0F`];
+        if (meta.humidity_pct != null) {
+            parts.push(`${Math.round(meta.humidity_pct)}% RH`);
+        }
+        // Dew point (Magnus formula, temp in °C)
+        if (meta.humidity_pct != null) {
+            const tc = (meta.temperature_f - 32) * 5 / 9;
+            const rh = meta.humidity_pct;
+            const a = 17.27, b = 237.7;
+            const alpha = (a * tc) / (b + tc) + Math.log(rh / 100);
+            const dpC = (b * alpha) / (a - alpha);
+            const dpF = dpC * 9 / 5 + 32;
+            parts.push(`DP ${Math.round(dpF)}\u00B0`);
+            // Wet bulb (Stull 2011 approximation, temp in °C)
+            const wbC = tc * Math.atan(0.151977 * Math.sqrt(rh + 8.313659))
+                + Math.atan(tc + rh) - Math.atan(rh - 1.676331)
+                + 0.00391838 * Math.pow(rh, 1.5) * Math.atan(0.023101 * rh)
+                - 4.686035;
+            const wbF = wbC * 9 / 5 + 32;
+            parts.push(`WB ${Math.round(wbF)}\u00B0`);
+        }
+        if (meta.cloud_cover_pct != null) {
+            const sun = 100 - Math.round(meta.cloud_cover_pct);
+            parts.push(`\u2600 ${sun}%`);
+        }
+        if (meta.weather_conditions) {
+            parts.push(meta.weather_conditions);
+        }
+        return parts.join("  ");
+    }
+
     // ── Per-activity edit form builder (no per-field save buttons) ──
 
     function formatDurationInput(seconds) {
@@ -1450,7 +1485,7 @@
             </div>
             <div class="edit-row">
                 <label>Weather</label>
-                <span style="padding:3px 6px;font-size:12px">${meta.temperature_f != null ? `${Math.round(meta.temperature_f)}\u00B0F` + (meta.humidity_pct != null ? `  ${Math.round(meta.humidity_pct)}%` : "") + (meta.weather_conditions ? `  ${meta.weather_conditions}` : "") : "\u2014"}</span>
+                <span style="padding:3px 6px;font-size:12px">${formatWeather(meta)}</span>
             </div>
             <div class="edit-row" data-field-row="avg_hr">
                 <label>Avg HR</label>
@@ -1504,6 +1539,14 @@
                 <label>Notes</label>
                 <textarea data-field="notes" rows="2" placeholder="${escapeHtml(meta.notes)}">${escapeHtml(meta.notes)}</textarea>
                 ${resetBtn("notes")}
+            </div>
+            <div class="edit-row data-quality-row">
+                <label>Data</label>
+                <span style="display:flex;gap:12px;align-items:center;font-size:12px">
+                    <label style="width:auto;display:flex;align-items:center;gap:3px"><input type="checkbox" class="flag-cb" data-flag="suppress_hr" data-aid="${aid}" ${meta.suppress_hr ? "checked" : ""}> Suppress HR</label>
+                    <label style="width:auto;display:flex;align-items:center;gap:3px"><input type="checkbox" class="flag-cb" data-flag="suppress_cadence" data-aid="${aid}" ${meta.suppress_cadence ? "checked" : ""}> Suppress Cadence</label>
+                    <label style="width:auto;display:flex;align-items:center;gap:3px"><input type="checkbox" class="flag-cb" data-flag="exclude_from_vdot" data-aid="${aid}" ${meta.exclude_from_vdot ? "checked" : ""}> Exclude from VDOT</label>
+                </span>
             </div>
             <div class="edit-row" data-field-row="splits">
                 <label>Splits</label>
@@ -1678,6 +1721,23 @@
             vdotInput.addEventListener("input", vdotHandler);
             vdotInput.addEventListener("change", vdotHandler);
         }
+
+        // Data quality flag checkboxes — save immediately
+        form.querySelectorAll(".flag-cb").forEach(cb => {
+            cb.addEventListener("change", () => {
+                const flag = cb.dataset.flag;
+                const flagAid = parseInt(cb.dataset.aid);
+                fetch(`/api/activity/${flagAid}/flags`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ [flag]: cb.checked }),
+                });
+                if (flag === "suppress_hr" || flag === "exclude_from_vdot") {
+                    modalNeedsEnrich = true;
+                    updateModalButtons();
+                }
+            });
+        });
 
         // "Add Splits" button — reveals the splits section
         const splitsBtn = form.querySelector(".btn-add-splits");
@@ -3323,6 +3383,107 @@
         if (valid.length > 0) {
             drawRPScatter(valid);
         }
+
+        // ── Weather-Adjusted CVD Model ──
+        try {
+            const wrResp = await fetch("/api/weather-regression");
+            if (wrResp.ok) {
+                const wr = await wrResp.json();
+                let wrHtml = `<hr style="margin:32px 0;border-color:#333">`;
+
+                // Model description
+                wrHtml += `<div class="rp-section">
+                    <h3>Weather-Adjusted CVD Model</h3>
+                    <p class="rp-desc">
+                        A shallow random forest (max depth 4, 100 trees) predicting per-activity
+                        computed VDOT from weather and fitness features. Captures nonlinear effects
+                        like the heat/humidity performance threshold without hand-engineered features.<br><br>
+                        <strong>Features:</strong> temperature, humidity, wet-bulb temp (Stull 2011),
+                        precipitation flag, 7-day avg CVD (duration-weighted), and distance.
+                        Excludes activities under 3 miles (noisy CVD from short reps).
+                        Train/test split is 80/20 with fixed seed for reproducibility.
+                    </p>
+                </div>`;
+
+                // Diagnostics cards
+                wrHtml += `<div class="rp-section">
+                    <h3>Model Diagnostics</h3>
+                    <div class="rp-params">
+                        <div class="rp-param">
+                            <div class="rp-param-label">N (train)</div>
+                            <div class="rp-param-value">${wr.n_train}</div>
+                        </div>
+                        <div class="rp-param">
+                            <div class="rp-param-label">N (test)</div>
+                            <div class="rp-param-value">${wr.n_test}</div>
+                        </div>
+                        <div class="rp-param">
+                            <div class="rp-param-label">Train R²</div>
+                            <div class="rp-param-value">${wr.train.r2.toFixed(4)}</div>
+                        </div>
+                        <div class="rp-param">
+                            <div class="rp-param-label">Test R²</div>
+                            <div class="rp-param-value">${wr.test.r2.toFixed(4)}</div>
+                        </div>
+                        <div class="rp-param">
+                            <div class="rp-param-label">Train RMSE</div>
+                            <div class="rp-param-value">${wr.train.rmse.toFixed(2)}</div>
+                        </div>
+                        <div class="rp-param">
+                            <div class="rp-param-label">Test RMSE</div>
+                            <div class="rp-param-value">${wr.test.rmse.toFixed(2)}</div>
+                        </div>
+                        <div class="rp-param">
+                            <div class="rp-param-label">Train MAE</div>
+                            <div class="rp-param-value">${wr.train.mae.toFixed(2)}</div>
+                        </div>
+                        <div class="rp-param">
+                            <div class="rp-param-label">Test MAE</div>
+                            <div class="rp-param-value">${wr.test.mae.toFixed(2)}</div>
+                        </div>
+                    </div>
+                </div>`;
+
+                // Feature importance table
+                wrHtml += `<div class="rp-section">
+                    <h3>Feature Importances</h3>
+                    <table class="rp-table">
+                        <thead>
+                            <tr>
+                                <th>Feature</th>
+                                <th style="text-align:right">Importance</th>
+                                <th style="width:200px"></th>
+                            </tr>
+                        </thead>
+                        <tbody>`;
+
+                const maxImp = Math.max(...wr.feature_importances.map(f => f.importance));
+                for (const fi of wr.feature_importances) {
+                    const barW = maxImp > 0 ? (fi.importance / maxImp * 100) : 0;
+                    wrHtml += `<tr>
+                        <td>${fi.name}</td>
+                        <td class="num">${(fi.importance * 100).toFixed(1)}%</td>
+                        <td><div style="background:#4a7ab5;height:12px;width:${barW}%;border-radius:2px"></div></td>
+                    </tr>`;
+                }
+
+                wrHtml += `</tbody></table></div>`;
+
+                // Scatter chart
+                wrHtml += `<div class="rp-section">
+                    <h3>Predicted vs Actual CVD</h3>
+                    <canvas id="wr-scatter" width="500" height="400" style="max-width:100%"></canvas>
+                </div>`;
+
+                page.innerHTML += wrHtml;
+
+                if (wr.activities.length > 0) {
+                    drawWRScatter(wr.activities);
+                }
+            }
+        } catch (e) {
+            console.warn("Weather regression fetch failed:", e);
+        }
     }
 
     function drawRPScatter(races) {
@@ -3400,6 +3561,100 @@
         }
     }
 
+    function drawWRScatter(activities) {
+        const canvas = document.getElementById("wr-scatter");
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        const w = canvas.width, h = canvas.height;
+        const pad = { top: 20, right: 20, bottom: 40, left: 50 };
+
+        const all = activities.map(a => a.actual_cvd).concat(activities.map(a => a.predicted_cvd));
+        const lo = Math.floor(Math.min(...all) - 2);
+        const hi = Math.ceil(Math.max(...all) + 2);
+
+        const xPos = v => pad.left + (v - lo) / (hi - lo) * (w - pad.left - pad.right);
+        const yPos = v => h - pad.bottom - (v - lo) / (hi - lo) * (h - pad.top - pad.bottom);
+
+        ctx.clearRect(0, 0, w, h);
+
+        // Perfect prediction line
+        ctx.beginPath();
+        ctx.moveTo(xPos(lo), yPos(lo));
+        ctx.lineTo(xPos(hi), yPos(hi));
+        ctx.strokeStyle = "#ddd";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Grid lines
+        ctx.fillStyle = "#aaa";
+        ctx.font = "10px monospace";
+        ctx.textAlign = "center";
+        for (let v = Math.ceil(lo); v <= hi; v += 5) {
+            ctx.beginPath();
+            ctx.moveTo(xPos(v), h - pad.bottom);
+            ctx.lineTo(xPos(v), pad.top);
+            ctx.strokeStyle = "#f0f0f0";
+            ctx.stroke();
+            ctx.fillText(v, xPos(v), h - pad.bottom + 14);
+        }
+        ctx.textAlign = "right";
+        for (let v = Math.ceil(lo); v <= hi; v += 5) {
+            ctx.beginPath();
+            ctx.moveTo(pad.left, yPos(v));
+            ctx.lineTo(w - pad.right, yPos(v));
+            ctx.strokeStyle = "#f0f0f0";
+            ctx.stroke();
+            ctx.fillText(v, pad.left - 6, yPos(v) + 3);
+        }
+
+        // Axis labels
+        ctx.fillStyle = "#888";
+        ctx.font = "11px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("Actual CVD", (pad.left + w - pad.right) / 2, h - 4);
+        ctx.save();
+        ctx.translate(12, (pad.top + h - pad.bottom) / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillText("Predicted CVD", 0, 0);
+        ctx.restore();
+
+        // Draw train points first (behind), then test points
+        const train = activities.filter(a => a.split === "train");
+        const test = activities.filter(a => a.split === "test");
+
+        for (const a of train) {
+            ctx.beginPath();
+            ctx.arc(xPos(a.actual_cvd), yPos(a.predicted_cvd), 3, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(74, 122, 181, 0.5)";
+            ctx.fill();
+        }
+        for (const a of test) {
+            ctx.beginPath();
+            ctx.arc(xPos(a.actual_cvd), yPos(a.predicted_cvd), 4, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(230, 140, 50, 0.8)";
+            ctx.fill();
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        }
+
+        // Legend
+        ctx.font = "11px sans-serif";
+        ctx.textAlign = "left";
+        const lx = w - pad.right - 110, ly = pad.top + 10;
+        ctx.fillStyle = "rgba(74, 122, 181, 0.5)";
+        ctx.beginPath(); ctx.arc(lx, ly, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#aaa";
+        ctx.fillText("Train", lx + 8, ly + 4);
+
+        ctx.fillStyle = "rgba(230, 140, 50, 0.8)";
+        ctx.beginPath(); ctx.arc(lx, ly + 18, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#aaa";
+        ctx.fillText("Test", lx + 8, ly + 22);
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // ── Planning Tab ─────────────────────────────────────────────
     // ═══════════════════════════════════════════════════════════════
@@ -3467,6 +3722,7 @@
             else if (isFuture) rowClass = "planning-future";
 
             const milesEditable = isFuture ? ' class="planning-editable num" data-field="target_mileage"' : ' class="num"';
+            const intensityEditable = isFuture ? ' class="planning-editable num" data-field="target_intensity"' : ' class="num"';
             const phaseEditable = ' class="planning-editable" data-field="phase"';
             const noteEditable = ' class="planning-editable" data-field="note"';
             const dateColor = MONTH_COLORS[month] || "";
@@ -3486,10 +3742,25 @@
                 milesDisplay = w.total_mileage > 0 ? w.total_mileage.toFixed(1) : "";
             }
 
+            // Intensity display: same target/actual pattern as miles
+            let intensityDisplay = "";
+            if (!isFuture) {
+                intensityDisplay = w.total_intensity > 0 ? w.total_intensity.toFixed(1) : "";
+            } else if (w.target_intensity != null) {
+                if (w.total_intensity > 0) {
+                    intensityDisplay = `<span class="planning-target">${w.target_intensity.toFixed(1)}</span>`
+                        + `<span class="planning-actual">(${w.total_intensity.toFixed(1)})</span>`;
+                } else {
+                    intensityDisplay = w.target_intensity.toFixed(1);
+                }
+            } else {
+                intensityDisplay = w.total_intensity > 0 ? w.total_intensity.toFixed(1) : "";
+            }
+
             html += `<tr class="${rowClass}" data-week-start="${w.week_start}">
                 <td class="planning-week-label" style="background:${dateColor}">${escapeHtml(w.label)}</td>
                 <td${milesEditable} data-target="${w.target_mileage != null ? w.target_mileage : ""}" data-actual="${w.total_mileage}">${milesDisplay}</td>
-                <td class="num">${w.total_intensity > 0 ? w.total_intensity.toFixed(1) : ""}</td>
+                <td${intensityEditable} data-target="${w.target_intensity != null ? w.target_intensity : ""}" data-actual="${w.total_intensity}">${intensityDisplay}</td>
                 <td class="num">${w.run_count || ""}</td>
                 <td${phaseEditable}>${escapeHtml(w.phase || "")}</td>
                 <td${noteEditable}>${escapeHtml(w.note || "")}</td>
@@ -3526,15 +3797,16 @@
         const prevRowState = {};
         row.querySelectorAll(".planning-editable").forEach(c => {
             const f = c.dataset.field;
-            if (f === "target_mileage") {
+            if (f === "target_mileage" || f === "target_intensity") {
                 prevRowState[f] = c.dataset.target ? parseFloat(c.dataset.target) : null;
             } else {
                 prevRowState[f] = c.textContent.trim() || null;
             }
         });
 
-        // For target_mileage, use data-target as the editable value
-        const editValue = field === "target_mileage"
+        // For target_mileage/target_intensity, use data-target as the editable value
+        const isTargetField = field === "target_mileage" || field === "target_intensity";
+        const editValue = isTargetField
             ? (cell.dataset.target || "")
             : cell.textContent.trim();
 
@@ -3553,7 +3825,7 @@
             if (newValue !== editValue) {
                 pushPlanUndo({ type: "weekly", weekStart: weekStart, previous: prevRowState });
             }
-            if (field === "target_mileage") {
+            if (isTargetField) {
                 const numVal = newValue ? parseFloat(newValue) : null;
                 cell.dataset.target = numVal != null && !isNaN(numVal) ? numVal : "";
                 const actual = parseFloat(cell.dataset.actual) || 0;
@@ -3605,7 +3877,7 @@
         const payload = {};
         cells.forEach(c => {
             const f = c.dataset.field;
-            if (f === "target_mileage") {
+            if (f === "target_mileage" || f === "target_intensity") {
                 const v = c.dataset.target;
                 payload[f] = v ? parseFloat(v) : null;
             } else {

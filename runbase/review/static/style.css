@@ -1257,13 +1257,14 @@ header {
 }
 
 /* ── Planning Tab ────────────────────────────────────────────── */
-.planning-page { max-width: 900px; margin: 0 auto; }
+.planning-page { max-width: 900px; margin: 0 auto; padding-top: 0 !important; }
 
 .planning-year-nav {
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 12px;
+    padding-top: 20px;
     margin-bottom: 16px;
 }
 
@@ -1305,6 +1306,7 @@ header {
     padding: 5px 8px;
     text-align: left;
     border-bottom: 1px solid #ddd;
+    box-shadow: 0 1px 0 #ddd;
 }
 
 .planning-table td {

@@ -18,8 +18,8 @@ def cmd_sync(args):
 
     config = load_config()
 
-    if not args.icloud and not args.strava:
-        print("No sync source specified. Use --icloud or --strava.")
+    if not args.icloud and not args.strava and not args.garmin:
+        print("No sync source specified. Use --icloud, --strava, or --garmin.")
         sys.exit(1)
 
     if args.icloud:
@@ -51,6 +51,18 @@ def cmd_sync(args):
             fetch_streams=not args.no_streams,
         )
         _print_strava_summary(result, dry_run=args.dry_run)
+
+    if args.garmin:
+        from runbase.ingest.garmin_sync import sync_garmin
+
+        result = sync_garmin(
+            config,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+            full_history=args.full_history,
+            fetch_fit=not args.no_streams,
+        )
+        _print_garmin_summary(result, dry_run=args.dry_run)
 
 
 def _print_sync_summary(result: dict, dry_run: bool = False):
@@ -91,6 +103,27 @@ def _print_strava_summary(result: dict, dry_run: bool = False):
         for d in result["details"]:
             if d["status"] == "error":
                 print(f"  strava:{d['strava_id']}: {d['error']}")
+
+
+def _print_garmin_summary(result: dict, dry_run: bool = False):
+    prefix = "[DRY RUN] " if dry_run else ""
+    print(f"\n{prefix}Garmin sync complete:")
+    print(f"  Matched:       {result['matched']}")
+    print(f"  Unmatched:     {result['unmatched']}")
+    print(f"  Skipped:       {result['skipped']}")
+    print(f"  Errors:        {result['errors']}")
+    print(f"  Fields filled: {result['fields_filled']}")
+    print(f"  Laps inserted: {result['laps_inserted']}")
+    print(f"  Streams pts:   {result['streams_inserted']}")
+
+    if result["rate_limit_pauses"] > 0:
+        print(f"  Rate pauses:   {result['rate_limit_pauses']}")
+
+    if result["errors"] > 0:
+        print("\nErrors:")
+        for d in result["details"]:
+            if d["status"] == "error":
+                print(f"  garmin:{d['garmin_id']}: {d['error']}")
 
 
 def cmd_import(args):
@@ -558,6 +591,21 @@ def cmd_pipeline(args):
     if verbose or strava_result["matched"]:
         print(f"  {strava_result['matched']} matched, {strava_result['fields_filled']} fields filled")
 
+    # Step 2.5: Garmin sync (if configured)
+    garmin_result = {"matched": 0, "fields_filled": 0}
+    if config.get("garmin", {}).get("token_store"):
+        from pathlib import Path
+        token_store = Path(config["garmin"]["token_store"]).expanduser()
+        if token_store.exists():
+            if verbose:
+                print("\n=== Garmin sync ===")
+            from runbase.ingest.garmin_sync import sync_garmin
+
+            garmin_result = sync_garmin(config, verbose=verbose, fetch_fit=True)
+            if verbose or garmin_result["matched"]:
+                print(f"  {garmin_result['matched']} matched, "
+                      f"{garmin_result['fields_filled']} fields filled")
+
     # Step 2b: Lightweight reconcile — link orphaned Strava sources to activities
     if verbose:
         print("\n=== Reconcile ===")
@@ -610,9 +658,13 @@ def cmd_pipeline(args):
     conn.close()
 
     # Summary
-    print(f"\nPipeline complete: {icloud_result['new']} new, "
-          f"{strava_result['matched']} Strava matched, "
-          f"{len(reconciled_ids)} reconciled")
+    garmin_matched = garmin_result.get("matched", 0)
+    parts = [f"{icloud_result['new']} new",
+             f"{strava_result['matched']} Strava matched"]
+    if garmin_matched:
+        parts.append(f"{garmin_matched} Garmin matched")
+    parts.append(f"{len(reconciled_ids)} reconciled")
+    print(f"\nPipeline complete: {', '.join(parts)}")
 
 
 def cmd_review(args):
@@ -645,6 +697,7 @@ def main():
     sync_parser = subparsers.add_parser("sync", help="Sync data from sources")
     sync_parser.add_argument("--icloud", action="store_true", help="Sync from iCloud HealthFit folder")
     sync_parser.add_argument("--strava", action="store_true", help="Sync from Strava API")
+    sync_parser.add_argument("--garmin", action="store_true", help="Sync from Garmin Connect")
     sync_parser.add_argument("--full-history", action="store_true", help="Ignore last sync timestamp, fetch everything")
     sync_parser.add_argument("--no-streams", action="store_true", help="Skip per-second stream data (faster sync)")
     sync_parser.add_argument("--backfill-laps", action="store_true",
@@ -713,7 +766,7 @@ def main():
 
     # pipeline subcommand (cron-friendly)
     pipeline_parser = subparsers.add_parser(
-        "pipeline", help="Run full sync pipeline: iCloud → Strava → enrich")
+        "pipeline", help="Run full sync pipeline: iCloud → Strava → Garmin → enrich")
     pipeline_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     pipeline_parser.set_defaults(func=cmd_pipeline)
 

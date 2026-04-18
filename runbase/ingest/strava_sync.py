@@ -14,9 +14,11 @@ from stravalib import Client
 
 from runbase.db import get_connection
 from runbase.ingest.fit_parser import format_pace
-
-METERS_PER_MILE = 1609.344
-METERS_TO_FEET = 3.28084
+from runbase.ingest.common import (
+    METERS_PER_MILE, METERS_TO_FEET, FILLABLE_FIELDS,
+    _GENERIC_NAME_PATTERNS, build_activity_lookup, is_generic_name,
+    match_activity, merge_fields, activity_has_intervals, activity_has_streams,
+)
 
 # Strava activity types we care about
 RUNNING_TYPES = {"Run", "TrailRun", "VirtualRun"}
@@ -139,38 +141,8 @@ def _get_client(config: dict) -> Client:
 # ---------------------------------------------------------------------------
 
 def _build_activity_lookup(conn) -> dict:
-    """Load all activities into a dict keyed by date -> list of activity rows.
-
-    Each row is a dict with id, distance_mi, duration_s, start_time, and
-    fields needed for NULL-check merging.
-    """
-    rows = conn.execute(
-        """SELECT id, date, distance_mi, duration_s, start_time,
-                  avg_hr, max_hr, avg_cadence, total_ascent_ft, total_descent_ft,
-                  calories, shoe_id
-           FROM activities"""
-    ).fetchall()
-
-    lookup = {}
-    for r in rows:
-        date = r[0 + 1]  # date is column index 1
-        entry = {
-            "id": r[0],
-            "date": r[1],
-            "distance_mi": r[2],
-            "duration_s": r[3],
-            "start_time": r[4],
-            "avg_hr": r[5],
-            "max_hr": r[6],
-            "avg_cadence": r[7],
-            "total_ascent_ft": r[8],
-            "total_descent_ft": r[9],
-            "calories": r[10],
-            "shoe_id": r[11],
-        }
-        lookup.setdefault(date, []).append(entry)
-
-    return lookup
+    """Load all activities keyed by date. Delegates to common.build_activity_lookup."""
+    return build_activity_lookup(conn)
 
 
 def _load_processed_strava_ids(conn) -> set:
@@ -207,19 +179,13 @@ def _get_last_sync_timestamp(conn) -> datetime | None:
 
 
 def _activity_has_intervals(conn, activity_id: int) -> bool:
-    """Check if an activity already has intervals (from XLSX splits)."""
-    row = conn.execute(
-        "SELECT COUNT(*) FROM intervals WHERE activity_id = ?", (activity_id,)
-    ).fetchone()
-    return row[0] > 0
+    """Check if an activity already has intervals. Delegates to common."""
+    return activity_has_intervals(conn, activity_id)
 
 
 def _activity_has_streams(conn, activity_id: int) -> bool:
-    """Check if an activity already has stream data."""
-    row = conn.execute(
-        "SELECT COUNT(*) FROM streams WHERE activity_id = ?", (activity_id,)
-    ).fetchone()
-    return row[0] > 0
+    """Check if an activity already has stream data. Delegates to common."""
+    return activity_has_streams(conn, activity_id)
 
 
 # ---------------------------------------------------------------------------
@@ -227,45 +193,10 @@ def _activity_has_streams(conn, activity_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def _match_strava_activity(strava_act, lookup: dict, tolerance_pct: float) -> dict | None:
-    """Match a Strava activity to a DB activity by date + distance.
-
-    Returns the matched DB activity dict or None.
-    """
+    """Match a Strava activity to a DB activity by date + distance."""
     strava_date = strava_act.start_date_local.strftime("%Y-%m-%d")
     strava_dist_mi = float(strava_act.distance) / METERS_PER_MILE if strava_act.distance else 0
-
-    # Check date and ±1 day as timezone fallback
-    candidate_dates = [strava_date]
-    dt = strava_act.start_date_local
-    candidate_dates.append((dt - timedelta(days=1)).strftime("%Y-%m-%d"))
-    candidate_dates.append((dt + timedelta(days=1)).strftime("%Y-%m-%d"))
-
-    candidates = []
-    for d in candidate_dates:
-        candidates.extend(lookup.get(d, []))
-
-    if not candidates:
-        return None
-
-    # Score candidates by distance similarity
-    best_match = None
-    best_diff_pct = float("inf")
-
-    for cand in candidates:
-        db_dist = cand["distance_mi"]
-        if db_dist is None or db_dist <= 0:
-            # No distance on DB side — match by date only (lower confidence)
-            if cand["date"] == strava_date and best_match is None:
-                best_match = cand
-                best_diff_pct = 100  # low-confidence sentinel
-            continue
-
-        diff_pct = abs(strava_dist_mi - db_dist) / db_dist * 100
-        if diff_pct <= tolerance_pct and diff_pct < best_diff_pct:
-            best_match = cand
-            best_diff_pct = diff_pct
-
-    return best_match
+    return match_activity(strava_date, strava_dist_mi, lookup, tolerance_pct)
 
 
 # ---------------------------------------------------------------------------
@@ -337,86 +268,14 @@ def _extract_strava_data(strava_act) -> dict:
 # Merge, laps, streams, shoes
 # ---------------------------------------------------------------------------
 
-# Fields Strava can fill (only when NULL on canonical activity)
-FILLABLE_FIELDS = [
-    "start_time", "max_hr", "total_ascent_ft", "total_descent_ft",
-    "calories", "duration_s", "avg_hr", "avg_cadence",
-]
-
-# Generic FIT/Strava default names that should be replaced by real Strava names
-_GENERIC_NAME_PATTERNS = [
-    "Outdoor Running", "Indoor Running", "Treadmill Running",
-    "Morning Run", "Afternoon Run", "Evening Run", "Lunch Run",
-    "Night Run",
-]
-
-
 def _is_generic_name(name: str | None) -> bool:
-    """Check if a workout name is a generic default that should be overridden."""
-    if not name:
-        return True
-    # Match exact generic names and day-prefixed variants like "Monday Morning Run"
-    name_lower = name.lower().strip()
-    for pattern in _GENERIC_NAME_PATTERNS:
-        if name_lower == pattern.lower():
-            return True
-        # "Monday Morning Run", "Tuesday Afternoon Run", etc.
-        if name_lower.endswith(pattern.lower()):
-            return True
-    return False
+    """Check if a workout name is a generic default. Delegates to common."""
+    return is_generic_name(name)
 
 
 def _merge_fields(conn, activity_id: int, strava_data: dict, verbose: bool) -> list:
-    """Fill NULL fields on canonical activity with Strava data. Returns list of filled fields."""
-    # Map strava_data keys to DB column names (most are the same)
-    field_map = {
-        "start_time": "start_time",
-        "max_hr": "max_hr",
-        "total_ascent_ft": "total_ascent_ft",
-        "calories": "calories",
-        "duration_s": "duration_s",
-        "avg_hr": "avg_hr",
-        "avg_cadence": "avg_cadence",
-    }
-
-    # total_descent_ft: Strava doesn't provide descent separately in summary,
-    # but we include it in the fillable list for future use
-    filled = []
-    for strava_key, db_col in field_map.items():
-        strava_val = strava_data.get(strava_key)
-        if strava_val is None:
-            continue
-
-        # Check if DB field is NULL
-        row = conn.execute(
-            f"SELECT {db_col} FROM activities WHERE id = ?", (activity_id,)
-        ).fetchone()
-        if row and row[0] is None:
-            conn.execute(
-                f"UPDATE activities SET {db_col} = ?, updated_at = datetime('now') WHERE id = ?",
-                (strava_val, activity_id),
-            )
-            filled.append(db_col)
-            if verbose:
-                print(f"    FILL {db_col} = {strava_val}")
-
-    # Replace generic workout names with real Strava names
-    strava_name = strava_data.get("name")
-    if strava_name and not _is_generic_name(strava_name):
-        row = conn.execute(
-            "SELECT workout_name FROM activities WHERE id = ?", (activity_id,)
-        ).fetchone()
-        current_name = row[0] if row else None
-        if _is_generic_name(current_name):
-            conn.execute(
-                "UPDATE activities SET workout_name = ?, updated_at = datetime('now') WHERE id = ?",
-                (strava_name, activity_id),
-            )
-            filled.append("workout_name")
-            if verbose:
-                print(f"    NAME '{current_name}' → '{strava_name}'")
-
-    return filled
+    """Fill NULL fields on canonical activity. Delegates to common."""
+    return merge_fields(conn, activity_id, strava_data, verbose)
 
 
 def _insert_activity_source(conn, activity_id: int | None, strava_data: dict,

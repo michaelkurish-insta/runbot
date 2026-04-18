@@ -13,6 +13,10 @@ strava:
 garmin:
   email: "${GARMIN_EMAIL}"
   password: "${GARMIN_PASSWORD}"
+  token_store: "~/runbase/state/garmin_tokens"
+
+pipeline:
+  canonical_source: master_xlsx  # source of truth: master_xlsx, healthfit, strava, garmin
 
 runalyze:
   username: "${RUNALYZE_USERNAME}"

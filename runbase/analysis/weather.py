@@ -1,14 +1,17 @@
 """Fetch historical weather data from Open-Meteo API.
 
 Uses the free Open-Meteo Historical Weather API (no API key required).
-Returns temperature (°F), humidity (%), and conditions for a given
-lat/lon/datetime.
+Falls back to the Forecast API for recent dates (last ~5 days) where
+the archive may have incomplete data.
+
+Returns temperature (°F), humidity (%), cloud cover (%), and conditions
+for a given lat/lon/datetime.
 """
 
 import json
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # WMO Weather interpretation codes
 # https://open-meteo.com/en/docs
@@ -43,64 +46,27 @@ WMO_CODES = {
     99: "Heavy Thunderstorm w/ Hail",
 }
 
+_HOURLY_VARS = "temperature_2m,relative_humidity_2m,weather_code,cloud_cover"
 
-def fetch_weather(lat: float, lon: float, dt: datetime,
-                  verbose: bool = False) -> dict | None:
-    """Fetch weather for a location and time from Open-Meteo.
 
-    Args:
-        lat: Latitude
-        lon: Longitude
-        dt: Datetime of the activity (used to pick the closest hour)
-        verbose: Print debug info
-
-    Returns:
-        {"temperature_f": float, "humidity_pct": float, "weather_conditions": str}
-        or None on failure.
-    """
-    date_str = dt.strftime("%Y-%m-%d")
-    url = (
-        f"https://archive-api.open-meteo.com/v1/archive"
-        f"?latitude={lat:.5f}&longitude={lon:.5f}"
-        f"&start_date={date_str}&end_date={date_str}"
-        f"&hourly=temperature_2m,relative_humidity_2m,weather_code"
-        f"&temperature_unit=fahrenheit"
-        f"&timezone=auto"
-    )
-
-    if verbose:
-        print(f"    Weather API: {lat:.4f},{lon:.4f} on {date_str} hour={dt.hour}")
-
-    try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
-            OSError) as e:
-        if verbose:
-            print(f"    Weather fetch failed: {e}")
-        return None
-
+def _parse_hourly(data: dict, target_hour: int) -> dict | None:
+    """Extract closest-hour weather from an Open-Meteo hourly response."""
     hourly = data.get("hourly")
     if not hourly:
-        if verbose:
-            print("    Weather: no hourly data in response")
         return None
 
     times = hourly.get("time", [])
-    temps = hourly.get("temperature_2m", [])
-    humids = hourly.get("relative_humidity_2m", [])
-    codes = hourly.get("weather_code", [])
-
     if not times:
         return None
 
-    # Pick the hour closest to dt.hour
-    target_hour = dt.hour
+    temps = hourly.get("temperature_2m", [])
+    humids = hourly.get("relative_humidity_2m", [])
+    codes = hourly.get("weather_code", [])
+    clouds = hourly.get("cloud_cover", [])
+
     best_idx = 0
     best_diff = 999
     for i, t in enumerate(times):
-        # times are like "2025-01-15T14:00"
         try:
             h = int(t.split("T")[1].split(":")[0])
         except (IndexError, ValueError):
@@ -113,20 +79,107 @@ def fetch_weather(lat: float, lon: float, dt: datetime,
     temp = temps[best_idx] if best_idx < len(temps) else None
     humid = humids[best_idx] if best_idx < len(humids) else None
     code = codes[best_idx] if best_idx < len(codes) else None
+    cloud = clouds[best_idx] if best_idx < len(clouds) else None
 
     if temp is None:
         return None
 
     conditions = WMO_CODES.get(code, f"Code {code}") if code is not None else ""
 
-    result = {
+    return {
         "temperature_f": round(temp, 1),
         "humidity_pct": round(humid, 1) if humid is not None else None,
         "weather_conditions": conditions,
+        "cloud_cover_pct": round(cloud, 0) if cloud is not None else None,
     }
 
+
+def _fetch_json(url: str, verbose: bool = False) -> dict | None:
+    """Fetch and parse JSON from a URL."""
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
+            OSError) as e:
+        if verbose:
+            print(f"    Weather fetch failed: {e}")
+        return None
+
+
+def fetch_weather(lat: float, lon: float, dt: datetime,
+                  verbose: bool = False) -> dict | None:
+    """Fetch weather for a location and time from Open-Meteo.
+
+    Tries the archive API first; falls back to the forecast API for
+    recent dates where the archive may have incomplete data.
+
+    Returns:
+        {"temperature_f": float, "humidity_pct": float,
+         "weather_conditions": str, "cloud_cover_pct": float}
+        or None on failure.
+    """
+    date_str = dt.strftime("%Y-%m-%d")
+    target_hour = dt.hour
+
     if verbose:
+        print(f"    Weather API: {lat:.4f},{lon:.4f} on {date_str} hour={target_hour}")
+
+    # Try archive API first
+    archive_url = (
+        f"https://archive-api.open-meteo.com/v1/archive"
+        f"?latitude={lat:.5f}&longitude={lon:.5f}"
+        f"&start_date={date_str}&end_date={date_str}"
+        f"&hourly={_HOURLY_VARS}"
+        f"&temperature_unit=fahrenheit"
+        f"&timezone=auto"
+    )
+    data = _fetch_json(archive_url, verbose=verbose)
+    result = _parse_hourly(data, target_hour) if data else None
+
+    # If archive returned incomplete data (missing humidity/clouds),
+    # try the forecast API which covers the last ~7 days
+    if result and (result["humidity_pct"] is None or result["cloud_cover_pct"] is None):
+        days_ago = (datetime.now() - dt).days
+        if days_ago <= 7:
+            if verbose:
+                print(f"    Archive incomplete, trying forecast API...")
+            forecast_url = (
+                f"https://api.open-meteo.com/v1/forecast"
+                f"?latitude={lat:.5f}&longitude={lon:.5f}"
+                f"&start_date={date_str}&end_date={date_str}"
+                f"&hourly={_HOURLY_VARS}"
+                f"&temperature_unit=fahrenheit"
+                f"&timezone=auto"
+            )
+            fdata = _fetch_json(forecast_url, verbose=verbose)
+            fresult = _parse_hourly(fdata, target_hour) if fdata else None
+            if fresult:
+                # Merge: prefer forecast data for missing fields
+                for k in ("humidity_pct", "cloud_cover_pct", "weather_conditions"):
+                    if result[k] is None and fresult[k] is not None:
+                        result[k] = fresult[k]
+
+    # If archive failed entirely, try forecast API for recent dates
+    if result is None:
+        days_ago = (datetime.now() - dt).days
+        if days_ago <= 7:
+            if verbose:
+                print(f"    Archive failed, trying forecast API...")
+            forecast_url = (
+                f"https://api.open-meteo.com/v1/forecast"
+                f"?latitude={lat:.5f}&longitude={lon:.5f}"
+                f"&start_date={date_str}&end_date={date_str}"
+                f"&hourly={_HOURLY_VARS}"
+                f"&temperature_unit=fahrenheit"
+                f"&timezone=auto"
+            )
+            fdata = _fetch_json(forecast_url, verbose=verbose)
+            result = _parse_hourly(fdata, target_hour) if fdata else None
+
+    if result and verbose:
         print(f"    Weather: {result['temperature_f']}°F  "
-              f"{result['humidity_pct']}%  {result['weather_conditions']}")
+              f"{result['humidity_pct']}%  {result['cloud_cover_pct']}% cloud  "
+              f"{result['weather_conditions']}")
 
     return result
