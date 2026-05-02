@@ -100,7 +100,7 @@
                                         </td>
                                         <td class="col-dist planned-dist">{{ '%.1f' % day.planned.distance_mi if day.planned.distance_mi else '' }}</td>
                                         <td class="col-name planned-name">{{ day.planned.workout_name or '' }}</td>
-                                        <td class="col-type planned-type {{ 'zone-' ~ day.planned.workout_type_zone if day.planned.workout_type_zone }}">{{ day.planned.workout_type_zone or '' }}</td>
+                                        <td class="col-type planned-type {{ 'zone-' ~ day.planned.workout_type_zone.split('/')[0] if day.planned.workout_type_zone }}">{{ day.planned.workout_type_zone or '' }}</td>
                                         <td class="col-strides planned-strides">{{ day.planned.strides or '' }}</td>
                                         <td class="col-dur"></td>
                                         <td class="col-pace"></td>

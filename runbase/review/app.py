@@ -192,12 +192,17 @@ def create_app(config=None):
 
         Uses FIT-preferred logic: when an activity has both FIT (NULL source)
         and strava_lap intervals, only FIT intervals are considered.
+
+        When an activity has work intervals at multiple distinct distances,
+        returns a combo type (e.g. "I/R") with zones sorted slowest-first.
         """
         if not activity_ids:
             return {}
         placeholders = ",".join("?" * len(activity_ids))
         rows = conn.execute(
-            f"""SELECT activity_id, pace_zone, source
+            f"""SELECT activity_id, pace_zone, source,
+                       COALESCE(canonical_distance_mi, gps_measured_distance_mi,
+                                prescribed_distance_mi) as dist
                 FROM intervals
                 WHERE activity_id IN ({placeholders})
                   AND pace_zone IS NOT NULL
@@ -222,17 +227,64 @@ def create_app(config=None):
         ).fetchall()
         has_fit = {r["activity_id"] for r in fit_check}
 
-        # Pick highest-priority zone per activity, skipping strava_lap when FIT exists
-        result = {}
+        # Group qualifying intervals per activity (skip strava_lap when FIT exists)
+        by_act = {}
         for r in rows:
             aid = r["activity_id"]
             if r["source"] == "strava_lap" and aid in has_fit:
                 continue
-            zone = r["pace_zone"]
-            prio = ZONE_PRIORITY.get(zone, 0)
-            if prio > ZONE_PRIORITY.get(result.get(aid, ""), 0):
-                result[aid] = zone
+            by_act.setdefault(aid, []).append(r)
+
+        result = {}
+        for aid, intervals in by_act.items():
+            # Cluster by distance: round to nearest 50m bucket
+            dist_clusters = {}
+            for iv in intervals:
+                dist = iv["dist"]
+                if dist and dist > 0:
+                    dist_m = dist * 1609.344
+                    bucket = round(dist_m / 50) * 50
+                else:
+                    bucket = 0
+                dist_clusters.setdefault(bucket, []).append(iv["pace_zone"])
+
+            # Find highest-priority zone per cluster
+            cluster_zones = {}
+            for bucket, zones in dist_clusters.items():
+                best = max(zones, key=lambda z: ZONE_PRIORITY.get(z, 0))
+                cluster_zones[bucket] = best
+
+            unique_zones = set(cluster_zones.values())
+            # E laps in a mixed workout are warmup/cooldown, not a distinct
+            # work type.  Drop E (and M) from combos — "E/I" is just "I".
+            # Keep E or M only when it's the sole zone present.
+            if len(unique_zones) > 1:
+                unique_zones -= {"E", "M"}
+            if len(unique_zones) <= 1:
+                # Single zone — use it directly
+                result[aid] = next(iter(unique_zones)) if unique_zones else ""
+            else:
+                # Multiple zones — combo sorted slowest first (ascending priority)
+                sorted_zones = sorted(unique_zones, key=lambda z: ZONE_PRIORITY.get(z, 0))
+                result[aid] = "/".join(sorted_zones)
+
         return result
+
+    def _zone_for_distance_m(dist_m, combo_zone):
+        """Pick the appropriate zone from a combo type based on rep distance.
+
+        Heuristic: ≤600m → R (or FR if combo contains FR), 601-1200m → I, 1201m+ → T.
+        Only returns zones present in the combo.
+        """
+        parts = combo_zone.split("/")
+        has_fr = "FR" in parts
+        if dist_m <= 600:
+            preferred = "FR" if has_fr else "R"
+        elif dist_m <= 1200:
+            preferred = "I"
+        else:
+            preferred = "T"
+        return preferred if preferred in parts else parts[-1]  # fallback to fastest
 
     # ── Intensity Score ────────────────────────────────────────────
     INTENSITY_PTS_PER_MIN = {
@@ -504,31 +556,47 @@ def create_app(config=None):
                 result["recovery_zone"] = ZONE_ALIASES.get(rec_z, rec_z)
             return result
 
-        # Distance-based: "8x200m", "6x400", "4x1mi", "3x1k"
-        # Finds ALL NxD groups (e.g. "2x600, 3x400, 4x200") and sums them
+        # Distance-based: "8x200m", "6x400", "4x1mi @R", "3x1k @I"
+        # Finds ALL NxD groups (e.g. "2x600 @R, 3x400 @I, 4x200 @FR") and sums them
         dist_pat = re.compile(
-            r'(\d+)\s*x\s*(\d+\.?\d*)\s*(mile|mi|k|km|m)?',
+            r'(\d+)\s*x\s*(\d+\.?\d*)\s*(mile|mi|k|km|m)?(?:\s*@\s*(FR|R|I|T|M|E))?',
             re.IGNORECASE,
         )
         matches = dist_pat.findall(name)
         if matches:
             total_work_mi = 0.0
-            for reps_s, val_s, unit_s in matches:
+            groups = []
+            for reps_s, val_s, unit_s, zone_s in matches:
                 reps = int(reps_s)
                 val = float(val_s)
-                unit = unit_s.lower()
+                unit = unit_s.lower() if unit_s else ""
                 if unit in ("mile", "mi"):
                     dist_mi = val
+                    dist_m = val * 1609.344
                 elif unit in ("k", "km"):
-                    dist_mi = val * 1000 / 1609.344
+                    dist_m = val * 1000
+                    dist_mi = dist_m / 1609.344
                 elif unit == "m":
+                    dist_m = val
                     dist_mi = val / 1609.344
                 else:
-                    dist_mi = val if val <= 10 else val / 1609.344
+                    if val <= 10:
+                        dist_mi = val
+                        dist_m = val * 1609.344
+                    else:
+                        dist_m = val
+                        dist_mi = val / 1609.344
                 total_work_mi += reps * dist_mi
+                groups.append({
+                    "reps": reps,
+                    "dist_mi": dist_mi,
+                    "dist_m": dist_m,
+                    "zone_override": zone_s.upper() if zone_s else None,
+                })
 
             return {
                 "type": "distance",
+                "groups": groups,
                 "total_work_dist_mi": total_work_mi,
             }
 
@@ -631,30 +699,47 @@ def create_app(config=None):
         if structure and structure["type"] == "distance" and zone and zone != "E" and vdot:
             from runbase.analysis.vdot import vdot_to_paces
             paces = vdot_to_paces(vdot)
+            is_combo = "/" in zone
+            groups = structure.get("groups", [])
 
-            work_dist = structure["total_work_dist_mi"]
-            zone_pace = paces.get(zone, e_pace)
-            work_time_min = work_dist * zone_pace / 60
-            work_mult = INTENSITY_PTS_PER_MIN.get(zone, 0.2)
-            score = work_time_min * work_mult
+            score = 0.0
+            total_work_dist = 0.0
+            total_rec_dist = 0.0
 
-            # Recovery by zone
-            if zone == "T":
-                rec_time_min = 0
-                rec_dist = 0
-            elif zone == "R":
-                rec_dist = work_dist
-                rec_time_min = rec_dist * e_pace / 60
-            elif zone == "FR":
-                rec_time_min = work_time_min * 2
-                rec_dist = rec_time_min * 60 / e_pace
-            else:  # I, M
-                rec_time_min = work_time_min * (2 / 3)
-                rec_dist = rec_time_min * 60 / e_pace
+            for g in groups:
+                # Determine zone for this group
+                if g.get("zone_override"):
+                    g_zone = g["zone_override"]
+                elif is_combo:
+                    g_zone = _zone_for_distance_m(g["dist_m"], zone)
+                else:
+                    g_zone = zone
 
-            score += rec_time_min * 0.2
+                g_work_dist = g["reps"] * g["dist_mi"]
+                g_pace = paces.get(g_zone, e_pace)
+                g_work_min = g_work_dist * g_pace / 60
+                g_mult = INTENSITY_PTS_PER_MIN.get(g_zone, 0.2)
+                score += g_work_min * g_mult
+                total_work_dist += g_work_dist
 
-            wucd_dist = max(distance_mi - work_dist - rec_dist - stride_dist, 0)
+                # Recovery by zone
+                if g_zone == "T":
+                    g_rec_min = 0
+                    g_rec_dist = 0
+                elif g_zone == "R":
+                    g_rec_dist = g_work_dist
+                    g_rec_min = g_rec_dist * e_pace / 60
+                elif g_zone == "FR":
+                    g_rec_min = g_work_min * 2
+                    g_rec_dist = g_rec_min * 60 / e_pace
+                else:  # I, M
+                    g_rec_min = g_work_min * (2 / 3)
+                    g_rec_dist = g_rec_min * 60 / e_pace
+
+                score += g_rec_min * 0.2
+                total_rec_dist += g_rec_dist
+
+            wucd_dist = max(distance_mi - total_work_dist - total_rec_dist - stride_dist, 0)
             wucd_time_min = wucd_dist * e_pace / 60
             score += wucd_time_min * 0.2
             score += strides * STRIDE_PTS
@@ -683,6 +768,8 @@ def create_app(config=None):
         a["has_streams"] = a["id"] in has_streams_set
         a["overridden_fields"] = list(overridden)
         a["workout_type_zone"] = ovr.get("workout_type_zone", workout_types.get(a["id"], ""))
+        wtz = a["workout_type_zone"]
+        a["zone_class"] = ("zone-" + wtz.split("/")[0]) if wtz else ""
         a["intensity_score"] = (intensity_scores or {}).get(a["id"])
 
         dt = datetime.strptime(a["date"], "%Y-%m-%d")
@@ -726,13 +813,20 @@ def create_app(config=None):
         merged["has_streams"] = any(a["has_streams"] for a in day_acts)
         merged["overridden_fields"] = list(set().union(*(a["overridden_fields"] for a in day_acts)))
 
-        # Pick highest-priority workout type zone across all activities
+        # Pick highest-priority workout type zone across all activities.
+        # For combo types like "I/R", use the fastest (last) component for priority.
+        def _max_zone_prio(z):
+            if not z:
+                return 0
+            return max(ZONE_PRIORITY.get(part, 0) for part in z.split("/"))
+
         best_zone = ""
         for a in day_acts:
             z = a.get("workout_type_zone", "")
-            if ZONE_PRIORITY.get(z, 0) > ZONE_PRIORITY.get(best_zone, 0):
+            if _max_zone_prio(z) > _max_zone_prio(best_zone):
                 best_zone = z
         merged["workout_type_zone"] = best_zone
+        merged["zone_class"] = ("zone-" + best_zone.split("/")[0]) if best_zone else ""
 
         # Collect names if multiple
         names = [a.get("workout_name") or "" for a in day_acts if a.get("workout_name")]

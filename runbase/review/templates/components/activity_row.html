@@ -13,7 +13,7 @@
     </td>
     <td class="col-dist {{ 'overridden' if 'distance_mi' in a.overridden_fields }}">{{ a.display_distance }}</td>
     <td class="col-name {{ 'overridden' if 'workout_name' in a.overridden_fields }}">{{ a.workout_name or '' }}</td>
-    <td class="col-type {{ 'zone-' + a.workout_type_zone if a.workout_type_zone }}">{{ a.workout_type_zone or '' }}</td>
+    <td class="col-type {{ a.zone_class }}">{{ a.workout_type_zone or '' }}</td>
     <td class="col-strides {{ 'overridden' if 'strides' in a.overridden_fields }}">{{ a.strides if a.strides else '' }}</td>
     <td class="col-dur {{ 'overridden' if 'duration_s' in a.overridden_fields }}">{{ a.display_duration }}</td>
     <td class="col-pace {{ 'overridden' if 'avg_pace_s_per_mi' in a.overridden_fields }}">{{ a.display_pace }}</td>

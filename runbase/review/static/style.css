@@ -1060,6 +1060,24 @@ header {
     font-family: inherit;
 }
 
+.notes-resize-handle {
+    height: 8px;
+    cursor: ns-resize;
+    background: #ddd;
+    border-radius: 0 0 3px 3px;
+    transition: background 0.15s;
+    user-select: none;
+}
+
+.notes-wrap textarea {
+    overflow-y: auto;
+}
+
+.notes-resize-handle:hover,
+.notes-resize-handle.dragging {
+    background: #4a7ab5;
+}
+
 .edit-row input:focus,
 .edit-row select:focus,
 .edit-row textarea:focus {

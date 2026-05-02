@@ -92,7 +92,13 @@
 
     // ── Double-click to edit workout type zone ─────────────────
 
-    const ZONE_OPTIONS = ["", "E", "M", "T", "I", "R", "FR"];
+    const ZONE_OPTIONS = ["", "E", "M", "T", "I", "R", "FR", "T/I", "T/R", "T/FR", "I/R", "I/FR", "R/FR"];
+
+    function zoneClass(zone) {
+        if (!zone) return "";
+        const parts = zone.split("/");
+        return "zone-" + parts[0];
+    }
 
     document.querySelectorAll(".activity-row .col-type").forEach(cell => {
         cell.addEventListener("dblclick", (e) => {
@@ -123,7 +129,7 @@
                 if (save && newValue !== currentValue) {
                     pushPlanUndo({ type: "override", activityId: id, field: "workout_type_zone", previous: currentValue, cell: cell });
                     cell.textContent = newValue;
-                    cell.className = "col-type" + (newValue ? ` zone-${newValue}` : "");
+                    cell.className = "col-type" + (newValue ? ` ${zoneClass(newValue)}` : "");
                     if (newValue) {
                         saveOverride(id, "workout_type_zone", newValue);
                     } else {
@@ -198,11 +204,15 @@
 
             const typeTd = document.createElement("td");
             typeTd.className = "col-type";
-            const typeSelect = document.createElement("input");
-            typeSelect.type = "text";
+            const typeSelect = document.createElement("select");
             typeSelect.className = "planned-input";
-            typeSelect.placeholder = "zone";
-            typeSelect.value = oldType;
+            for (const z of ZONE_OPTIONS) {
+                const opt = document.createElement("option");
+                opt.value = z;
+                opt.textContent = z || "--";
+                if (z === oldType) opt.selected = true;
+                typeSelect.appendChild(opt);
+            }
             typeTd.appendChild(typeSelect);
             row.appendChild(typeTd);
 
@@ -269,7 +279,7 @@
                         nTd.textContent = name;
                         row.appendChild(nTd);
                         const tTd = document.createElement("td");
-                        tTd.className = "col-type planned-type" + (d.workout_type_zone ? " zone-" + d.workout_type_zone : "");
+                        tTd.className = "col-type planned-type" + (d.workout_type_zone ? " " + zoneClass(d.workout_type_zone) : "");
                         tTd.textContent = d.workout_type_zone || "";
                         row.appendChild(tTd);
                         const sTd = document.createElement("td");
@@ -547,7 +557,7 @@
                     if (!ok) return;
                     cell.textContent = prev;
                     if (entry.field === "workout_type_zone") {
-                        cell.className = "col-type" + (prev ? ` zone-${prev}` : "");
+                        cell.className = "col-type" + (prev ? ` ${zoneClass(prev)}` : "");
                     }
                 });
             } else {
@@ -578,7 +588,7 @@
             nTd.textContent = data.workout_name || "";
             row.appendChild(nTd);
             const tTd = document.createElement("td");
-            tTd.className = "col-type planned-type" + (data.workout_type_zone ? " zone-" + data.workout_type_zone : "");
+            tTd.className = "col-type planned-type" + (data.workout_type_zone ? " " + zoneClass(data.workout_type_zone) : "");
             tTd.textContent = data.workout_type_zone || "";
             row.appendChild(tTd);
             const sTd = document.createElement("td");
@@ -1431,7 +1441,7 @@
             }
         }
 
-        const zones = ["", "E", "M", "T", "I", "R", "FR"];
+        const zones = ZONE_OPTIONS;
         let zoneOptions = "";
         for (const z of zones) {
             const sel = meta.workout_type_zone === z ? " selected" : "";
@@ -1535,9 +1545,12 @@
                 <input type="number" step="0.1" class="race-vdot-adjusted" placeholder="VDOT" style="width:60px">
                 <label style="margin-left:4px;width:auto"><input type="checkbox" class="race-tag-cb"> Tag Race</label>
             </div>
-            <div class="edit-row" data-field-row="notes">
-                <label>Notes</label>
-                <textarea data-field="notes" rows="2" placeholder="${escapeHtml(meta.notes)}">${escapeHtml(meta.notes)}</textarea>
+            <div class="edit-row" data-field-row="notes" style="align-items:start">
+                <label style="margin-top:4px">Notes</label>
+                <div class="notes-wrap" style="flex:1;display:flex;flex-direction:column">
+                    <textarea data-field="notes" rows="2" placeholder="${escapeHtml(meta.notes)}" style="resize:none;${localStorage.getItem('notesHeight') ? 'height:' + localStorage.getItem('notesHeight') + 'px' : ''}">${escapeHtml(meta.notes)}</textarea>
+                    <div class="notes-resize-handle"></div>
+                </div>
                 ${resetBtn("notes")}
             </div>
             <div class="edit-row data-quality-row">
@@ -1563,6 +1576,36 @@
         const aid = meta.id;
         const form = container.querySelector(`[data-edit-aid="${aid}"]`);
         if (!form) return;
+
+        // Drag-to-resize notes textarea
+        const notesTA = form.querySelector('textarea[data-field="notes"]');
+        const resizeHandle = form.querySelector('.notes-resize-handle');
+        if (notesTA && resizeHandle) {
+            resizeHandle.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const startY = e.clientY;
+                const startH = notesTA.getBoundingClientRect().height;
+                resizeHandle.classList.add('dragging');
+                document.body.style.userSelect = 'none';
+                document.body.style.cursor = 'ns-resize';
+                const onMove = (ev) => {
+                    ev.preventDefault();
+                    const newH = Math.max(36, startH + (ev.clientY - startY));
+                    notesTA.style.height = newH + 'px';
+                };
+                const onUp = () => {
+                    resizeHandle.classList.remove('dragging');
+                    document.body.style.userSelect = '';
+                    document.body.style.cursor = '';
+                    localStorage.setItem('notesHeight', Math.round(notesTA.getBoundingClientRect().height));
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                };
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+        }
 
         // Store original values
         const originals = {};
@@ -2207,7 +2250,7 @@
             cell.textContent = `${m}:${sec < 10 ? "0" : ""}${sec}`;
         } else if (field === "workout_type_zone") {
             cell.textContent = value || "";
-            cell.className = "col-type" + (value ? ` zone-${value}` : "");
+            cell.className = "col-type" + (value ? ` ${zoneClass(value)}` : "");
         } else if (field === "avg_hr" || field === "max_hr" || field === "avg_cadence") {
             cell.textContent = empty ? "" : Math.round(parseFloat(value));
         }
