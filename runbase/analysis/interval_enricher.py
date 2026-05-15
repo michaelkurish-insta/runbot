@@ -668,7 +668,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
     )
     conn.execute(
         """UPDATE intervals SET
-               canonical_distance_mi = NULL, location_type = NULL,
+               location_type = NULL,
                is_recovery = 0, set_number = NULL
            WHERE activity_id = ? AND source = 'manual'""",
         (activity_id,),

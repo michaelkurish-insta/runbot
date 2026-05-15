@@ -1473,6 +1473,7 @@ def create_app(config=None):
             "temperature_f": a.get("temperature_f"),
             "humidity_pct": a.get("humidity_pct"),
             "weather_conditions": a.get("weather_conditions") or "",
+            "start_time": a.get("start_time"),
             "cloud_cover_pct": a.get("cloud_cover_pct"),
             "suppress_hr": bool(a.get("suppress_hr")),
             "suppress_cadence": bool(a.get("suppress_cadence")),
@@ -1658,11 +1659,20 @@ def create_app(config=None):
                             (activity_id,),
                         ).fetchone()
                         if row:
-                            pace = row["avg_pace_s_per_mi"]
-                            conn.execute(
-                                "UPDATE activities SET avg_pace_display = ? WHERE id = ?",
-                                (_format_pace(pace), activity_id),
-                            )
+                            dur = row["duration_s"]
+                            dist = row["distance_mi"]
+                            if field == "duration_s" and dur and dist and dist > 0:
+                                pace = dur / dist
+                                conn.execute(
+                                    "UPDATE activities SET avg_pace_s_per_mi = ?, avg_pace_display = ? WHERE id = ?",
+                                    (pace, _format_pace(pace), activity_id),
+                                )
+                            else:
+                                pace = row["avg_pace_s_per_mi"]
+                                conn.execute(
+                                    "UPDATE activities SET avg_pace_display = ? WHERE id = ?",
+                                    (_format_pace(pace), activity_id),
+                                )
                 elif field in ("shoe_id", "strides"):
                     conn.execute(
                         f"UPDATE activities SET {field} = ?, updated_at = datetime('now') WHERE id = ?",

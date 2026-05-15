@@ -1110,6 +1110,8 @@
                                         cell.textContent = iv.display_hr;
                                         cell.dataset.raw = iv.avg_hr || "";
                                     }
+                                    modalNeedsEnrich = true;
+                                    updateModalButtons();
                                 } else {
                                     cell.innerHTML = originalHtml;
                                 }
@@ -1496,6 +1498,10 @@
             <div class="edit-row">
                 <label>Weather</label>
                 <span style="padding:3px 6px;font-size:12px">${formatWeather(meta)}</span>
+            </div>
+            <div class="edit-row">
+                <label>Time</label>
+                <span style="padding:3px 6px;font-size:12px">${meta.start_time ? new Date(meta.start_time.replace(" ", "T") + "Z").toLocaleTimeString("en-US", {hour: "numeric", minute: "2-digit", timeZone: "America/New_York"}) : "\u2014"}</span>
             </div>
             <div class="edit-row" data-field-row="avg_hr">
                 <label>Avg HR</label>
