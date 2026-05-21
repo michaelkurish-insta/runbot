@@ -720,8 +720,8 @@ def main():
                                   help="Fetch streams/laps from Strava for newly group-matched orphans")
     reconcile_parser.add_argument("--promote-orphans", action="store_true",
                                   help="Create activities from orphaned Strava sources that have no matching activity")
-    reconcile_parser.add_argument("--promote-since", type=str, default="2025-12-01", metavar="YYYY-MM-DD",
-                                  help="Cutoff date for orphan promotion (default: 2025-12-01)")
+    reconcile_parser.add_argument("--promote-since", type=str, default="2025-07-01", metavar="YYYY-MM-DD",
+                                  help="Cutoff date for orphan promotion (default: 2025-07-01)")
     reconcile_parser.add_argument("--dry-run", action="store_true", help="Show matches without writing")
     reconcile_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     reconcile_parser.set_defaults(func=cmd_reconcile)

@@ -1101,6 +1101,8 @@ def enrich_activity(conn, activity_id: int, config: dict,
         adjusted_distance = float(overrides["distance_mi"])
     if "strides" in overrides:
         stride_count = int(overrides["strides"]) or None
+    if "duration_s" in overrides:
+        act_dur = float(overrides["duration_s"])
 
     # Compute running pace = running_time / adjusted_distance.
     # Running time excludes walking duration so the pace reflects actual running.
