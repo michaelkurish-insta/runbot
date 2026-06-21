@@ -732,7 +732,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
         stream_groups = _split_streams_by_source(streams)
         track_result = {"is_track": False}
         for sg in stream_groups:
-            r = detect_track_activity(conn, activity_id, intervals, sg, track_cfg)
+            r = detect_track_activity(conn, activity_id, intervals, sg, track_cfg, config)
             if r["is_track"] and (not track_result["is_track"]
                                   or r["fit_score"] < track_result.get("fit_score", 1)):
                 track_result = r

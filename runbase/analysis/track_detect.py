@@ -5,11 +5,15 @@ by scanning a sliding window over the GPS stream, computing convex hulls,
 and comparing them to a template oval contour via cv2.matchShapes.
 
 Known track locations are cached in detected_tracks for fast lookup.
+Locations within a configured measured course are excluded from track
+detection to avoid false positives on measured out-and-back routes.
 """
 
 import math
 import numpy as np
 import cv2
+
+from runbase.analysis.locations import is_measured_course
 
 METERS_PER_MILE = 1609.344
 METERS_PER_DEGREE_LAT = 111320.0
@@ -64,8 +68,13 @@ def snap_to_100m(distance_mi: float, snap_m: int = 100) -> float:
 
 
 def _check_known_tracks(conn, centroid_lat: float, centroid_lon: float,
-                        radius_m: float = 200) -> dict | None:
+                        radius_m: float = 200,
+                        config: dict | None = None) -> dict | None:
     """Check if centroid is within radius_m of a known detected track.
+
+    Skips known tracks whose cached location falls within a configured
+    measured course, since those are false positives from out-and-back
+    routes that happened to match the oval template.
 
     Returns the detected_tracks row as a dict, or None.
     """
@@ -73,8 +82,13 @@ def _check_known_tracks(conn, centroid_lat: float, centroid_lon: float,
         "SELECT id, lat, lon, orientation_deg, fit_score FROM detected_tracks"
     ).fetchall()
 
+    full_config = config or {}
+
     for row in rows:
         track_lat, track_lon = row[1], row[2]
+        # Skip cached tracks that overlap a measured course
+        if is_measured_course(track_lat, track_lon, full_config):
+            continue
         dx, dy = latlon_to_local_m(centroid_lat, centroid_lon, track_lat, track_lon)
         dist = math.sqrt(dx ** 2 + dy ** 2)
         if dist <= radius_m:
@@ -87,8 +101,15 @@ def _check_known_tracks(conn, centroid_lat: float, centroid_lon: float,
 
 def _save_detected_track(conn, centroid_lat: float, centroid_lon: float,
                          orientation_deg: float, fit_score: float,
-                         activity_id: int) -> None:
-    """Save a newly detected track location."""
+                         activity_id: int,
+                         config: dict | None = None) -> None:
+    """Save a newly detected track location.
+
+    Skips saving if the centroid falls within a configured measured course
+    to avoid caching false positives.
+    """
+    if config and is_measured_course(centroid_lat, centroid_lon, config):
+        return
     conn.execute(
         """INSERT INTO detected_tracks
            (lat, lon, orientation_deg, fit_score, detected_by_activity_id)
@@ -167,13 +188,16 @@ def _score_window(points_m: np.ndarray, cfg: dict) -> dict | None:
 
 
 def detect_track_activity(conn, activity_id: int, intervals: list[dict],
-                          streams: list[dict], config: dict | None = None
-                          ) -> dict:
+                          streams: list[dict], config: dict | None = None,
+                          full_config: dict | None = None) -> dict:
     """Detect if an activity includes a track portion using sliding window + OpenCV.
 
     Uses a sliding window to scan the GPS stream, computing convex hull shape
     matching against a standard 400m oval template. This approach handles
     activities with warmup/cooldown segments by isolating the track portion.
+
+    Locations within a configured measured course are excluded from both
+    known-track matching and new-track saving to avoid false positives.
 
     Args:
         conn: SQLite connection (for known-track lookup and saving).
@@ -181,6 +205,7 @@ def detect_track_activity(conn, activity_id: int, intervals: list[dict],
         intervals: List of interval dicts.
         streams: List of stream dicts with timestamp_s, lat, lon.
         config: Optional paces.track_detection config dict.
+        full_config: Optional full config dict (for measured course exclusion).
 
     Returns:
         Dict with keys: is_track, fit_score, orientation_deg, method,
@@ -234,8 +259,8 @@ def detect_track_activity(conn, activity_id: int, intervals: list[dict],
         if bbox_x > max_bbox_m or bbox_y > max_bbox_m:
             continue
 
-        # Check known tracks
-        known = _check_known_tracks(conn, c_lat, c_lon, known_radius)
+        # Check known tracks (skips tracks within measured courses)
+        known = _check_known_tracks(conn, c_lat, c_lon, known_radius, full_config)
         if known:
             result["is_track"] = True
             result["fit_score"] = known["fit_score"]
@@ -261,6 +286,12 @@ def detect_track_activity(conn, activity_id: int, intervals: list[dict],
             }
 
     if best_window:
+        # Don't report a track if the best window is within a measured course
+        if full_config and is_measured_course(
+            best_window["centroid_lat"], best_window["centroid_lon"], full_config
+        ):
+            return result
+
         result["is_track"] = True
         result["fit_score"] = round(best_window["score"], 4)
         result["orientation_deg"] = best_window["angle"]
@@ -271,6 +302,7 @@ def detect_track_activity(conn, activity_id: int, intervals: list[dict],
         _save_detected_track(
             conn, best_window["centroid_lat"], best_window["centroid_lon"],
             best_window["angle"], result["fit_score"], activity_id,
+            full_config,
         )
 
     return result
