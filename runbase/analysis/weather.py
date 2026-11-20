@@ -11,7 +11,7 @@ for a given lat/lon/datetime.
 import json
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # WMO Weather interpretation codes
 # https://open-meteo.com/en/docs
@@ -119,6 +119,10 @@ def fetch_weather(lat: float, lon: float, dt: datetime,
          "weather_conditions": str, "cloud_cover_pct": float}
         or None on failure.
     """
+    weather_timezone = "auto"
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+        weather_timezone = "UTC"
     date_str = dt.strftime("%Y-%m-%d")
     target_hour = dt.hour
 
@@ -132,7 +136,7 @@ def fetch_weather(lat: float, lon: float, dt: datetime,
         f"&start_date={date_str}&end_date={date_str}"
         f"&hourly={_HOURLY_VARS}"
         f"&temperature_unit=fahrenheit"
-        f"&timezone=auto"
+        f"&timezone={weather_timezone}"
     )
     data = _fetch_json(archive_url, verbose=verbose)
     result = _parse_hourly(data, target_hour) if data else None
@@ -140,7 +144,7 @@ def fetch_weather(lat: float, lon: float, dt: datetime,
     # If archive returned incomplete data (missing humidity/clouds),
     # try the forecast API which covers the last ~7 days
     if result and (result["humidity_pct"] is None or result["cloud_cover_pct"] is None):
-        days_ago = (datetime.now() - dt).days
+        days_ago = (datetime.now(dt.tzinfo) - dt).days
         if days_ago <= 7:
             if verbose:
                 print(f"    Archive incomplete, trying forecast API...")
@@ -150,7 +154,7 @@ def fetch_weather(lat: float, lon: float, dt: datetime,
                 f"&start_date={date_str}&end_date={date_str}"
                 f"&hourly={_HOURLY_VARS}"
                 f"&temperature_unit=fahrenheit"
-                f"&timezone=auto"
+                f"&timezone={weather_timezone}"
             )
             fdata = _fetch_json(forecast_url, verbose=verbose)
             fresult = _parse_hourly(fdata, target_hour) if fdata else None
@@ -162,7 +166,7 @@ def fetch_weather(lat: float, lon: float, dt: datetime,
 
     # If archive failed entirely, try forecast API for recent dates
     if result is None:
-        days_ago = (datetime.now() - dt).days
+        days_ago = (datetime.now(dt.tzinfo) - dt).days
         if days_ago <= 7:
             if verbose:
                 print(f"    Archive failed, trying forecast API...")
@@ -172,7 +176,7 @@ def fetch_weather(lat: float, lon: float, dt: datetime,
                 f"&start_date={date_str}&end_date={date_str}"
                 f"&hourly={_HOURLY_VARS}"
                 f"&temperature_unit=fahrenheit"
-                f"&timezone=auto"
+                f"&timezone={weather_timezone}"
             )
             fdata = _fetch_json(forecast_url, verbose=verbose)
             result = _parse_hourly(fdata, target_hour) if fdata else None

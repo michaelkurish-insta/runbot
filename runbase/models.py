@@ -75,6 +75,7 @@ class Interval:
     start_timestamp_s: Optional[float] = None
     end_timestamp_s: Optional[float] = None
     source: Optional[str] = None
+    lap_kind: Optional[str] = None
 
 
 @dataclass

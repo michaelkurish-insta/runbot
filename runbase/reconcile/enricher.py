@@ -216,6 +216,11 @@ def promote_orphans(conn, groups: list[list[dict]],
         for orphan in group:
             meta = orphan.get("metadata", {})
             date = orphan["start_date"]
+            # Older Strava metadata stored local wall time with a spurious
+            # +00:00 offset. Strip it before weather enrichment.
+            if meta.get("start_time"):
+                from datetime import datetime
+                meta["start_time"] = datetime.fromisoformat(meta["start_time"]).replace(tzinfo=None).isoformat()
             dist = orphan["distance_mi"] or 0
             dur = orphan["duration_s"] or 0
             avg_pace = dur / dist if dist > 0 else None
@@ -250,6 +255,10 @@ def promote_orphans(conn, groups: list[list[dict]],
             conn.execute(
                 "UPDATE activity_sources SET activity_id = ? WHERE id = ?",
                 (activity_id, orphan["id"]),
+            )
+            conn.execute(
+                "UPDATE processed_files SET activity_id = ? WHERE source = 'strava' AND file_path = ?",
+                (activity_id, f"strava:{orphan['source_id']}"),
             )
             conn.commit()
 

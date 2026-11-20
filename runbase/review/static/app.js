@@ -34,6 +34,9 @@
     let modalDate = null;       // date of the currently open modal's activity
     let modalNewActivityIds = new Set();  // IDs of activities created during this modal session
     let modalNeedsEnrich = false;  // set when stride/recovery/walking toggles fire
+    let modalFlagState = {};    // quality flags are saved with the other edits
+    let modalNeedsRefresh = false;
+    let modalSaving = false;
 
     // ── Row click → open modal ──────────────────────────────────
 
@@ -92,7 +95,7 @@
 
     // ── Double-click to edit workout type zone ─────────────────
 
-    const ZONE_OPTIONS = ["", "E", "M", "T", "I", "R", "FR", "T/I", "T/R", "T/FR", "I/R", "I/FR", "R/FR"];
+    const ZONE_OPTIONS = ["", "E", "M", "T", "CV", "I", "R", "FR", "T/CV", "CV/I", "T/I", "T/R", "T/FR", "I/R", "I/FR", "R/FR"];
 
     function zoneClass(zone) {
         if (!zone) return "";
@@ -381,6 +384,10 @@
         modalDate = row.dataset.date || null;
         modalNewActivityIds = new Set();
         modalNeedsEnrich = false;
+        modalFlagState = {};
+        modalNeedsRefresh = false;
+        modalSaving = false;
+        showModalSaveError("");
 
         // Clean up old chart registry entries
         for (const key of Object.keys(modalChartRegistry)) {
@@ -430,7 +437,7 @@
         }
     }
 
-    function isDirty() {
+    function hasFieldChanges() {
         for (const aid of Object.keys(modalDirtyState)) {
             if (Object.keys(modalDirtyState[aid]).length > 0) return true;
         }
@@ -443,7 +450,12 @@
         return false;
     }
 
+    function isDirty() {
+        return hasFieldChanges() || Object.values(modalFlagState).some(flags => Object.keys(flags).length > 0);
+    }
+
     function confirmDiscard() {
+        if (modalSaving) return false;
         if (!isDirty()) return true;
         return confirm("You have unsaved changes. Discard them?");
     }
@@ -683,18 +695,7 @@
                 // Chart placeholder (renderChartsInModal will fill this)
                 html += `<div class="modal-chart-placeholder" data-chart-aid="${r.aid}"></div>`;
 
-                if (intervals.length) {
-                    html += `<h3>Intervals</h3>`;
-                    html += buildTable(intervals);
-                }
-                if (laps.length) {
-                    html += `<h3 style="margin-top:10px">Laps</h3>`;
-                    html += buildTable(laps);
-                }
-                if (summary && summary.length) {
-                    html += `<h3 style="margin-top:10px">Summary</h3>`;
-                    html += renderSummary(summary);
-                }
+                html += `<div class="activity-interval-tables" data-table-aid="${r.aid}">${buildIntervalTables(r)}</div>`;
 
                 // Edit form inline with this activity's content
                 html += buildEditForm(meta);
@@ -828,13 +829,29 @@
 
     // ── Render intervals + laps ─────────────────────────────────
 
+    function buildIntervalTables(data) {
+        let html = "";
+        for (const [key, label] of [["intervals", "Intervals"], ["laps", "Laps"], ["splits", "Mile splits"]]) {
+            const rows = data[key] || [];
+            if (!rows.length) continue;
+            const fullMiles = rows.slice(0, -1).every(iv => {
+                const distance = iv.gps_measured_distance_mi || iv.canonical_distance_mi || 0;
+                return distance >= 0.98 && distance <= 1.02;
+            });
+            const title = key === "splits" && !fullMiles ? "Automatic splits" : label;
+            html += `<h3>${title}</h3>${buildTable(rows)}`;
+        }
+        if (data.summary && data.summary.length) html += `<h3>Summary</h3>${renderSummary(data.summary)}`;
+        return html;
+    }
+
     function buildTable(rows) {
         if (!rows.length) return "";
 
         let html = `<table class="intervals-table">
             <thead><tr>
                 <th>#</th><th>Distance</th><th>Duration</th><th>Pace</th>
-                <th>HR</th><th>Zone</th>`;
+                <th>HR</th><th>Intensity</th><th class="iv-points" title="Contribution to activity intensity score">Points</th>`;
         html += `<th title="Stride">S</th><th title="Recovery">Rec</th>`;
         html += `<th></th>`;  // walking toggle column
         html += `</tr></thead><tbody>`;
@@ -853,6 +870,8 @@
             const manualLabel = iv.source === "manual_split" ? " (manual)" : "";
 
             const rawDist = iv.canonical_distance_mi || iv.gps_measured_distance_mi || iv.prescribed_distance_mi || 0;
+            const intensityTitle = "Click to edit intensity" + (iv.is_partial_split
+                ? ". Partial mile: excluded from workout type." : "");
 
             let walkBtn = "";
             if (iv.is_walking) {
@@ -867,7 +886,8 @@
                 <td class="iv-editable" data-field="duration_s" data-raw="${iv.duration_s || ""}">${iv.display_duration}</td>
                 <td>${iv.display_pace}</td>
                 <td class="iv-editable" data-field="avg_hr" data-raw="${iv.avg_hr || ""}">${iv.display_hr}</td>
-                <td class="iv-editable ${zoneClass}" data-field="pace_zone" data-raw="${zone}">${zone}${setLabel}${manualLabel}</td>`;
+                <td class="iv-intensity ${zoneClass}"><button type="button" class="iv-zone-trigger" data-interval-id="${iv.id}" data-activity-id="${iv.activity_id}" data-zone="${zone}" data-overridden="${!!iv.zone_overridden}" title="${intensityTitle}" aria-label="Edit intensity for split ${iv.rep_number || ''}: ${zone || 'Auto'}">${zone || "--"}</button>${setLabel}${manualLabel}</td>
+                <td class="iv-points">${(iv.intensity_points || 0).toFixed(2)}</td>`;
             const strideChecked = iv.is_stride ? "checked" : "";
             const recoveryChecked = iv.is_recovery ? "checked" : "";
             html += `<td class="iv-checkbox-cell"><input type="checkbox" class="iv-stride-cb" data-interval-id="${iv.id}" ${strideChecked}></td>`;
@@ -957,6 +977,7 @@
                         } else {
                             tr.classList.toggle("is-recovery", value);
                         }
+                        syncVdotExclusion(d.activity_id, d.exclude_from_vdot, d.vdot_exclusion_source);
                         modalNeedsEnrich = true;
                         updateModalButtons();
                     }
@@ -965,9 +986,77 @@
         });
     }
 
-    const IV_ZONE_OPTIONS = ["", "E", "M", "T", "I", "R", "FR"];
+    const IV_ZONE_OPTIONS = ["", "E", "M", "T", "CV", "I", "R", "FR"];
+    const IV_ZONE_LABELS = { E: "Easy", M: "Marathon", T: "Threshold", CV: "Critical velocity", I: "Interval", R: "Repetition", FR: "Fast repetition" };
 
     function wireIntervalEditing(container) {
+        container.querySelectorAll(".iv-zone-trigger").forEach(trigger => {
+            trigger.addEventListener("click", event => {
+                event.stopPropagation();
+                const cell = trigger.closest("td");
+                if (cell.querySelector("select")) return;
+                const aid = trigger.dataset.activityId;
+                const table = trigger.closest(".activity-interval-tables");
+                const originalValue = trigger.dataset.overridden === "true" ? trigger.dataset.zone : "";
+                const select = document.createElement("select");
+                select.className = "iv-zone-select";
+                select.setAttribute("aria-label", trigger.getAttribute("aria-label"));
+                for (const zone of IV_ZONE_OPTIONS) {
+                    const option = document.createElement("option");
+                    option.value = zone;
+                    option.textContent = zone ? `${IV_ZONE_LABELS[zone]} (${zone})` : `Auto (${trigger.dataset.zone || "--"})`;
+                    select.appendChild(option);
+                }
+                select.value = originalValue;
+                trigger.hidden = true;
+                cell.appendChild(select);
+                let finished = false;
+
+                async function finish(save) {
+                    if (finished) return;
+                    finished = true;
+                    if (!save || select.value === originalValue) {
+                        select.remove();
+                        trigger.hidden = false;
+                        return;
+                    }
+                    select.disabled = true;
+                    try {
+                        const result = await saveIntervalEdit(trigger.dataset.intervalId, "pace_zone", select.value);
+                        if (!result) throw new Error("Intensity could not be saved. Please try again.");
+                        modalNeedsEnrich = true;
+                        updateModalButtons();
+                        const response = await fetch(`/api/activity/${aid}/intervals`);
+                        if (!response.ok) throw new Error("Intensity saved. Reopen this run to refresh the splits.");
+                        refreshIntervalsTable(container, aid, await response.json());
+                    } catch (error) {
+                        let message = table.querySelector(".split-save-error");
+                        if (!message) {
+                            message = document.createElement("p");
+                            message.className = "split-save-error";
+                            message.setAttribute("role", "alert");
+                            table.appendChild(message);
+                        }
+                        message.textContent = error.message;
+                        select.disabled = false;
+                        finished = false;
+                    }
+                }
+                select.addEventListener("change", () => finish(true));
+                select.addEventListener("blur", () => finish(true));
+                select.addEventListener("keydown", event => {
+                    event.stopPropagation();
+                    if (event.key === "Escape") {
+                        event.preventDefault();
+                        finish(false);
+                        trigger.focus();
+                    }
+                });
+                select.focus();
+                // Open the native menu on the same click where supported.
+                try { select.showPicker?.(); } catch (_) { /* keyboard selection still works */ }
+            });
+        });
         container.querySelectorAll(".iv-editable").forEach(cell => {
             cell.addEventListener("dblclick", (e) => {
                 e.stopPropagation();
@@ -979,155 +1068,109 @@
                 const rawValue = cell.dataset.raw;
                 const originalHtml = cell.innerHTML;
 
-                if (field === "pace_zone") {
-                    const select = document.createElement("select");
-                    select.className = "iv-inline-edit";
-                    for (const z of IV_ZONE_OPTIONS) {
-                        const opt = document.createElement("option");
-                        opt.value = z;
-                        opt.textContent = z || "--";
-                        if (z === rawValue) opt.selected = true;
-                        select.appendChild(opt);
-                    }
-                    cell.textContent = "";
-                    cell.appendChild(select);
-                    select.focus();
+                const input = document.createElement("input");
+                input.className = "iv-inline-edit";
 
-                    function finish(save) {
-                        const newVal = select.value;
-                        select.remove();
-                        if (save && newVal !== rawValue) {
-                            saveIntervalEdit(intervalId, field, newVal).then(result => {
-                                if (result) {
-                                    const iv = result.interval;
-                                    const z = iv.pace_zone || "";
-                                    const setLabel = iv.set_number ? ` S${iv.set_number}` : "";
-                                    cell.className = "iv-editable" + (z ? ` zone-${z}` : "");
-                                    cell.textContent = z + setLabel;
-                                    cell.dataset.raw = z;
-                                    tr.className = tr.className.replace(/zone-bg-\w+/g, "");
-                                    if (z) tr.classList.add(`zone-bg-${z}`);
-                                } else {
-                                    cell.innerHTML = originalHtml;
-                                }
-                            });
-                        } else {
-                            cell.innerHTML = originalHtml;
-                        }
-                    }
-
-                    select.addEventListener("change", () => finish(true));
-                    select.addEventListener("keydown", (ev) => {
-                        ev.stopPropagation();
-                        if (ev.key === "Escape") finish(false);
-                    });
-                    select.addEventListener("blur", () => finish(true));
-
-                } else {
-                    const input = document.createElement("input");
-                    input.className = "iv-inline-edit";
-
-                    if (field === "distance") {
-                        const dist = parseFloat(rawValue);
-                        if (dist && dist < 1.0) {
-                            input.type = "number";
-                            input.step = "1";
-                            input.value = Math.round(dist * 1609.344);
-                            input.dataset.unit = "m";
-                        } else {
-                            input.type = "number";
-                            input.step = "0.01";
-                            input.value = dist ? dist.toFixed(2) : "";
-                            input.dataset.unit = "mi";
-                        }
-                    } else if (field === "duration_s") {
-                        input.type = "text";
-                        const dur = parseFloat(rawValue);
-                        if (dur) {
-                            const total = Math.floor(dur);
-                            const tenths = Math.round((dur - total) * 10) % 10;
-                            const m = Math.floor(total / 60);
-                            const s = total % 60;
-                            input.value = `${m}:${s < 10 ? "0" : ""}${s}.${tenths}`;
-                        } else {
-                            input.value = "";
-                        }
-                        input.placeholder = "m:ss.t";
-                    } else if (field === "avg_hr") {
+                if (field === "distance") {
+                    const dist = parseFloat(rawValue);
+                    if (dist && dist < 1.0) {
                         input.type = "number";
                         input.step = "1";
-                        input.value = rawValue ? Math.round(parseFloat(rawValue)) : "";
+                        input.value = Math.round(dist * 1609.344);
+                        input.dataset.unit = "m";
+                    } else {
+                        input.type = "number";
+                        input.step = "0.01";
+                        input.value = dist ? dist.toFixed(2) : "";
+                        input.dataset.unit = "mi";
                     }
-
-                    cell.textContent = "";
-                    cell.appendChild(input);
-                    input.focus();
-                    input.select();
-
-                    function finish(save) {
-                        const val = input.value.trim();
-                        input.remove();
-                        if (save && val !== "") {
-                            let sendValue;
-                            if (field === "distance") {
-                                if (input.dataset.unit === "m") {
-                                    sendValue = parseFloat(val) / 1609.344;
-                                } else {
-                                    sendValue = parseFloat(val);
-                                }
-                                if (isNaN(sendValue) || sendValue <= 0) {
-                                    cell.innerHTML = originalHtml;
-                                    return;
-                                }
-                            } else if (field === "duration_s") {
-                                sendValue = parseDurationPrecise(val);
-                                if (sendValue === null) {
-                                    cell.innerHTML = originalHtml;
-                                    return;
-                                }
-                            } else if (field === "avg_hr") {
-                                sendValue = parseFloat(val);
-                                if (isNaN(sendValue)) {
-                                    cell.innerHTML = originalHtml;
-                                    return;
-                                }
-                            }
-
-                            saveIntervalEdit(intervalId, field, sendValue).then(result => {
-                                if (result) {
-                                    const iv = result.interval;
-                                    if (field === "distance") {
-                                        cell.textContent = iv.display_distance;
-                                        cell.dataset.raw = iv.canonical_distance_mi || iv.gps_measured_distance_mi || iv.prescribed_distance_mi || 0;
-                                        const paceCell = tr.children[3];
-                                        if (paceCell) paceCell.textContent = iv.display_pace;
-                                    } else if (field === "duration_s") {
-                                        cell.textContent = iv.display_duration;
-                                        cell.dataset.raw = iv.duration_s || "";
-                                        const paceCell = tr.children[3];
-                                        if (paceCell) paceCell.textContent = iv.display_pace;
-                                    } else if (field === "avg_hr") {
-                                        cell.textContent = iv.display_hr;
-                                        cell.dataset.raw = iv.avg_hr || "";
-                                    }
-                                    modalNeedsEnrich = true;
-                                    updateModalButtons();
-                                } else {
-                                    cell.innerHTML = originalHtml;
-                                }
-                            });
-                        } else {
-                            cell.innerHTML = originalHtml;
-                        }
+                } else if (field === "duration_s") {
+                    input.type = "text";
+                    const dur = parseFloat(rawValue);
+                    if (dur) {
+                        const total = Math.floor(dur);
+                        const tenths = Math.round((dur - total) * 10) % 10;
+                        const m = Math.floor(total / 60);
+                        const s = total % 60;
+                        input.value = `${m}:${s < 10 ? "0" : ""}${s}.${tenths}`;
+                    } else {
+                        input.value = "";
                     }
-
-                    input.addEventListener("keydown", (ev) => {
-                        ev.stopPropagation();
-                        if (ev.key === "Enter") finish(true);
-                        if (ev.key === "Escape") finish(false);
-                    });
-                    input.addEventListener("blur", () => finish(true));
+                    input.placeholder = "m:ss.t";
+                } else if (field === "avg_hr") {
+                    input.type = "number";
+                    input.step = "1";
+                    input.value = rawValue ? Math.round(parseFloat(rawValue)) : "";
                 }
+
+                cell.textContent = "";
+                cell.appendChild(input);
+                input.focus();
+                input.select();
+
+                function finish(save) {
+                    const val = input.value.trim();
+                    input.remove();
+                    if (save && val !== "") {
+                        let sendValue;
+                        if (field === "distance") {
+                            if (input.dataset.unit === "m") {
+                                sendValue = parseFloat(val) / 1609.344;
+                            } else {
+                                sendValue = parseFloat(val);
+                            }
+                            if (isNaN(sendValue) || sendValue <= 0) {
+                                cell.innerHTML = originalHtml;
+                                return;
+                            }
+                        } else if (field === "duration_s") {
+                            sendValue = parseDurationPrecise(val);
+                            if (sendValue === null) {
+                                cell.innerHTML = originalHtml;
+                                return;
+                            }
+                        } else if (field === "avg_hr") {
+                            sendValue = parseFloat(val);
+                            if (isNaN(sendValue)) {
+                                cell.innerHTML = originalHtml;
+                                return;
+                            }
+                        }
+
+                        saveIntervalEdit(intervalId, field, sendValue).then(result => {
+                            if (result) {
+                                const iv = result.interval;
+                                if (field === "distance") {
+                                    cell.textContent = iv.display_distance;
+                                    cell.dataset.raw = iv.canonical_distance_mi || iv.gps_measured_distance_mi || iv.prescribed_distance_mi || 0;
+                                    const paceCell = tr.children[3];
+                                    if (paceCell) paceCell.textContent = iv.display_pace;
+                                } else if (field === "duration_s") {
+                                    cell.textContent = iv.display_duration;
+                                    cell.dataset.raw = iv.duration_s || "";
+                                    const paceCell = tr.children[3];
+                                    if (paceCell) paceCell.textContent = iv.display_pace;
+                                } else if (field === "avg_hr") {
+                                    cell.textContent = iv.display_hr;
+                                    cell.dataset.raw = iv.avg_hr || "";
+                                }
+                                modalNeedsEnrich = true;
+                                updateModalButtons();
+                            } else {
+                                cell.innerHTML = originalHtml;
+                            }
+                        });
+                    } else {
+                        cell.innerHTML = originalHtml;
+                    }
+                }
+
+                input.addEventListener("keydown", (ev) => {
+                    ev.stopPropagation();
+                    if (ev.key === "Enter") finish(true);
+                    if (ev.key === "Escape") finish(false);
+                });
+                input.addEventListener("blur", () => finish(true));
             });
         });
     }
@@ -1171,6 +1214,26 @@
         const pctVO2max = 0.8 + 0.1894393 * Math.exp(-0.012778 * timeMin)
                         + 0.2989558 * Math.exp(-0.1932605 * timeMin);
         return Math.round((vo2 / pctVO2max) * 100) / 100;
+    }
+
+    function formatActivityStartTime(value) {
+        if (!value) return "\u2014";
+        const timestamp = value.trim().replace(" ", "T");
+        // Naive timestamps are already activity-local wall time. Preserve that
+        // clock even if the browser is in another time zone.
+        const local = timestamp.match(/^\d{4}-\d{2}-\d{2}T(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?$/);
+        if (local) {
+            const hour = Number(local[1]);
+            if (hour > 23 || Number(local[2]) > 59) return "\u2014";
+            return `${hour % 12 || 12}:${local[2]} ${hour < 12 ? "AM" : "PM"}`;
+        }
+        // FIT files without a local clock retain an explicit UTC offset.
+        if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(timestamp)) return "\u2014";
+        const instant = new Date(timestamp);
+        if (Number.isNaN(instant.getTime())) return "\u2014";
+        return instant.toLocaleTimeString("en-US", {
+            hour: "numeric", minute: "2-digit", timeZone: "America/New_York",
+        });
     }
 
     // ── Weather display helper ──────────────────────────────────
@@ -1277,7 +1340,7 @@
         html += `<input type="text" class="split-time-input" placeholder="m:ss" style="width:60px">`;
         html += `<select class="split-zone-select" style="width:50px">`;
         html += `<option value="">--</option>`;
-        for (const z of ["E", "M", "T", "I", "R", "FR"]) {
+        for (const z of ["E", "M", "T", "CV", "I", "R", "FR"]) {
             html += `<option value="${z}">${z}</option>`;
         }
         html += `</select>`;
@@ -1377,59 +1440,13 @@
     }
 
     function refreshIntervalsTable(container, aid, data) {
-        // Find and refresh the intervals table for this activity
-        const intervals = data.intervals || [];
-        const laps = data.laps || [];
-        const summary = data.summary || [];
-
-        // Find the activity section or the whole container
-        const section = container.querySelector(`[data-activity-id="${aid}"]`) || container;
-
-        // Replace intervals table(s) — find existing h3 "Intervals" and its table
-        const h3s = section.querySelectorAll("h3");
-        let intervalsH3 = null;
-        let lapsH3 = null;
-        for (const h3 of h3s) {
-            if (h3.textContent === "Intervals") intervalsH3 = h3;
-            if (h3.textContent === "Laps") lapsH3 = h3;
-        }
-
-        // Remove old intervals table
-        if (intervalsH3) {
-            const nextEl = intervalsH3.nextElementSibling;
-            if (nextEl && nextEl.classList.contains("intervals-table")) nextEl.remove();
-            intervalsH3.remove();
-        }
-
-        // Remove old laps table
-        if (lapsH3) {
-            const nextEl = lapsH3.nextElementSibling;
-            if (nextEl && nextEl.classList.contains("intervals-table")) nextEl.remove();
-            lapsH3.remove();
-        }
-
-        // Find the chart placeholder or first h3 to insert before
-        const chartPlaceholder = section.querySelector(`.modal-chart-placeholder[data-chart-aid="${aid}"]`);
-        const insertBefore = chartPlaceholder ? chartPlaceholder.nextElementSibling : section.querySelector("h3");
-
-        if (intervals.length) {
-            const h3 = document.createElement("h3");
-            h3.textContent = "Intervals";
-            const tableDiv = document.createElement("div");
-            tableDiv.innerHTML = buildTable(intervals);
-            if (insertBefore) {
-                section.insertBefore(h3, insertBefore);
-                section.insertBefore(tableDiv.firstElementChild, insertBefore);
-            } else {
-                section.appendChild(h3);
-                section.appendChild(tableDiv.firstElementChild);
-            }
-        }
-
-        // Re-wire interaction handlers for new table
-        wireWalkingButtons(section);
-        wireIntervalCheckboxes(section);
-        wireIntervalEditing(section);
+        const selector = `[data-table-aid="${aid}"]`;
+        const table = container.matches(selector) ? container : container.querySelector(selector);
+        if (!table) return;
+        table.innerHTML = buildIntervalTables(data);
+        wireWalkingButtons(table);
+        wireIntervalCheckboxes(table);
+        wireIntervalEditing(table);
     }
 
     function buildEditForm(meta) {
@@ -1501,7 +1518,7 @@
             </div>
             <div class="edit-row">
                 <label>Time</label>
-                <span style="padding:3px 6px;font-size:12px">${meta.start_time ? new Date(meta.start_time.replace(" ", "T") + "Z").toLocaleTimeString("en-US", {hour: "numeric", minute: "2-digit", timeZone: "America/New_York"}) : "\u2014"}</span>
+                <span style="padding:3px 6px;font-size:12px">${formatActivityStartTime(meta.start_time)}</span>
             </div>
             <div class="edit-row" data-field-row="avg_hr">
                 <label>Avg HR</label>
@@ -1564,7 +1581,7 @@
                 <span style="display:flex;gap:12px;align-items:center;font-size:12px">
                     <label style="width:auto;display:flex;align-items:center;gap:3px"><input type="checkbox" class="flag-cb" data-flag="suppress_hr" data-aid="${aid}" ${meta.suppress_hr ? "checked" : ""}> Suppress HR</label>
                     <label style="width:auto;display:flex;align-items:center;gap:3px"><input type="checkbox" class="flag-cb" data-flag="suppress_cadence" data-aid="${aid}" ${meta.suppress_cadence ? "checked" : ""}> Suppress Cadence</label>
-                    <label style="width:auto;display:flex;align-items:center;gap:3px"><input type="checkbox" class="flag-cb" data-flag="exclude_from_vdot" data-aid="${aid}" ${meta.exclude_from_vdot ? "checked" : ""}> Exclude from VDOT</label>
+                    <label title="${meta.vdot_exclusion_source === 'strides' ? 'Automatically excluded: strides make up at least 40% of the activity distance. Uncheck to include this activity.' : ''}" style="width:auto;display:flex;align-items:center;gap:3px"><input type="checkbox" class="flag-cb" data-flag="exclude_from_vdot" data-aid="${aid}" ${meta.exclude_from_vdot ? "checked" : ""}> Exclude from VDOT</label>
                 </span>
             </div>
             <div class="edit-row" data-field-row="splits">
@@ -1771,22 +1788,8 @@
             vdotInput.addEventListener("change", vdotHandler);
         }
 
-        // Data quality flag checkboxes — save immediately
-        form.querySelectorAll(".flag-cb").forEach(cb => {
-            cb.addEventListener("change", () => {
-                const flag = cb.dataset.flag;
-                const flagAid = parseInt(cb.dataset.aid);
-                fetch(`/api/activity/${flagAid}/flags`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ [flag]: cb.checked }),
-                });
-                if (flag === "suppress_hr" || flag === "exclude_from_vdot") {
-                    modalNeedsEnrich = true;
-                    updateModalButtons();
-                }
-            });
-        });
+        // Save quality flags in the same sequence as the rest of the editor.
+        wireActivityFlags(form);
 
         // "Add Splits" button — reveals the splits section
         const splitsBtn = form.querySelector(".btn-add-splits");
@@ -1844,6 +1847,7 @@
                         delete modalOriginalValues[aid];
                         delete modalClearQueue[aid];
                         delete modalVdotState[aid];
+                        delete modalFlagState[aid];
                         updateModalButtons();
                     })
                     .catch(err => {
@@ -1856,21 +1860,85 @@
         form.addEventListener("click", e => e.stopPropagation());
     }
 
+    function syncVdotExclusion(aid, excluded, source) {
+        if (excluded === undefined || "exclude_from_vdot" in (modalFlagState[aid] || {})) return;
+        const checkbox = modalEl.querySelector(`.flag-cb[data-aid="${aid}"][data-flag="exclude_from_vdot"]`);
+        if (!checkbox) return;
+        checkbox.checked = !!excluded;
+        checkbox.dataset.savedChecked = String(checkbox.checked);
+        checkbox.closest("label").title = source === "strides"
+            ? "Automatically excluded: strides make up at least 40% of the activity distance. Uncheck to include this activity."
+            : "";
+    }
+
+    function wireActivityFlags(form) {
+        form.querySelectorAll(".flag-cb").forEach(cb => {
+            cb.dataset.savedChecked = String(cb.checked);
+            const pending = modalFlagState[cb.dataset.aid] || {};
+            if (cb.dataset.flag in pending) cb.checked = pending[cb.dataset.flag];
+            cb.addEventListener("change", () => {
+                const {flag, aid} = cb.dataset;
+                if (!modalFlagState[aid]) modalFlagState[aid] = {};
+                if (String(cb.checked) === cb.dataset.savedChecked) {
+                    delete modalFlagState[aid][flag];
+                } else {
+                    modalFlagState[aid][flag] = cb.checked;
+                }
+                updateModalButtons();
+            });
+        });
+    }
+
+    function showModalSaveError(message) {
+        const element = document.getElementById("modal-save-error");
+        element.textContent = message;
+        element.hidden = !message;
+    }
+
+    async function postModalChange(url, body) {
+        const response = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        const data = await response.json();
+        const failed = (data.results || []).find(result => !result.ok);
+        if (!response.ok || !data.ok || failed) {
+            throw new Error(data.error || (failed && failed.error) || "Could not save changes. Please try again.");
+        }
+        return data;
+    }
+
     function updateModalButtons() {
         // Save and Save & Close are always visible; disabled when nothing to save
         const hasDirty = isDirty();
-        modalBtnSave.disabled = !hasDirty;
+        modalBtnSave.disabled = modalSaving || !hasDirty;
         // Save & Close also enabled when enrichment needed (stride/recovery/walking toggled)
-        modalBtnSaveClose.disabled = !(hasDirty || modalNeedsEnrich);
+        modalBtnSaveClose.disabled = modalSaving || !(hasDirty || modalNeedsEnrich || modalNeedsRefresh);
     }
 
     // ── Batch save ──────────────────────────────────────────────
 
     async function saveModalChanges(andClose) {
-        modalBtnSave.disabled = true;
-        modalBtnSaveClose.disabled = true;
+        if (modalSaving) return;
+        modalSaving = true;
+        showModalSaveError("");
+        const controls = [...modalEl.querySelectorAll("input, select, textarea, button")];
+        const disabledBefore = controls.map(control => control.disabled);
+        controls.forEach(control => { control.disabled = true; });
+        updateModalButtons();
+        modalNeedsEnrich = modalNeedsEnrich || hasFieldChanges()
+            || Object.values(modalFlagState).some(flags => "suppress_hr" in flags);
+        modalNeedsRefresh = modalNeedsRefresh || isDirty() || modalNeedsEnrich;
 
         try {
+            // Finish flag writes before recalculating or reloading CVD/AVD.
+            for (const [aid, flags] of Object.entries(modalFlagState)) {
+                if (Object.keys(flags).length) {
+                    await postModalChange(`/api/activity/${aid}/flags`, flags);
+                }
+            }
+
             // 1. Save dirty field overrides
             for (const [aidStr, fields] of Object.entries(modalDirtyState)) {
                 const aid = parseInt(aidStr);
@@ -1882,10 +1950,12 @@
                     const input = form ? form.querySelector(`[data-field="${field}"]`) : null;
                     if (input && value !== "" && (input.dataset.type === "duration" || input.dataset.type === "pace")) {
                         const parsed = parseDuration(value);
-                        if (parsed === null) continue;
+                        if (parsed === null) throw new Error(`Invalid ${field.replaceAll("_", " ")}. Please correct it and save again.`);
                         value = parsed;
                     }
-                    await saveOverride(aid, field, value);
+                    if (!await saveOverride(aid, field, value)) {
+                        throw new Error(`Could not save ${field.replaceAll("_", " ")}. Please try again.`);
+                    }
 
                     // Update grid row
                     const row = document.querySelector(`.activity-row[data-id="${aid}"]`)
@@ -1905,7 +1975,9 @@
             for (const [aidStr, fields] of Object.entries(modalClearQueue)) {
                 const aid = parseInt(aidStr);
                 for (const field of fields) {
-                    await clearOverride(aid, field);
+                    if (!await clearOverride(aid, field)) {
+                        throw new Error(`Could not clear ${field.replaceAll("_", " ")}. Please try again.`);
+                    }
                     const row = document.querySelector(`.activity-row[data-id="${aid}"]`)
                              || document.querySelector(`.activity-row[data-activity-ids*="${aid}"]`);
                     if (row) {
@@ -1934,18 +2006,22 @@
                 );
                 payload.apply_timeline = applyTimeline;
 
-                await fetch(`/api/activity/${aid}/vdot`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(payload),
-                }).then(r => r.json());
+                await postModalChange(`/api/activity/${aid}/vdot`, payload);
+            }
+
+            if (andClose && modalNeedsEnrich && modalActivityIds.length) {
+                await postModalChange("/api/enrich", { activity_ids: modalActivityIds });
+                modalNeedsEnrich = false;
             }
 
             // Reset dirty state
             modalDirtyState = {};
             modalClearQueue = {};
             modalVdotState = {};
-            modalNeedsEnrich = false;
+            modalFlagState = {};
+            modalEl.querySelectorAll(".flag-cb").forEach(cb => {
+                cb.dataset.savedChecked = String(cb.checked);
+            });
             // Remove dirty classes
             document.querySelectorAll("#modal-edit-section .edit-row.dirty").forEach(el => {
                 el.classList.remove("dirty");
@@ -1969,19 +2045,16 @@
             }
 
             if (andClose) {
-                // Enrich all activity IDs then close
-                await fetch("/api/enrich", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ activity_ids: modalActivityIds }),
-                }).then(r => r.json());
                 closeModal();
                 sessionStorage.setItem("runbase_scroll_to", modalDate);
                 location.reload();
             }
         } catch (err) {
             console.error("Save error:", err);
-            // Re-enable so user can retry
+            showModalSaveError(err.message || "Could not save changes. Please try again.");
+        } finally {
+            modalSaving = false;
+            controls.forEach((control, index) => { control.disabled = disabledBefore[index]; });
             updateModalButtons();
         }
     }
@@ -2392,53 +2465,99 @@
 
     const importBtn = document.getElementById("btn-import");
     const importStatus = document.getElementById("import-status");
+    const importDetails = document.getElementById("import-details");
+    const importOutput = document.getElementById("import-output");
+    let importPoll = null;
+    let observedImportRunning = false;
+
+    async function refreshSystemStatus() {
+        const summary = document.getElementById("system-summary");
+        const output = document.getElementById("system-output");
+        try {
+            const response = await fetch("/api/system/status");
+            if (!response.ok) throw new Error("Could not check system status");
+            const report = await response.json();
+            const issues = report.checks.filter(c => c.status === "warning" || c.status === "error");
+            summary.textContent = issues.length ? `System status (${issues.length} issues)` : "System status";
+            output.textContent = report.checks.map(c => `${c.name} — ${c.status.toUpperCase()}\n${c.message}`).join("\n\n");
+        } catch (error) {
+            summary.textContent = "System status unavailable";
+            output.textContent = error.message;
+        }
+    }
+    if (document.getElementById("system-details")) {
+        refreshSystemStatus();
+        document.getElementById("system-details").addEventListener("toggle", event => {
+            if (event.target.open) refreshSystemStatus();
+        });
+    }
+
+    function renderImportStatus(s) {
+        importBtn.disabled = s.running;
+        importBtn.textContent = s.running ? "Running..." : "Import";
+        const elapsed = `${Math.floor(s.elapsed_s / 60)}:${String(s.elapsed_s % 60).padStart(2, "0")}`;
+        const warnings = s.warnings || [];
+        const message = s.running
+            ? `${s.message || "Starting import..."} (${elapsed})`
+            : warnings.length && s.success
+                ? `${s.message} ${warnings.join(" ")}`
+                : s.success === false ? `Import stopped: ${s.message}` : s.message || "";
+        importStatus.textContent = message;
+        importStatus.title = message;
+        importStatus.className = "import-status" + (s.running ? ""
+            : s.success === false ? " error" : warnings.length ? " warning"
+            : s.success ? " success" : "");
+        importOutput.textContent = s.output || s.message || "";
+        importDetails.hidden = !importOutput.textContent;
+        if (!s.running && (s.success === false || warnings.length)) importDetails.open = true;
+    }
+
+    async function pollImportStatus() {
+        try {
+            const response = await fetch("/api/import/status");
+            if (!response.ok) throw new Error("Could not read import status");
+            const s = await response.json();
+            renderImportStatus(s);
+            if (s.running) {
+                observedImportRunning = true;
+                importPoll = setTimeout(pollImportStatus, 1000);
+            } else {
+                importPoll = null;
+                if (observedImportRunning && s.success !== null) {
+                    observedImportRunning = false;
+                    // A retry may enrich existing rows without importing new
+                    // ones. Reload those results too; status remains on server.
+                    setTimeout(() => location.reload(), 500);
+                }
+            }
+        } catch (error) {
+            importStatus.textContent = "Cannot reach the server; retrying import status...";
+            importStatus.className = "import-status error";
+            importPoll = setTimeout(pollImportStatus, 3000);
+        }
+    }
 
     if (importBtn) {
-        importBtn.addEventListener("click", () => {
+        // Reconnect to a running import after a page refresh or year change.
+        pollImportStatus();
+        importBtn.addEventListener("click", async () => {
+            clearTimeout(importPoll);
+            observedImportRunning = true;
             importBtn.disabled = true;
             importBtn.textContent = "Running...";
-            importStatus.textContent = "";
-
-            fetch("/api/import", { method: "POST" })
-                .then(r => r.json())
-                .then(d => {
-                    if (!d.ok) {
-                        importBtn.disabled = false;
-                        importBtn.textContent = "Import";
-                        importStatus.textContent = d.error || "Error";
-                        return;
-                    }
-                    const poll = setInterval(() => {
-                        fetch("/api/import/status").then(r => r.json()).then(s => {
-                            if (!s.running) {
-                                clearInterval(poll);
-                                importBtn.disabled = false;
-                                importBtn.textContent = "Import";
-                                if (s.success) {
-                                    const match = s.output.match(/(\d+) new/);
-                                    const newCount = match ? parseInt(match[1], 10) : 0;
-                                    if (newCount > 0) {
-                                        importStatus.textContent = `Done! ${newCount} new`;
-                                        importStatus.className = "import-status success";
-                                        setTimeout(() => location.reload(), 1500);
-                                    } else {
-                                        importStatus.textContent = "No new activities";
-                                        importStatus.className = "import-status success";
-                                    }
-                                } else {
-                                    importStatus.textContent = "Failed";
-                                    importStatus.className = "import-status error";
-                                    importStatus.title = s.output;
-                                }
-                            }
-                        });
-                    }, 2000);
-                })
-                .catch(() => {
-                    importBtn.disabled = false;
-                    importBtn.textContent = "Import";
-                    importStatus.textContent = "Error";
-                });
+            importStatus.textContent = "Starting import...";
+            importStatus.className = "import-status";
+            importDetails.open = true;
+            try {
+                const response = await fetch("/api/import", { method: "POST" });
+                const result = await response.json();
+                if (!result.ok && response.status !== 409) throw new Error(result.error || "Import could not start");
+                pollImportStatus();
+            } catch (error) {
+                importStatus.textContent = `${error.message}. Checking server status...`;
+                importStatus.className = "import-status error";
+                importPoll = setTimeout(pollImportStatus, 1000);
+            }
         });
     }
 
@@ -2593,8 +2712,9 @@
     ];
 
     function formatPaceLabel(v) {
-        const m = Math.floor(v / 60);
-        const s = Math.round(v % 60);
+        const seconds = Math.round(v);
+        const m = Math.floor(seconds / 60);
+        const s = seconds % 60;
         return `${m}:${s < 10 ? "0" : ""}${s}`;
     }
 
@@ -2640,7 +2760,7 @@
         const page = document.querySelector(".shoes-page");
         page.innerHTML = '<p class="loading">Loading shoe data...</p>';
 
-        Promise.all([
+        return Promise.all([
             fetch("/api/shoes").then(r => r.json()),
             fetch("/api/shoes/monthly").then(r => r.json()),
         ]).then(([shoes, monthly]) => {
@@ -2650,7 +2770,9 @@
             html += '<h3 style="margin-bottom:8px">Shoe Summary</h3>';
             html += `<table class="shoes-table"><thead><tr>
                 <th></th><th>Shoe</th><th>Miles</th><th>Runs</th>
-                <th>Avg Pace</th><th>First Use</th><th>Last Use</th>
+                <th title="Distance-weighted recorded running pace">Avg Pace</th>
+                <th title="Duration-weighted CVD; excludes activities excluded from VDOT or with suppressed HR">Avg CVD</th>
+                <th>First Use</th><th>Last Use</th>
             </tr></thead><tbody>`;
 
             // Sort: active first by last_use desc, then retired
@@ -2669,6 +2791,7 @@
                     <td>${s.total_miles.toFixed(1)}</td>
                     <td>${s.activity_count}</td>
                     <td>${pace}</td>
+                    <td title="${s.cvd_count || 0} activities included in CVD">${s.avg_cvd != null ? s.avg_cvd.toFixed(1) : "\u2014"}</td>
                     <td>${s.first_use || ""}</td>
                     <td>${s.last_use || ""}</td>
                 </tr>`;
@@ -2880,10 +3003,7 @@
     // ── Trends Tab ─────────────────────────────────────────────────
     // ═══════════════════════════════════════════════════════════════
 
-    let trendsCurrentRange = "1y";
-
     function loadTrendsTab(range) {
-        trendsCurrentRange = range;
         const page = document.querySelector(".trends-page");
 
         // Build range selector if not present
@@ -2910,18 +3030,23 @@
     }
 
     function loadTrendsData(range) {
-        trendsCurrentRange = range;
         const container = document.getElementById("trends-charts-container");
         if (!container) return;
+        const requestId = String(Number(container.dataset.requestId || 0) + 1);
+        container.dataset.requestId = requestId;
         container.innerHTML = '<p class="loading">Loading trends...</p>';
 
-        fetch(`/api/trends?range=${range}`).then(r => r.json()).then(data => {
+        return fetch(`/api/trends?range=${range}`).then(r => {
+            if (!r.ok) throw new Error("Could not load trends");
+            return r.json();
+        }).then(data => {
+            if (container.dataset.requestId !== requestId) return;
             let html = "";
 
             // Row 1: Weekly Volume + Pace Trend
             html += '<div class="trends-row">';
             html += '<div class="trends-chart-wrap"><h3>Weekly Volume</h3><canvas id="trends-volume-chart" height="200"></canvas></div>';
-            html += '<div class="trends-chart-wrap"><h3>Pace Trend</h3><canvas id="trends-pace-chart" height="200"></canvas></div>';
+            html += '<div class="trends-chart-wrap"><h3 title="Weekly distance-weighted recorded running pace; activities without pace or running distance are omitted">Pace Trend</h3><canvas id="trends-pace-chart" height="200"></canvas></div>';
             html += '</div>';
 
             // Row 2: HR Trend + ATL/CTL/TSB
@@ -2959,10 +3084,15 @@
 
             container.innerHTML = html;
 
+            // Every chart uses the same dates and month ticks, including sparse race data.
+            const widths = [...container.querySelectorAll("canvas")].map(c => c.getBoundingClientRect().width);
+            const axis = trendsDateAxis(data, Math.min(...widths));
+            const crosshair = createTrendsCrosshairGroup();
+
             // Draw charts
-            drawTrendsBarChart("trends-volume-chart", data.weekly || [], { title: "Weekly Miles", barColor: "#4a7ab5", maWindow: 6 });
-            drawTrendsLineChart("trends-pace-chart", [{ label: "Pace", data: (data.weekly || []).filter(w => w.avg_pace).map(w => ({ date: w.week, value: w.avg_pace })), color: "#4a7ab5", fill: true }], { invertY: true, formatY: formatPaceLabel });
-            drawTrendsLineChart("trends-hr-chart", [{ label: "HR", data: (data.weekly || []).filter(w => w.avg_hr).map(w => ({ date: w.week, value: w.avg_hr })), color: "#c05050", fill: true }], { formatY: v => Math.round(v).toString() });
+            drawTrendsBarChart("trends-volume-chart", data.weekly || [], { axis, crosshair, barColor: "#4a7ab5", maWindow: 6 });
+            drawTrendsLineChart("trends-pace-chart", [{ label: "Pace", data: (data.weekly || []).filter(w => w.avg_pace).map(w => ({ date: w.week, value: w.avg_pace })), color: "#4a7ab5", fill: true }], { axis, crosshair, weekly: true, invertY: true, formatY: formatPaceLabel, formatValue: v => `${formatPaceLabel(v)}/mi` });
+            drawTrendsLineChart("trends-hr-chart", [{ label: "HR", data: (data.weekly || []).filter(w => w.avg_hr).map(w => ({ date: w.week, value: w.avg_hr })), color: "#c05050", fill: true }], { axis, crosshair, weekly: true, formatY: v => Math.round(v).toString(), formatValue: v => `${v.toFixed(1)} bpm` });
 
             // ATL/CTL/TSB
             const atlCtl = data.atl_ctl || [];
@@ -2970,73 +3100,281 @@
                 { label: "CTL", data: atlCtl.map(d => ({ date: d.date, value: d.ctl })), color: "#4a7ab5" },
                 { label: "ATL", data: atlCtl.map(d => ({ date: d.date, value: d.atl })), color: "#d9a030" },
                 { label: "TSB", data: atlCtl.map(d => ({ date: d.date, value: d.tsb })), color: "#50a050" },
-            ], { formatY: v => v.toFixed(0), zeroLine: true, legend: true });
+            ], { axis, crosshair, formatY: v => v.toFixed(0), zeroLine: true, legend: true });
 
             // VDOT scatter
             const vdotPts = (data.vdot_timeline || []).map(v => ({ date: v.effective_date, value: v.vdot, label: v.notes || "" }));
-            drawScatterChart("trends-vdot-chart", vdotPts);
+            drawScatterChart("trends-vdot-chart", vdotPts, axis, crosshair);
 
             // Predicted Race VDOT line + race actuals as scatter overlay
             const predVdot = (data.predicted_vdot || []);
-            if (predVdot.length > 0) {
-                const raceScatter = (data.vdot_timeline || [])
-                    .filter(v => v.source === "race")
-                    .map(v => ({ date: v.effective_date, value: v.vdot }));
-                drawPredictedVdotChart("trends-predicted-vdot-chart", predVdot, raceScatter);
+            const raceScatter = (data.vdot_timeline || [])
+                .filter(v => v.source === "race")
+                .map(v => ({ date: v.effective_date, value: v.vdot }));
+            drawPredictedVdotChart("trends-predicted-vdot-chart", predVdot, raceScatter, axis, crosshair);
+        }).catch(() => {
+            if (container.dataset.requestId === requestId) {
+                container.innerHTML = '<p class="loading">Could not load trends. Select a range to try again.</p>';
             }
         });
     }
 
-    function drawTrendsBarChart(canvasId, data, opts) {
-        const canvas = document.getElementById(canvasId);
-        if (!canvas || !data.length) return;
-        const { ctx, w, h } = initCanvas(canvas);
-        const pad = { top: 10, right: 10, bottom: 22, left: 40 };
+    function trendsDateTime(date) {
+        // Date-only records are calendar dates, independent of timezone and DST.
+        return Date.parse(`${date}T00:00:00Z`);
+    }
+
+    function trendsDateAxis(data, width) {
+        const dates = [data.date_range?.start, data.date_range?.end,
+            ...(data.weekly || []).map(d => d.week),
+            ...(data.atl_ctl || []).map(d => d.date),
+            ...(data.vdot_timeline || []).map(d => d.effective_date),
+            ...(data.predicted_vdot || []).map(d => d.date),
+        ].filter(Boolean).map(trendsDateTime).filter(Number.isFinite);
+        const end = dates.length ? Math.max(...dates) : trendsDateTime(new Date().toISOString().slice(0, 10));
+        const start = dates.length ? Math.min(...dates) : end - 365 * 86400000;
+        const axis = { start, end: Math.max(end, start + 86400000), ticks: [] };
+        const first = new Date(axis.start);
+        const last = new Date(axis.end);
+        const firstMonth = first.getUTCFullYear() * 12 + first.getUTCMonth();
+        const lastMonth = last.getUTCFullYear() * 12 + last.getUTCMonth();
+        // Use the narrowest chart's label density for every chart, even the wide one.
+        const slots = Math.max(2, Math.floor(((width || 500) - 64) / 48));
+        const needed = Math.ceil((lastMonth - firstMonth + 1) / slots);
+        const step = [1, 2, 3, 6, 12, 24, 36, 60, 120].find(n => n >= needed) || needed;
+        for (let month = Math.ceil(firstMonth / step) * step; month <= lastMonth; month += step) {
+            const time = Date.UTC(Math.floor(month / 12), month % 12, 1);
+            if (time < axis.start || time > axis.end) continue;
+            const date = new Date(time);
+            axis.ticks.push({ time, label: `${String(date.getUTCMonth() + 1).padStart(2, "0")}/${String(date.getUTCFullYear()).slice(-2)}` });
+        }
+        return axis;
+    }
+
+    function initTrendsChart(canvas, axis) {
+        const chart = initCanvas(canvas);
+        const { ctx, w, h } = chart;
+        const pad = { top: 12, right: 12, bottom: 30, left: 52 };
         const cw = w - pad.left - pad.right;
         const ch = h - pad.top - pad.bottom;
+        const xPos = time => pad.left + (time - axis.start) / (axis.end - axis.start) * cw;
+        ctx.font = "10px -apple-system, sans-serif";
+        ctx.textAlign = "center";
+        for (const tick of axis.ticks) {
+            const x = xPos(tick.time);
+            ctx.beginPath();
+            ctx.moveTo(x, pad.top);
+            ctx.lineTo(x, h - pad.bottom + 4);
+            ctx.strokeStyle = "#eee";
+            ctx.lineWidth = 0.5;
+            ctx.stroke();
+            ctx.fillStyle = "#888";
+            const half = ctx.measureText(tick.label).width / 2;
+            ctx.fillText(tick.label, Math.max(half + 2, Math.min(w - half - 2, x)), h - 9);
+        }
+        return { ...chart, pad, cw, ch, xPos };
+    }
 
-        const values = data.map(d => d.distance);
-        const maxV = Math.max(...values) * 1.1 || 1;
-
-        const barWidth = Math.max(3, Math.min(16, (cw / data.length) * 0.75));
-        const gap = (cw - barWidth * data.length) / (data.length + 1);
-        const yPos = v => pad.top + (1 - v / maxV) * ch;
-
-        // Y grid
-        ctx.fillStyle = "#aaa";
-        ctx.font = "9px -apple-system, sans-serif";
+    function drawTrendsYGrid(chart, yPos, min, max, formatY) {
+        const { ctx, w, pad } = chart;
+        ctx.fillStyle = "#888";
+        ctx.font = "10px -apple-system, sans-serif";
         ctx.textAlign = "right";
         for (let i = 0; i <= 4; i++) {
-            const v = (maxV * i) / 4;
-            const y = yPos(v);
+            const value = min + (max - min) * i / 4;
+            const y = yPos(value);
             ctx.beginPath();
             ctx.moveTo(pad.left, y);
             ctx.lineTo(w - pad.right, y);
             ctx.strokeStyle = "#eee";
             ctx.lineWidth = 0.5;
             ctx.stroke();
-            ctx.fillText(Math.round(v).toString(), pad.left - 4, y + 3);
+            ctx.fillText(formatY(value), pad.left - 5, y + 3);
+        }
+    }
+
+    function createTrendsCrosshairGroup() {
+        const charts = [];
+        return {
+            register(chart) { charts.push(chart); },
+            select(point, source) {
+                for (const chart of charts) chart.showDate(point?.date || null, chart === source ? point : null);
+            },
+        };
+    }
+
+    function wireTrendsCrosshair(canvas, chart, points, opts = {}) {
+        const { ctx, w, h, dpr, pad, xPos } = chart;
+        const cleanImage = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const readout = document.createElement("div");
+        readout.className = "trends-chart-readout";
+        readout.setAttribute("role", "status");
+        readout.setAttribute("aria-live", "polite");
+        canvas.parentElement.querySelector(".trends-chart-readout")?.remove();
+        canvas.parentElement.appendChild(readout);
+        const hint = points.length ? "Click and drag to inspect" : "No data in this range";
+        readout.textContent = hint;
+        canvas.tabIndex = points.length ? 0 : -1;
+        canvas.setAttribute("aria-label", `${canvas.parentElement.querySelector("h3")?.textContent || "Trend chart"}. ${hint}. Arrow keys move between dates; Escape clears the selection.`);
+        const plotPoints = points.map(p => ({ ...p, time: trendsDateTime(p.date), x: xPos(trendsDateTime(p.date)), y: chart.yPos(p.value) }))
+            .sort((a, b) => a.x - b.x);
+        let activePointer = null;
+        let selected = null;
+
+        const formatDate = date => `${date.slice(5, 7)}/${date.slice(8, 10)}/${date.slice(2, 4)}`;
+
+        function drawSelection(point, cursorDate) {
+            selected = point;
+            ctx.putImageData(cleanImage, 0, 0);
+            if (!cursorDate) { readout.textContent = hint; return; }
+            // Keep the date guide aligned even when a chart has only weekly/race points.
+            const x = xPos(trendsDateTime(cursorDate));
+            const date = formatDate(cursorDate);
+            if (point) {
+                const value = (opts.formatValue || (v => v.toFixed(1)))(point.value);
+                readout.textContent = `${opts.weekly ? "Week of " : ""}${formatDate(point.date)} · ${point.series}: ${value}${point.date !== cursorDate ? " (nearest point)" : ""}${point.label ? ` · ${point.label}` : ""}`;
+            } else {
+                readout.textContent = `${date} · No data in this range`;
+            }
+            ctx.save();
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.beginPath();
+            ctx.moveTo(x, pad.top);
+            ctx.lineTo(x, h - pad.bottom);
+            if (point) {
+                ctx.moveTo(pad.left, point.y);
+                ctx.lineTo(w - pad.right, point.y);
+            }
+            ctx.strokeStyle = "#556575";
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 3]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            if (point) {
+                ctx.beginPath();
+                ctx.arc(point.x, point.y, 4, 0, Math.PI * 2);
+                ctx.fillStyle = point.color || "#4a7ab5";
+                ctx.fill();
+                ctx.strokeStyle = "#fff";
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+            }
+
+            // Exact values sit on their axes; the ordinary ticks remain MM/YY.
+            ctx.font = "10px -apple-system, sans-serif";
+            ctx.textAlign = "center";
+            const dateWidth = ctx.measureText(date).width + 10;
+            const dateLeft = Math.max(1, Math.min(w - dateWidth - 1, x - dateWidth / 2));
+            ctx.fillStyle = "#344454";
+            ctx.fillRect(dateLeft, h - pad.bottom + 5, dateWidth, 19);
+            ctx.fillStyle = "#fff";
+            ctx.fillText(date, dateLeft + dateWidth / 2, h - pad.bottom + 18);
+            if (point) {
+                const axisValue = (opts.formatSelectionY || (v => v.toFixed(1)))(point.value);
+                const valueWidth = Math.max(30, ctx.measureText(axisValue).width + 10);
+                ctx.fillStyle = "#344454";
+                ctx.fillRect(pad.left - valueWidth - 1, point.y - 9, valueWidth, 18);
+                ctx.fillStyle = "#fff";
+                ctx.fillText(axisValue, pad.left - valueWidth / 2 - 1, point.y + 4);
+            }
+            ctx.restore();
         }
 
-        // Bars
-        for (let i = 0; i < data.length; i++) {
-            const x = pad.left + gap + i * (barWidth + gap);
-            const barH = (data[i].distance / maxV) * ch;
-            ctx.fillStyle = opts.barColor || "#4a7ab5";
-            ctx.fillRect(x, pad.top + ch - barH, barWidth, barH);
+        const linkedChart = {
+            showDate(date, sourcePoint) {
+                if (!date) { drawSelection(null, null); return; }
+                let nearest = sourcePoint;
+                if (!nearest) {
+                    const preferredSeries = selected?.series || points[0]?.series;
+                    const time = trendsDateTime(date);
+                    let best = Infinity;
+                    for (const point of plotPoints) {
+                        if (point.series !== preferredSeries) continue;
+                        const distance = Math.abs(point.time - time);
+                        if (distance < best) { nearest = point; best = distance; }
+                    }
+                }
+                drawSelection(nearest, date);
+            },
+        };
+        opts.crosshair?.register(linkedChart);
+
+        function select(point) {
+            if (opts.crosshair) opts.crosshair.select(point, linkedChart);
+            else linkedChart.showDate(point?.date || null, point);
         }
 
-        // MA line
+        function selectAt(event) {
+            const rect = canvas.getBoundingClientRect();
+            const x = (event.clientX - rect.left) * w / rect.width;
+            const y = (event.clientY - rect.top) * h / rect.height;
+            let closest = null, bestX = Infinity, bestY = Infinity;
+            for (const point of plotPoints) {
+                const dx = Math.abs(point.x - x), dy = Math.abs(point.y - y);
+                if (dx < bestX - 0.01 || (Math.abs(dx - bestX) <= 0.01 && dy < bestY)) {
+                    closest = point; bestX = dx; bestY = dy;
+                }
+            }
+            select(closest);
+        }
+
+        canvas.onpointerdown = event => {
+            if (event.button !== 0 || !plotPoints.length) return;
+            event.preventDefault();
+            canvas.focus({ preventScroll: true });
+            activePointer = event.pointerId;
+            canvas.setPointerCapture(event.pointerId);
+            selectAt(event);
+        };
+        canvas.onpointermove = event => {
+            if (event.pointerId === activePointer && (event.buttons & 1)) selectAt(event);
+        };
+        canvas.onpointerup = event => {
+            if (event.pointerId !== activePointer) return;
+            selectAt(event);
+            activePointer = null;
+            if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+        };
+        canvas.onpointercancel = canvas.onlostpointercapture = () => { activePointer = null; };
+        canvas.onkeydown = event => {
+            if (event.key === "Escape") { select(null); return; }
+            if (!["ArrowLeft", "ArrowRight"].includes(event.key) || !plotPoints.length) return;
+            event.preventDefault();
+            const sameSeries = selected ? plotPoints.filter(p => p.series === selected.series) : plotPoints;
+            const index = selected ? sameSeries.indexOf(selected) + (event.key === "ArrowLeft" ? -1 : 1) : 0;
+            select(sameSeries[Math.max(0, Math.min(sameSeries.length - 1, index))]);
+        };
+    }
+
+    function drawTrendsBarChart(canvasId, data, opts) {
+        const canvas = document.getElementById(canvasId);
+        if (!canvas) return;
+        const chart = initTrendsChart(canvas, opts.axis);
+        const { ctx, w, pad, cw, ch, xPos } = chart;
+        const maxV = Math.max(0, ...data.map(d => d.distance)) * 1.1 || 1;
+        const yPos = chart.yPos = v => pad.top + (1 - v / maxV) * ch;
+        drawTrendsYGrid(chart, yPos, 0, maxV, v => v.toFixed(0));
+        const barWidth = Math.max(1, Math.min(16, cw * 7 * 86400000 / (opts.axis.end - opts.axis.start) * 0.75));
+        const color = opts.barColor || "#4a7ab5";
+        const points = data.map(d => ({ date: d.week, value: d.distance, series: "Miles", color }));
+        ctx.fillStyle = color;
+        for (const point of points) {
+            const x = xPos(trendsDateTime(point.date));
+            const left = Math.max(pad.left, x - barWidth / 2);
+            const right = Math.min(w - pad.right, x + barWidth / 2);
+            ctx.fillRect(left, yPos(point.value), right - left, pad.top + ch - yPos(point.value));
+        }
         if (opts.maWindow && data.length >= opts.maWindow) {
             ctx.beginPath();
-            let started = false;
             for (let i = opts.maWindow - 1; i < data.length; i++) {
+                const date = trendsDateTime(data[i].week);
                 let sum = 0;
                 for (let j = i - opts.maWindow + 1; j <= i; j++) sum += data[j].distance;
-                const avg = sum / opts.maWindow;
-                const x = pad.left + gap + i * (barWidth + gap) + barWidth / 2;
-                if (!started) { ctx.moveTo(x, yPos(avg)); started = true; }
-                else ctx.lineTo(x, yPos(avg));
+                const value = sum / opts.maWindow;
+                const x = xPos(date), y = yPos(value);
+                if (i === opts.maWindow - 1) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+                points.push({ date: data[i].week, value, series: `${opts.maWindow}-week average`, color: "#c05050" });
             }
             ctx.strokeStyle = "#c05050";
             ctx.lineWidth = 1.5;
@@ -3044,74 +3382,29 @@
             ctx.stroke();
             ctx.setLineDash([]);
         }
-
-        // X labels
-        ctx.fillStyle = "#aaa";
-        ctx.font = "8px -apple-system, sans-serif";
-        ctx.textAlign = "center";
-        const labelStep = Math.max(1, Math.floor(data.length / 6));
-        for (let i = 0; i < data.length; i += labelStep) {
-            const x = pad.left + gap + i * (barWidth + gap) + barWidth / 2;
-            const d = new Date(data[i].week + "T00:00:00");
-            ctx.fillText(`${d.getMonth() + 1}/${d.getDate()}`, x, h - 4);
-        }
+        wireTrendsCrosshair(canvas, chart, points, { crosshair: opts.crosshair, weekly: true, formatValue: v => `${v.toFixed(1)} mi` });
     }
 
     function drawTrendsLineChart(canvasId, series, opts) {
         const canvas = document.getElementById(canvasId);
         if (!canvas) return;
-
-        // Filter out empty series
-        const validSeries = series.filter(s => s.data && s.data.length > 0);
-        if (!validSeries.length) return;
-
-        const { ctx, w, h } = initCanvas(canvas);
-        const pad = { top: 10, right: 10, bottom: 22, left: 40 };
-        const cw = w - pad.left - pad.right;
-        const ch = h - pad.top - pad.bottom;
-
-        // Collect all dates and values
-        const allDates = [];
-        let vMin = Infinity, vMax = -Infinity;
-        for (const s of validSeries) {
-            for (const d of s.data) {
-                allDates.push(new Date(d.date + "T00:00:00").getTime());
-                if (d.value < vMin) vMin = d.value;
-                if (d.value > vMax) vMax = d.value;
-            }
-        }
-        if (vMin === Infinity) return;
-
+        const validSeries = series.map(s => ({ ...s, data: (s.data || [])
+            .filter(d => Number.isFinite(d.value) && Number.isFinite(trendsDateTime(d.date)))
+            .sort((a, b) => a.date.localeCompare(b.date)) })).filter(s => s.data.length);
+        const chart = initTrendsChart(canvas, opts.axis);
+        const { ctx, w, pad, ch, xPos } = chart;
+        const values = validSeries.flatMap(s => s.data.map(d => d.value));
+        let vMin = values.length ? Math.min(...values) : 0;
+        let vMax = values.length ? Math.max(...values) : 1;
         const vPad = (vMax - vMin) * 0.1 || 1;
         vMin -= vPad;
         vMax += vPad;
-        if (opts.zeroLine && vMin > 0) vMin = -vPad;
-
-        const uniqueDates = [...new Set(allDates)].sort((a, b) => a - b);
-        const xPos = dateXPositioner(uniqueDates, pad, cw);
-        function yPos(v) {
-            const norm = (v - vMin) / (vMax - vMin || 1);
-            return opts.invertY ? pad.top + norm * ch : pad.top + (1 - norm) * ch;
-        }
-
-        // Y grid
-        ctx.fillStyle = "#aaa";
-        ctx.font = "9px -apple-system, sans-serif";
-        ctx.textAlign = "right";
-        const formatY = opts.formatY || (v => v.toFixed(0));
-        for (let i = 0; i <= 4; i++) {
-            const v = vMin + ((vMax - vMin) * i) / 4;
-            const y = yPos(v);
-            ctx.beginPath();
-            ctx.moveTo(pad.left, y);
-            ctx.lineTo(w - pad.right, y);
-            ctx.strokeStyle = "#eee";
-            ctx.lineWidth = 0.5;
-            ctx.stroke();
-            ctx.fillText(formatY(v), pad.left - 4, y + 3);
-        }
-
-        // Zero line
+        if (opts.zeroLine) { vMin = Math.min(vMin, -vPad); vMax = Math.max(vMax, vPad); }
+        const yPos = chart.yPos = v => {
+            const norm = (v - vMin) / (vMax - vMin);
+            return pad.top + (opts.invertY ? norm : 1 - norm) * ch;
+        };
+        drawTrendsYGrid(chart, yPos, vMin, vMax, opts.formatY || (v => v.toFixed(0)));
         if (opts.zeroLine) {
             ctx.beginPath();
             ctx.moveTo(pad.left, yPos(0));
@@ -3120,14 +3413,8 @@
             ctx.lineWidth = 1;
             ctx.stroke();
         }
-
-        // Draw series
         for (const s of validSeries) {
-            const pts = s.data.map(d => ({
-                x: xPos(new Date(d.date + "T00:00:00").getTime()),
-                y: yPos(d.value),
-            }));
-
+            const pts = s.data.map(d => ({ x: xPos(trendsDateTime(d.date)), y: yPos(d.value) }));
             if (s.fill) {
                 ctx.beginPath();
                 ctx.moveTo(pts[0].x, pts[0].y);
@@ -3135,194 +3422,57 @@
                 ctx.lineTo(pts[pts.length - 1].x, pad.top + ch);
                 ctx.lineTo(pts[0].x, pad.top + ch);
                 ctx.closePath();
-                ctx.fillStyle = s.color.replace(")", ",0.1)").replace("rgb", "rgba");
+                ctx.save();
+                ctx.globalAlpha = 0.08;
+                ctx.fillStyle = s.color;
                 ctx.fill();
+                ctx.restore();
             }
-
-            ctx.beginPath();
-            ctx.moveTo(pts[0].x, pts[0].y);
-            for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-            ctx.strokeStyle = s.color;
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-        }
-
-        // X labels
-        drawDateXLabels(ctx, uniqueDates, xPos, h, pad);
-
-        // Legend
-        if (opts.legend && validSeries.length > 1) {
-            const parent = canvas.parentElement;
-            let legendDiv = parent.querySelector(".chart-legend");
-            if (!legendDiv) {
-                legendDiv = document.createElement("div");
-                legendDiv.className = "chart-legend";
-                parent.appendChild(legendDiv);
+            if (s.line !== false) {
+                ctx.beginPath();
+                ctx.moveTo(pts[0].x, pts[0].y);
+                for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+                ctx.strokeStyle = s.lineColor || s.color;
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
             }
-            legendDiv.innerHTML = validSeries.map(s =>
-                `<span class="chart-legend-item"><span class="chart-legend-swatch" style="background:${s.color}"></span>${s.label}</span>`
-            ).join("");
+            if (s.radius || pts.length === 1) {
+                for (const p of pts) {
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, s.radius || 3, 0, Math.PI * 2);
+                    ctx.fillStyle = s.color;
+                    ctx.fill();
+                    ctx.strokeStyle = "#fff";
+                    ctx.lineWidth = 1.5;
+                    ctx.stroke();
+                }
+            }
         }
+        if (opts.legend) {
+            let legend = canvas.parentElement.querySelector(".chart-legend");
+            if (!legend) {
+                legend = document.createElement("div");
+                legend.className = "chart-legend";
+                canvas.parentElement.appendChild(legend);
+            }
+            legend.innerHTML = validSeries.map(s => `<span class="chart-legend-item"><span class="chart-legend-swatch" style="background:${s.color}"></span>${escapeHtml(s.label)}</span>`).join("");
+        }
+        wireTrendsCrosshair(canvas, chart, validSeries.flatMap(s => s.data.map(d => ({ ...d, series: s.label, color: s.color }))), {
+            ...opts, formatSelectionY: opts.invertY ? opts.formatY : undefined,
+        });
     }
 
-    function drawScatterChart(canvasId, points) {
-        const canvas = document.getElementById(canvasId);
-        if (!canvas || !points.length) return;
-        const { ctx, w, h } = initCanvas(canvas);
-        const pad = { top: 10, right: 10, bottom: 22, left: 40 };
-        const cw = w - pad.left - pad.right;
-        const ch = h - pad.top - pad.bottom;
-
-        const dates = points.map(p => new Date(p.date + "T00:00:00").getTime());
-        const values = points.map(p => p.value);
-        let vMin = Math.min(...values);
-        let vMax = Math.max(...values);
-        const vPad = (vMax - vMin) * 0.15 || 1;
-        vMin -= vPad;
-        vMax += vPad;
-
-        const xPos = dateXPositioner(dates, pad, cw);
-        const yPos = v => pad.top + (1 - (v - vMin) / (vMax - vMin || 1)) * ch;
-
-        // Y grid
-        ctx.fillStyle = "#aaa";
-        ctx.font = "9px -apple-system, sans-serif";
-        ctx.textAlign = "right";
-        for (let i = 0; i <= 4; i++) {
-            const v = vMin + ((vMax - vMin) * i) / 4;
-            const y = yPos(v);
-            ctx.beginPath();
-            ctx.moveTo(pad.left, y);
-            ctx.lineTo(w - pad.right, y);
-            ctx.strokeStyle = "#eee";
-            ctx.lineWidth = 0.5;
-            ctx.stroke();
-            ctx.fillText(v.toFixed(1), pad.left - 4, y + 3);
-        }
-
-        // Connecting line
-        ctx.beginPath();
-        for (let i = 0; i < points.length; i++) {
-            const x = xPos(dates[i]);
-            const y = yPos(values[i]);
-            if (i === 0) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
-        }
-        ctx.strokeStyle = "rgba(74,122,181,0.4)";
-        ctx.lineWidth = 1;
-        ctx.stroke();
-
-        // Dots
-        for (let i = 0; i < points.length; i++) {
-            const x = xPos(dates[i]);
-            const y = yPos(values[i]);
-            ctx.beginPath();
-            ctx.arc(x, y, 4, 0, Math.PI * 2);
-            ctx.fillStyle = "#4a7ab5";
-            ctx.fill();
-            ctx.strokeStyle = "#fff";
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-        }
-
-        // X labels
-        drawDateXLabels(ctx, dates, xPos, h, pad);
+    function drawScatterChart(canvasId, points, axis, crosshair) {
+        drawTrendsLineChart(canvasId, [{ label: "VDOT", data: points, color: "#4a7ab5", lineColor: "rgba(74,122,181,0.4)", radius: 4 }], {
+            axis, crosshair, formatY: v => v.toFixed(1),
+        });
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // ── Predicted VDOT Chart (Trends tab) ─────────────────────────
-    // ═══════════════════════════════════════════════════════════════
-
-    function drawPredictedVdotChart(canvasId, linePts, scatterPts) {
-        const canvas = document.getElementById(canvasId);
-        if (!canvas || !linePts.length) return;
-        const { ctx, w, h } = initCanvas(canvas);
-        const pad = { top: 10, right: 10, bottom: 22, left: 40 };
-        const cw = w - pad.left - pad.right;
-        const ch = h - pad.top - pad.bottom;
-
-        // Merge all values for Y range
-        const allVals = linePts.map(p => p.value).concat(scatterPts.map(p => p.value));
-        let vMin = Math.min(...allVals);
-        let vMax = Math.max(...allVals);
-        const vPad = (vMax - vMin) * 0.15 || 1;
-        vMin -= vPad;
-        vMax += vPad;
-
-        // Merge all dates for X range
-        const allDates = linePts.map(p => new Date(p.date + "T00:00:00").getTime())
-            .concat(scatterPts.map(p => new Date(p.date + "T00:00:00").getTime()));
-        const uniqueDates = [...new Set(allDates)].sort((a, b) => a - b);
-
-        const xPos = dateXPositioner(uniqueDates, pad, cw);
-        const yPos = v => pad.top + (1 - (v - vMin) / (vMax - vMin || 1)) * ch;
-
-        // Y grid
-        ctx.fillStyle = "#aaa";
-        ctx.font = "9px -apple-system, sans-serif";
-        ctx.textAlign = "right";
-        for (let i = 0; i <= 4; i++) {
-            const v = vMin + ((vMax - vMin) * i) / 4;
-            const y = yPos(v);
-            ctx.beginPath();
-            ctx.moveTo(pad.left, y);
-            ctx.lineTo(w - pad.right, y);
-            ctx.strokeStyle = "#eee";
-            ctx.lineWidth = 0.5;
-            ctx.stroke();
-            ctx.fillText(v.toFixed(1), pad.left - 4, y + 3);
-        }
-
-        // Predicted line
-        ctx.beginPath();
-        const lpts = linePts.map(p => ({
-            x: xPos(new Date(p.date + "T00:00:00").getTime()),
-            y: yPos(p.value),
-        }));
-        ctx.moveTo(lpts[0].x, lpts[0].y);
-        for (let i = 1; i < lpts.length; i++) ctx.lineTo(lpts[i].x, lpts[i].y);
-        ctx.strokeStyle = "#4a7ab5";
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-
-        // Fill under line
-        ctx.beginPath();
-        ctx.moveTo(lpts[0].x, lpts[0].y);
-        for (let i = 1; i < lpts.length; i++) ctx.lineTo(lpts[i].x, lpts[i].y);
-        ctx.lineTo(lpts[lpts.length - 1].x, pad.top + ch);
-        ctx.lineTo(lpts[0].x, pad.top + ch);
-        ctx.closePath();
-        ctx.fillStyle = "rgba(74, 122, 181, 0.08)";
-        ctx.fill();
-
-        // Race VDOT scatter dots
-        for (const p of scatterPts) {
-            const x = xPos(new Date(p.date + "T00:00:00").getTime());
-            const y = yPos(p.value);
-            ctx.beginPath();
-            ctx.arc(x, y, 5, 0, Math.PI * 2);
-            ctx.fillStyle = "#c05050";
-            ctx.fill();
-            ctx.strokeStyle = "#fff";
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-        }
-
-        // X labels
-        drawDateXLabels(ctx, uniqueDates, xPos, h, pad);
-
-        // Legend
-        const parent = canvas.parentElement;
-        let legendDiv = parent.querySelector(".chart-legend");
-        if (!legendDiv) {
-            legendDiv = document.createElement("div");
-            legendDiv.className = "chart-legend";
-            parent.appendChild(legendDiv);
-        }
-        legendDiv.innerHTML = [
-            `<span class="chart-legend-item"><span class="chart-legend-swatch" style="background:#4a7ab5"></span>Predicted</span>`,
-            `<span class="chart-legend-item"><span class="chart-legend-swatch" style="background:#c05050;border-radius:50%;width:8px;height:8px"></span>Race Actual</span>`,
-        ].join("");
+    function drawPredictedVdotChart(canvasId, linePts, scatterPts, axis, crosshair) {
+        drawTrendsLineChart(canvasId, [
+            { label: "Predicted", data: linePts, color: "#4a7ab5", fill: true },
+            { label: "Race Actual", data: scatterPts, color: "#c05050", line: false, radius: 5 },
+        ], { axis, crosshair, formatY: v => v.toFixed(1), legend: true });
     }
 
     // ═══════════════════════════════════════════════════════════════

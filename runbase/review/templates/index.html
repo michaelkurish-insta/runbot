@@ -18,7 +18,15 @@
             <button class="tab-btn" data-tab="race-prediction">Race Prediction</button>
         </nav>
         <button id="btn-import" class="btn-import" title="Run import pipeline">Import</button>
-        <span id="import-status" class="import-status"></span>
+        <span id="import-status" class="import-status" role="status" aria-live="polite"></span>
+        <details id="import-details" class="import-details" hidden>
+            <summary>Import details</summary>
+            <pre id="import-output"></pre>
+        </details>
+        <details id="system-details" class="import-details">
+            <summary id="system-summary">System status</summary>
+            <pre id="system-output" role="status">Checking connections and recent activities...</pre>
+        </details>
     </header>
 
     <div class="tab-content active" id="tab-calendar">
@@ -247,6 +255,7 @@
                 </div>
             </div>
             <div class="modal-footer">
+                <p id="modal-save-error" class="modal-save-error" role="alert" hidden></p>
                 <button class="modal-btn modal-btn-new" id="modal-btn-new">+ New Activity</button>
                 <button class="modal-btn modal-btn-close" id="modal-btn-close">Close</button>
                 <button class="modal-btn modal-btn-save" id="modal-btn-save" disabled>Save</button>

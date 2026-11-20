@@ -412,7 +412,7 @@ def cmd_vdot(args):
         paces = vdot_to_paces(vdot)
         print(f"Current VDOT: {vdot}")
         print(f"\nTraining paces:")
-        for zone in ("E", "M", "T", "I", "R", "FR"):
+        for zone in ("E", "M", "T", "CV", "I", "R", "FR"):
             pace = paces[zone]
             print(f"  {zone:3s}  {format_pace(pace)}/mi")
 
@@ -574,22 +574,31 @@ def cmd_pipeline(args):
     from runbase.ingest.icloud_sync import sync_icloud
 
     icloud_result = sync_icloud(config, verbose=verbose)
-    new_activity_ids = [
-        d["activity_id"] for d in icloud_result.get("details", [])
-        if d.get("status") == "new" and d.get("activity_id")
-    ]
 
     if verbose or icloud_result["new"]:
         print(f"  {icloud_result['new']} new, {icloud_result['skipped']} skipped")
+    if icloud_result["errors"]:
+        _print_sync_summary(icloud_result)
 
     # Step 2: Strava sync
     if verbose:
         print("\n=== Strava sync ===")
     from runbase.ingest.strava_sync import sync_strava
 
-    strava_result = sync_strava(config, verbose=verbose, fetch_streams=True)
+    from pathlib import Path
+    token_file = config.get("strava", {}).get("token_file")
+    strava_result = {"matched": 0, "fields_filled": 0, "errors": 0}
+    if token_file and Path(token_file).expanduser().is_file():
+        strava_result = sync_strava(config, verbose=verbose, fetch_streams=True)
+    else:
+        print("WARNING: Strava skipped: login tokens are missing. "
+              "Restore strava_tokens.json or run scripts/setup_strava_auth.py. "
+              "HealthFit import can still complete.", flush=True)
     if verbose or strava_result["matched"]:
         print(f"  {strava_result['matched']} matched, {strava_result['fields_filled']} fields filled")
+    if strava_result.get("unmatched"):
+        print(f"WARNING: {strava_result['unmatched']} Strava activities are not on the calendar yet. "
+              "See System status for dates that need review.", flush=True)
 
     # Step 2.5: Garmin sync (if configured)
     garmin_result = {"matched": 0, "fields_filled": 0}
@@ -641,8 +650,14 @@ def cmd_pipeline(args):
     if verbose or reconciled_ids:
         print(f"  {len(reconciled_ids)} reconciled from {len(rows)} unlinked")
 
-    # Include reconciled activities in the enrichment pass
-    enrich_ids = list(set(new_activity_ids + reconciled_ids))
+    # Strava names/types can change classification after the initial FIT pass.
+    # The source marker is committed with the merge and cleared by enrichment,
+    # so failed or interrupted secondary enrichment is retried on the next run.
+    pending_ids = [row[0] for row in conn.execute(
+        "SELECT DISTINCT activity_id FROM activity_sources WHERE activity_id IS NOT NULL "
+        "AND json_extract(metadata_json, '$.enrichment_pending') = 1"
+    )]
+    enrich_ids = list(dict.fromkeys(reconciled_ids + pending_ids))
 
     # Step 3: Enrich new + reconciled activities
     if enrich_ids:
@@ -652,6 +667,7 @@ def cmd_pipeline(args):
 
         for aid in enrich_ids:
             enrich_activity(conn, aid, config, verbose=verbose)
+        print(f"Enrichment complete: {len(enrich_ids)} enriched after source updates.", flush=True)
     elif verbose:
         print("\n  No new activities to enrich.")
 
@@ -664,7 +680,12 @@ def cmd_pipeline(args):
     if garmin_matched:
         parts.append(f"{garmin_matched} Garmin matched")
     parts.append(f"{len(reconciled_ids)} reconciled")
+    if icloud_result.get("resumed"):
+        parts.append(f"{icloud_result['resumed']} resumed")
     print(f"\nPipeline complete: {', '.join(parts)}")
+    if icloud_result["errors"] or strava_result.get("errors") or garmin_result.get("errors"):
+        print("Import finished with errors. See the source details above.", flush=True)
+        sys.exit(1)
 
 
 def cmd_review(args):
@@ -681,6 +702,16 @@ def cmd_stub(name):
     def handler(args):
         print(f"'{name}' is not yet implemented.")
     return handler
+
+
+def cmd_status(args):
+    from runbase.config import load_config
+    from runbase.status import system_status
+    report = system_status(load_config())
+    for check in report['checks']:
+        print(f"{check['status'].upper()}: {check['name']}: {check['message']}")
+    if not report['ok']:
+        raise SystemExit(1)
 
 
 def main():
@@ -776,7 +807,7 @@ def main():
     review_parser.set_defaults(func=cmd_review)
 
     status_parser = subparsers.add_parser("status", help="Show pipeline status")
-    status_parser.set_defaults(func=cmd_stub("status"))
+    status_parser.set_defaults(func=cmd_status)
 
     args = parser.parse_args()
     if not args.command:

@@ -256,6 +256,8 @@ def _migrate_schema(conn):
         ("intervals", "pace_zone", "TEXT"),
         ("intervals", "is_walking", "BOOLEAN DEFAULT FALSE"),
         ("intervals", "is_stride", "BOOLEAN DEFAULT FALSE"),
+        ("intervals", "is_hill_sprint", "BOOLEAN DEFAULT FALSE"),
+        ("intervals", "lap_kind", "TEXT"),
         ("intervals", "location_type", "TEXT"),
         ("intervals", "start_timestamp_s", "REAL"),
         ("intervals", "end_timestamp_s", "REAL"),
@@ -289,6 +291,7 @@ def _migrate_schema(conn):
         ("activities", "suppress_hr", "INTEGER"),
         ("activities", "suppress_cadence", "INTEGER"),
         ("activities", "exclude_from_vdot", "INTEGER"),
+        ("activities", "vdot_exclusion_source", "TEXT"),
     ]
 
     existing = {}
@@ -329,6 +332,15 @@ def _migrate_schema(conn):
             override_value  TEXT NOT NULL,
             created_at      TEXT DEFAULT (datetime('now')),
             UNIQUE(activity_id, field_name)
+        );
+        CREATE TABLE IF NOT EXISTS interval_zone_overrides (
+            id              INTEGER PRIMARY KEY,
+            activity_id     INTEGER NOT NULL REFERENCES activities(id),
+            source          TEXT NOT NULL,
+            rep_number      INTEGER NOT NULL,
+            pace_zone       TEXT NOT NULL,
+            created_at      TEXT DEFAULT (datetime('now')),
+            UNIQUE(activity_id, source, rep_number)
         );
         CREATE TABLE IF NOT EXISTS planned_activities (
             id              INTEGER PRIMARY KEY,

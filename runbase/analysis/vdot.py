@@ -1,7 +1,8 @@
 """VDOT calculator using the Daniels-Gilbert formula.
 
 Provides race-to-VDOT conversion, training pace derivation, and pace zone
-classification for Jack Daniels training zones (E/M/T/I/R/FR).
+classification for Jack Daniels training zones (E/M/T/I/R/FR), with a CV
+planning pace interpolated between T and I.
 """
 
 import math
@@ -13,6 +14,7 @@ ZONE_PCT_VO2MAX = {
     "E": 0.70,
     "M": 0.82,
     "T": 0.88,
+    "CV": 0.93,     # planning estimate: midpoint between T and I oxygen demands
     "I": 0.98,      # ~97.5-98.1% across VDOTs, not 100%
     "R": 1.075,     # ~107-108% across VDOTs (faster than VO2max velocity)
     "FR": 1.15,     # fast reps: roughly midway between R and sprint

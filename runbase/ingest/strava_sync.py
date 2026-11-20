@@ -6,6 +6,7 @@ with activity_id=NULL for later review.
 """
 
 import json
+import os
 import time as time_mod
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -103,16 +104,30 @@ def _load_tokens(config: dict) -> dict:
 
 
 def _save_tokens(config: dict, tokens: dict):
-    """Save tokens to disk."""
+    """Replace tokens atomically without exposing them to other local users."""
     token_path = Path(config["strava"]["token_file"]).expanduser()
     token_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(token_path, "w") as f:
+    temporary = token_path.with_suffix(".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.chmod(temporary, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(tokens, f, indent=2)
+    temporary.replace(token_path)
+
+
+def _configure_client_credentials(config: dict):
+    """Supply the configured app credentials to stravalib's environment API."""
+    for key in ("client_id", "client_secret"):
+        value = str(config.get("strava", {}).get(key) or os.environ.get(f"STRAVA_{key.upper()}", ""))
+        if not value or value.startswith("$"):
+            raise ValueError(f"Strava {key} is missing from config.")
+        os.environ[f"STRAVA_{key.upper()}"] = value
 
 
 def _get_client(config: dict) -> Client:
     """Create an authenticated stravalib Client, refreshing tokens if needed."""
     tokens = _load_tokens(config)
+    _configure_client_credentials(config)
 
     # Refresh if expired or expiring within 60s
     if tokens["expires_at"] < time_mod.time() + 60:
@@ -125,14 +140,25 @@ def _get_client(config: dict) -> Client:
             client_secret=client_secret,
             refresh_token=tokens["refresh_token"],
         )
-        tokens = {
+        tokens = {**tokens,
             "access_token": new_tokens["access_token"],
             "refresh_token": new_tokens["refresh_token"],
             "expires_at": new_tokens["expires_at"],
         }
         _save_tokens(config, tokens)
 
-    client = Client(access_token=tokens["access_token"])
+    client = Client(access_token=tokens["access_token"],
+                    token_expires=tokens["expires_at"], refresh_token=tokens["refresh_token"])
+    refresh = client.protocol.refresh_access_token
+
+    def refresh_and_save(*args, **kwargs):
+        refreshed = refresh(*args, **kwargs)
+        tokens.update({key: refreshed[key] for key in ('access_token', 'refresh_token', 'expires_at')})
+        _save_tokens(config, tokens)
+        return refreshed
+
+    # Persist rotations triggered inside a long-running stravalib request too.
+    client.protocol.refresh_access_token = refresh_and_save
     return client
 
 
@@ -217,7 +243,9 @@ def _extract_strava_data(strava_act) -> dict:
 
     start_time = None
     if strava_act.start_date_local:
-        start_time = strava_act.start_date_local.isoformat()
+        # Strava's local timestamp carries a placeholder +00:00, not a UTC
+        # instant. Store local wall time, consistent with HealthFit imports.
+        start_time = strava_act.start_date_local.replace(tzinfo=None).isoformat()
 
     total_ascent_ft = None
     if strava_act.total_elevation_gain is not None:
@@ -261,6 +289,7 @@ def _extract_strava_data(strava_act) -> dict:
         "total_ascent_ft": total_ascent_ft,
         "calories": calories,
         "gear_id": gear_id,
+        "workout_type": getattr(strava_act, "workout_type", None),
     }
 
 
@@ -289,6 +318,8 @@ def _insert_activity_source(conn, activity_id: int | None, strava_data: dict,
         "gear_id": strava_data.get("gear_id"),
         "start_date": strava_data.get("date"),
         "start_time": strava_data.get("start_time"),
+        "workout_type": strava_data.get("workout_type"),
+        "enrichment_pending": True,
     }
     if strava_data.get("elapsed_s"):
         metadata["elapsed_s"] = strava_data["elapsed_s"]
@@ -366,8 +397,7 @@ def _fetch_and_insert_streams(client, conn, strava_id: str, activity_id: int,
             int(strava_id), types=stream_types, resolution="high"
         )
     except Exception as e:
-        if verbose:
-            print(f"    WARN streams fetch failed: {e}")
+        print(f"WARNING: Strava streams could not be fetched for activity #{activity_id}: {e}")
         return 0
 
     _update_rate_limiter(client, rate_limiter)
@@ -447,6 +477,30 @@ def _update_rate_limiter(client, rate_limiter: StravaRateLimiter):
         pass
 
 
+def _legacy_shoe_for_gear(conn, gear_id: str) -> int | None:
+    """Reuse a legacy shoe only when linked Strava records identify its gear.
+
+    A matching model name alone is not evidence: runners can own multiple pairs.
+    Conflicting gear IDs or multiple candidates are deliberately left separate.
+    """
+    known_gears = {}
+    for shoe_id, metadata_json in conn.execute(
+        """SELECT s.id, src.metadata_json
+           FROM shoes s JOIN activities a ON a.shoe_id = s.id
+           JOIN activity_sources src ON src.activity_id = a.id
+           WHERE s.strava_gear_id IS NULL AND src.source = 'strava'"""
+    ):
+        try:
+            metadata = json.loads(metadata_json or '{}')
+        except (TypeError, ValueError):
+            continue
+        linked_gear = metadata.get('gear_id') if isinstance(metadata, dict) else None
+        if linked_gear:
+            known_gears.setdefault(shoe_id, set()).add(linked_gear)
+    candidates = [shoe_id for shoe_id, gears in known_gears.items() if gears == {gear_id}]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _ensure_shoe(conn, client, gear_id: str, shoe_cache: dict,
                  rate_limiter: StravaRateLimiter, verbose: bool) -> int | None:
     """Look up or create a shoe from Strava gear_id. Returns shoes.id or None."""
@@ -461,13 +515,20 @@ def _ensure_shoe(conn, client, gear_id: str, shoe_cache: dict,
         shoe_cache[gear_id] = row[0]
         return row[0]
 
+    legacy_id = _legacy_shoe_for_gear(conn, gear_id)
+    if legacy_id is not None:
+        conn.execute("UPDATE shoes SET strava_gear_id = ? WHERE id = ?", (gear_id, legacy_id))
+        shoe_cache[gear_id] = legacy_id
+        if verbose:
+            print(f"    SHOE linked existing shoe #{legacy_id} to gear {gear_id}")
+        return legacy_id
+
     # Fetch from Strava API
     try:
         gear = client.get_gear(gear_id)
         _update_rate_limiter(client, rate_limiter)
     except Exception as e:
-        if verbose:
-            print(f"    WARN gear fetch failed for {gear_id}: {e}")
+        print(f"WARNING: Strava shoe details could not be fetched for {gear_id}: {e}")
         shoe_cache[gear_id] = None
         return None
 
@@ -708,7 +769,7 @@ def sync_strava(config: dict, dry_run: bool = False, verbose: bool = False,
             if act_type in RUNNING_TYPES:
                 strava_activities.append(act)
     except Exception as e:
-        print(f"Error fetching activity list: {e}")
+        print(f"ERROR: Could not fetch Strava activities: {e}")
         conn.close()
         return {"matched": 0, "unmatched": 0, "skipped": 0, "errors": 1,
                 "fields_filled": 0, "laps_inserted": 0, "streams_inserted": 0,
@@ -799,6 +860,9 @@ def sync_strava(config: dict, dry_run: bool = False, verbose: bool = False,
                                 if verbose:
                                     print(f"    SHOE → shoe #{shoe_id}")
 
+                    if rate_limiter.aborted:
+                        raise RuntimeError("Daily API limit interrupted this activity; it will be retried.")
+
                     # Record in processed_files
                     conn.execute(
                         "INSERT INTO processed_files (file_path, source, activity_id) VALUES (?, ?, ?)",
@@ -849,8 +913,13 @@ def sync_strava(config: dict, dry_run: bool = False, verbose: bool = False,
             except Exception:
                 pass
 
-    # Update sync_state
-    if not dry_run and (result["matched"] > 0 or result["unmatched"] > 0):
+    if rate_limiter.aborted:
+        result["errors"] += 1
+        print("ERROR: Strava sync stopped at the daily API limit; retry after midnight UTC.")
+
+    # Keep the previous checkpoint on partial failure so a retry sees failed
+    # activities, even when newer activities already committed successfully.
+    if not dry_run and result["errors"] == 0:
         now = datetime.now(timezone.utc).isoformat()
         meta = {
             "matched": result["matched"],
@@ -858,6 +927,8 @@ def sync_strava(config: dict, dry_run: bool = False, verbose: bool = False,
         }
         if latest_timestamp:
             meta["last_activity_timestamp"] = latest_timestamp.isoformat()
+        elif after:
+            meta["last_activity_timestamp"] = after.isoformat()
 
         conn.execute(
             """INSERT INTO sync_state (source, last_sync_at, metadata_json)

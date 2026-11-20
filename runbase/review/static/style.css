@@ -162,6 +162,26 @@ header {
     min-width: 0;
 }
 
+.trends-chart-wrap canvas {
+    height: 200px;
+    cursor: crosshair;
+    touch-action: none;
+    user-select: none;
+}
+
+.trends-chart-wrap canvas:focus-visible {
+    outline: 2px solid #4a7ab5;
+    outline-offset: 2px;
+}
+
+.trends-chart-readout {
+    min-height: 18px;
+    margin-top: 4px;
+    color: #596674;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
 .trends-race-table {
     width: 100%;
     border-collapse: collapse;
@@ -309,6 +329,23 @@ header {
 
 .import-status.success { color: #2E7D32; }
 .import-status.error { color: #C62828; }
+.import-status.warning { color: #8a5700; }
+.iv-zone-trigger { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+.iv-zone-trigger:hover { text-decoration: underline; }
+.iv-zone-trigger:focus-visible { outline: 1px solid currentColor; outline-offset: 2px; }
+.iv-zone-select { font: inherit; max-width: 140px; padding: 0; }
+.iv-points { text-align: right; font-variant-numeric: tabular-nums; }
+.split-save-error { color: #b3261e; }
+.import-status { max-width: 34vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.import-details { position: relative; margin-left: 8px; font-size: 11px; }
+.import-details summary { cursor: pointer; white-space: nowrap; }
+.import-details pre {
+    position: absolute; right: 0; top: 20px; z-index: 1000;
+    width: min(700px, 90vw); max-height: 55vh; overflow: auto;
+    margin: 0; padding: 12px; background: #fff; color: #333;
+    border: 1px solid #ccc; border-radius: 4px;
+    box-shadow: 0 4px 16px #0002; white-space: pre-wrap; overflow-wrap: anywhere;
+}
 
 /* ── Layout: sidebar + main ──────────────────────────────────── */
 .layout {
@@ -761,6 +798,8 @@ header {
     flex-shrink: 0;
 }
 
+.modal-save-error { margin: 0 auto 0 0; color: #b3261e; font-size: 12px; }
+
 .modal-btn {
     padding: 5px 16px;
     border: none;
@@ -849,6 +888,7 @@ header {
 .zone-E  { color: #2E7D32; }
 .zone-M  { color: #F57F17; }
 .zone-T  { color: #E65100; }
+.zone-CV { color: #d84315; }
 .zone-I  { color: #C62828; }
 .zone-R  { color: #6A1B9A; }
 .zone-FR { color: #AD1457; }
@@ -857,6 +897,7 @@ header {
 .zone-bg-E  { background: rgba(76,175,80,0.10); }
 .zone-bg-M  { background: rgba(255,193,7,0.10); }
 .zone-bg-T  { background: rgba(255,152,0,0.10); }
+.zone-bg-CV { background: rgba(216,67,21,0.10); }
 .zone-bg-I  { background: rgba(244,67,54,0.10); }
 .zone-bg-R  { background: rgba(156,39,176,0.10); }
 .zone-bg-FR { background: rgba(233,30,99,0.10); }

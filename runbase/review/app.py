@@ -1,8 +1,7 @@
 import math
 import re
 import sqlite3
-import subprocess
-import threading
+import sys
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -11,6 +10,9 @@ from flask import Flask, jsonify, render_template, request
 
 from runbase.config import load_config
 from runbase.db import get_connection, _migrate_schema
+from runbase.analysis.interval_sources import preferred_intervals, effective_intervals, is_auto_split
+from runbase.analysis.vdot_eligibility import refresh_stride_vdot_exclusion
+from runbase.review.import_job import ImportJob
 
 
 def create_app(config=None):
@@ -90,7 +92,8 @@ def create_app(config=None):
         ).fetchall()
         all_cvd = conn.execute(
             "SELECT date, computed_vdot, duration_s FROM activities "
-            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) ORDER BY date",
+            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) "
+            "AND NOT COALESCE(suppress_hr, 0) ORDER BY date",
         ).fetchall()
         cvd_list = [(r[0], r[1], r[2] or 0) for r in all_cvd]
 
@@ -185,13 +188,41 @@ def create_app(config=None):
         first_day_offset = (first.weekday() + 1) % 7  # Mon=0..Sun=6 → Sun=0..Sat=6
         return ((dt.day - 1 + first_day_offset) // 7) + 1
 
-    ZONE_PRIORITY = {"FR": 6, "R": 5, "I": 4, "T": 3, "M": 2, "E": 1}
+    ZONE_PRIORITY = {"FR": 7, "R": 6, "I": 5, "CV": 4, "T": 3, "M": 2, "E": 1}
+
+    def _apply_interval_zone_overrides(conn, rows):
+        """Read saved zone edits without rewriting imported interval data."""
+        intervals = [dict(row) for row in rows]
+        ids = list({iv["activity_id"] for iv in intervals})
+        if not ids:
+            return intervals
+        placeholders = ",".join("?" * len(ids))
+        overrides = {(r["activity_id"], r["source"], r["rep_number"]): r["pace_zone"]
+                     for r in conn.execute(
+                         f"SELECT * FROM interval_zone_overrides WHERE activity_id IN ({placeholders})",
+                         ids,
+                     )}
+        for iv in intervals:
+            key = (iv["activity_id"], iv["source"], iv["rep_number"])
+            if key in overrides:
+                iv["pace_zone"] = overrides[key]
+                iv["zone_overridden"] = True
+            elif iv["source"] in (None, "manual"):
+                # Older edits relabeled recorded laps 'manual'. Recover an
+                # unambiguous override under the original recorded source.
+                matches = [zone for (aid, source, rep), zone in overrides.items()
+                           if aid == iv["activity_id"] and rep == iv["rep_number"]
+                           and source in ("fit_lap", "strava_lap", "xlsx_split")]
+                if len(matches) == 1:
+                    iv["pace_zone"] = matches[0]
+                    iv["zone_overridden"] = True
+        return intervals
 
     def _get_workout_types(conn, activity_ids):
         """Get predominant pace zone per activity from qualifying intervals.
 
-        Uses FIT-preferred logic: when an activity has both FIT (NULL source)
-        and strava_lap intervals, only FIT intervals are considered.
+        Prefer recorded FIT laps (NULL or fit_lap) over Strava and generated
+        mile splits, selecting the source before filtering qualifying reps.
 
         When an activity has work intervals at multiple distinct distances,
         returns a combo type (e.g. "I/R") with zones sorted slowest-first.
@@ -200,43 +231,27 @@ def create_app(config=None):
             return {}
         placeholders = ",".join("?" * len(activity_ids))
         rows = conn.execute(
-            f"""SELECT activity_id, pace_zone, source,
+            f"""SELECT activity_id, rep_number, lap_kind, pace_zone, source, duration_s, is_recovery, is_walking,
+                       is_stride, is_hill_sprint, gps_measured_distance_mi,
                        COALESCE(canonical_distance_mi, gps_measured_distance_mi,
                                 prescribed_distance_mi) as dist
                 FROM intervals
-                WHERE activity_id IN ({placeholders})
-                  AND pace_zone IS NOT NULL
-                  AND NOT is_recovery
-                  AND NOT is_walking
-                  AND NOT is_stride
-                  AND NOT is_hill_sprint
-                  AND gps_measured_distance_mi > 0.015
-                  AND (source IS NULL OR source NOT IN ('pace_segment'))""",
+                WHERE activity_id IN ({placeholders})""",
             activity_ids,
         ).fetchall()
 
-        # Find which activities have ANY FIT (NULL-source) non-pace-segment intervals.
-        # Check all intervals, not just qualifying ones — an activity with only
-        # stride FIT laps still has FIT data, so its Strava laps should be hidden.
-        fit_check = conn.execute(
-            f"""SELECT DISTINCT activity_id FROM intervals
-                WHERE activity_id IN ({placeholders})
-                  AND source IS NULL
-                  AND (source IS NULL OR source != 'pace_segment')""",
-            activity_ids,
-        ).fetchall()
-        has_fit = {r["activity_id"] for r in fit_check}
-
-        # Group qualifying intervals per activity (skip strava_lap when FIT exists)
         by_act = {}
-        for r in rows:
-            aid = r["activity_id"]
-            if r["source"] == "strava_lap" and aid in has_fit:
-                continue
-            by_act.setdefault(aid, []).append(r)
+        for r in _apply_interval_zone_overrides(conn, rows):
+            by_act.setdefault(r["activity_id"], []).append(r)
 
         result = {}
         for aid, intervals in by_act.items():
+            intervals = [iv for iv in effective_intervals(intervals)
+                         if iv["pace_zone"] is not None
+                         and not iv.get("is_partial_split")
+                         and not any(iv[field] for field in
+                                     ("is_recovery", "is_walking", "is_stride", "is_hill_sprint"))
+                         and (iv["gps_measured_distance_mi"] or 0) > 0.015]
             # Cluster by distance: round to nearest 50m bucket
             dist_clusters = {}
             for iv in intervals:
@@ -259,7 +274,9 @@ def create_app(config=None):
             # work type.  Drop E (and M) from combos — "E/I" is just "I".
             # Keep E or M only when it's the sole zone present.
             if len(unique_zones) > 1:
-                unique_zones -= {"E", "M"}
+                unique_zones.discard("E")
+                if len(unique_zones) > 1:
+                    unique_zones.discard("M")
             if len(unique_zones) <= 1:
                 # Single zone — use it directly
                 result[aid] = next(iter(unique_zones)) if unique_zones else ""
@@ -289,6 +306,7 @@ def create_app(config=None):
     # ── Intensity Score ────────────────────────────────────────────
     INTENSITY_PTS_PER_MIN = {
         "walk": 0, "E": 0.2, "M": 0.4, "T": 0.6,
+        "CV": config.get("intensity", {}).get("cv_points_per_min", 0.8),
         "I": 1.0, "R": 1.5, "FR": 2.0,
     }
     STRIDE_PTS = 0.2   # flat per stride
@@ -305,7 +323,7 @@ def create_app(config=None):
         - Otherwise: zone multiplier * duration_minutes
         - Fallback: if no intervals, use activity-level pace to classify zone
           and multiply by activity duration
-        Uses FIT-preferred logic (skip strava_laps when FIT intervals exist).
+        Scores one representation of the run, retaining edited laps.
         """
         from runbase.analysis.vdot import classify_pace, vdot_to_boundaries, get_current_vdot
 
@@ -313,7 +331,8 @@ def create_app(config=None):
             return {}
         placeholders = ",".join("?" * len(activity_ids))
         rows = conn.execute(
-            f"""SELECT activity_id, pace_zone, duration_s, source,
+            f"""SELECT activity_id, rep_number, lap_kind, pace_zone, duration_s, source, canonical_distance_mi,
+                       gps_measured_distance_mi, prescribed_distance_mi,
                        is_stride, is_hill_sprint, is_walking, is_recovery
                 FROM intervals
                 WHERE activity_id IN ({placeholders})""",
@@ -322,23 +341,11 @@ def create_app(config=None):
 
         # Group by activity
         by_act = {}
-        for r in rows:
-            by_act.setdefault(r["activity_id"], []).append(r)
+        for r in _apply_interval_zone_overrides(conn, rows):
+            by_act.setdefault(r["activity_id"], []).append(dict(r))
 
-        # Determine which activities have manual laps (FIT, strava_lap, xlsx_split)
-        # vs only pace_segments. When manual laps exist, skip pace_segments
-        # to avoid double-counting the same time period.
-        has_manual_laps = set()
-        has_fit = set()
-        has_manual_splits = set()
-        for aid, intervals in by_act.items():
-            for iv in intervals:
-                if iv["source"] == "manual_split":
-                    has_manual_splits.add(aid)
-                elif iv["source"] != "pace_segment":
-                    has_manual_laps.add(aid)
-                if iv["source"] is None:
-                    has_fit.add(aid)
+        has_manual_splits = {aid for aid, intervals in by_act.items()
+                             if any(iv["source"] == "manual_split" for iv in intervals)}
 
         # Pre-fetch activity durations for interval coverage checks
         act_dur_map = {}
@@ -350,19 +357,6 @@ def create_app(config=None):
                 dur_ids,
             ).fetchall():
                 act_dur_map[ar["id"]] = ar["duration_s"] or 0
-
-        # Coverage check: if manual laps cover < 10% of activity duration,
-        # treat as if no manual laps exist (use pace_segments or fallback).
-        # Handles cases like a FIT file that only captured a few seconds.
-        for aid in list(has_manual_laps):
-            manual_dur = sum(
-                (iv["duration_s"] or 0)
-                for iv in by_act[aid]
-                if iv["source"] != "pace_segment"
-            )
-            act_dur = act_dur_map.get(aid, 0)
-            if act_dur > 60 and manual_dur / act_dur < 0.10:
-                has_manual_laps.discard(aid)
 
         # Pre-fetch activity distance/duration for manual_split remainder calculation
         act_info = {}
@@ -383,10 +377,8 @@ def create_app(config=None):
             if aid in has_manual_splits:
                 splits = [iv for iv in intervals if iv["source"] == "manual_split"]
                 # Also collect strides from other intervals
-                other = [iv for iv in intervals if iv["source"] != "manual_split"
-                         and iv["source"] != "pace_segment"]
-                if aid in has_fit:
-                    other = [iv for iv in other if iv["source"] != "strava_lap"]
+                other = [iv for iv in preferred_intervals(intervals)
+                         if iv["source"] != "manual_split"]
 
                 score = 0.0
                 split_dist = 0.0
@@ -434,14 +426,15 @@ def create_app(config=None):
                 result[aid] = round(score, 1) if score > 0 else None
                 continue
 
-            # Skip pace_segments when manual laps exist (avoid double-counting)
-            if aid in has_manual_laps:
-                visible = [iv for iv in intervals if iv["source"] != "pace_segment"]
-            else:
-                visible = intervals
-            # FIT-preferred: skip strava_lap when FIT exists
-            if aid in has_fit:
-                visible = [iv for iv in visible if iv["source"] != "strava_lap"]
+            visible = effective_intervals(intervals, include_pace_segments=True)
+            # A truncated recording should not hide a complete derived view.
+            # Use that alternate view alone, never add it to the partial laps.
+            act_dur = act_dur_map.get(aid, 0)
+            coverage = sum(iv["duration_s"] or 0 for iv in visible)
+            if act_dur > 60 and coverage / act_dur < 0.10:
+                derived = [iv for iv in intervals
+                           if iv["source"] in ("mile_split", "pace_segment")]
+                visible = effective_intervals(derived, include_pace_segments=True)
 
             score = 0.0
             scored_dur = 0.0
@@ -535,7 +528,7 @@ def create_app(config=None):
 
         # Time-based: "6x(3min I, 2min E)" or "6x(3min on, 2min off)"
         ZONE_ALIASES = {"ON": None, "OFF": "E"}  # ON = use row's zone
-        ZONE_NAMES = r'E|M|T|I|FR|R|on|off'
+        ZONE_NAMES = r'FR|CV|E|M|T|I|R|on|off'
         time_pat = re.compile(
             r'(\d+)\s*x\s*\(?\s*(\d+\.?\d*)\s*min(?:s|utes?)?\s+(' + ZONE_NAMES + r')'
             r'(?:\s*[,/]\s*(\d+\.?\d*)\s*min(?:s|utes?)?\s+(' + ZONE_NAMES + r'))?\s*\)?',
@@ -559,10 +552,15 @@ def create_app(config=None):
         # Distance-based: "8x200m", "6x400", "4x1mi @R", "3x1k @I"
         # Finds ALL NxD groups (e.g. "2x600 @R, 3x400 @I, 4x200 @FR") and sums them
         dist_pat = re.compile(
-            r'(\d+)\s*x\s*(\d+\.?\d*)\s*(mile|mi|k|km|m)?(?:\s*@\s*(FR|R|I|T|M|E))?',
+            r'(\d+)\s*x\s*(\d+\.?\d*)\s*(mile|mi|km|k|m)?(?:\s*@\s*(FR|CV|R|I|T|M|E))?',
             re.IGNORECASE,
         )
         matches = dist_pat.findall(name)
+        if not matches:
+            # A continuous effort can be written without an explicit "1x".
+            single = re.search(r'(?<![\w.])(\d+\.?\d*)\s*(mile|mi|km|k|m)\s*@\s*(FR|CV|R|I|T|M|E)\b', name, re.IGNORECASE)
+            if single:
+                matches = [("1", *single.groups())]
         if matches:
             total_work_mi = 0.0
             groups = []
@@ -669,21 +667,13 @@ def create_app(config=None):
                     rec_pace = vdot_to_paces(vdot).get(rec_zone, e_pace)
                 rec_dist = rec_time_min * 60 / rec_pace
             else:
-                # Default recovery by zone
-                if work_zone == "T":
-                    rec_time_min = 0
-                elif work_zone == "FR":
-                    rec_time_min = total_work_min * 2
-                elif work_zone in ("I", "M"):
-                    rec_time_min = total_work_min * (2 / 3)
-                else:  # R, E
-                    rec_time_min = total_work_min
-                score += rec_time_min * 0.2
-                rec_dist = rec_time_min * 60 / e_pace if rec_time_min else 0
+                # Unspecified recoveries are part of the remaining easy miles.
+                # Do not invent extra recovery time beyond the planned distance.
+                rec_dist = 0
 
             # Estimate work distance for WU/CD calc
             work_pace = e_pace
-            if vdot:
+            if vdot and work_zone != "E":
                 from runbase.analysis.vdot import vdot_to_paces
                 work_pace = vdot_to_paces(vdot).get(work_zone, e_pace)
             work_dist = total_work_min * 60 / work_pace
@@ -696,15 +686,14 @@ def create_app(config=None):
             return round(score, 1) if score > 0 else None
 
         # ── Distance-based structured workout ──
-        if structure and structure["type"] == "distance" and zone and zone != "E" and vdot:
+        if structure and structure["type"] == "distance" and vdot:
             from runbase.analysis.vdot import vdot_to_paces
             paces = vdot_to_paces(vdot)
-            is_combo = "/" in zone
+            is_combo = "/" in (zone or "")
             groups = structure.get("groups", [])
 
             score = 0.0
             total_work_dist = 0.0
-            total_rec_dist = 0.0
 
             for g in groups:
                 # Determine zone for this group
@@ -713,33 +702,17 @@ def create_app(config=None):
                 elif is_combo:
                     g_zone = _zone_for_distance_m(g["dist_m"], zone)
                 else:
-                    g_zone = zone
+                    g_zone = zone or "E"
 
                 g_work_dist = g["reps"] * g["dist_mi"]
-                g_pace = paces.get(g_zone, e_pace)
+                g_pace = e_pace if g_zone == "E" else paces.get(g_zone, e_pace)
                 g_work_min = g_work_dist * g_pace / 60
                 g_mult = INTENSITY_PTS_PER_MIN.get(g_zone, 0.2)
                 score += g_work_min * g_mult
                 total_work_dist += g_work_dist
 
-                # Recovery by zone
-                if g_zone == "T":
-                    g_rec_min = 0
-                    g_rec_dist = 0
-                elif g_zone == "R":
-                    g_rec_dist = g_work_dist
-                    g_rec_min = g_rec_dist * e_pace / 60
-                elif g_zone == "FR":
-                    g_rec_min = g_work_min * 2
-                    g_rec_dist = g_rec_min * 60 / e_pace
-                else:  # I, M
-                    g_rec_min = g_work_min * (2 / 3)
-                    g_rec_dist = g_rec_min * 60 / e_pace
-
-                score += g_rec_min * 0.2
-                total_rec_dist += g_rec_dist
-
-            wucd_dist = max(distance_mi - total_work_dist - total_rec_dist - stride_dist, 0)
+            # Recovery, warmup, and cooldown share the remaining easy mileage.
+            wucd_dist = max(distance_mi - total_work_dist - stride_dist, 0)
             wucd_time_min = wucd_dist * e_pace / 60
             score += wucd_time_min * 0.2
             score += strides * STRIDE_PTS
@@ -784,18 +757,29 @@ def create_app(config=None):
         """Merge multiple activities on the same day into one summary row.
 
         Distance/duration/strides are summed. Pace/HR/cadence/shoe/name/notes/vdot
-        come from the primary (largest distance) activity. All activity IDs are
-        kept for detail expansion.
+        come from the primary (largest distance) activity. CVD is duration-weighted
+        across eligible activities only, using the same weights as AVD. All
+        activity IDs are kept for detail expansion.
         """
+        cvds = [
+            (a["computed_vdot"], max(a.get("duration_s") or 0, 60))
+            for a in day_acts
+            if a.get("computed_vdot") is not None
+            and not a.get("exclude_from_vdot") and not a.get("suppress_hr")
+        ]
+        daily_cvd = (sum(cvd * weight for cvd, weight in cvds)
+                     / sum(weight for _, weight in cvds)) if cvds else None
         if len(day_acts) == 1:
             a = day_acts[0].copy()
             a["activity_ids"] = [a["id"]]
+            a["computed_vdot"] = daily_cvd
             return a
 
         # Primary = largest distance
         primary = max(day_acts, key=lambda a: (a.get("adjusted_distance_mi") or a.get("distance_mi") or 0))
         merged = primary.copy()
         merged["activity_ids"] = [a["id"] for a in day_acts]
+        merged["computed_vdot"] = daily_cvd
 
         total_dist = sum((a.get("adjusted_distance_mi") or a.get("distance_mi") or 0) for a in day_acts)
         total_dur = sum((a.get("duration_s") or 0) for a in day_acts)
@@ -930,7 +914,8 @@ def create_app(config=None):
         avd_seed = (date(year, 1, 1) - timedelta(days=AVD_WINDOW_DAYS)).isoformat()
         avd_cvd_rows = conn.execute(
             "SELECT date, computed_vdot, duration_s FROM activities "
-            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) AND date >= ? ORDER BY date",
+            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) "
+            "AND NOT COALESCE(suppress_hr, 0) AND date >= ? ORDER BY date",
             (avd_seed,),
         ).fetchall()
         avd_cvd_list = [(r[0], r[1], r[2] or 0) for r in avd_cvd_rows]
@@ -1231,20 +1216,11 @@ def create_app(config=None):
         and strava_lap intervals exist, only FIT laps are shown.
         """
         rows = conn.execute(
-            """SELECT source, is_stride FROM intervals
+            """SELECT source, lap_kind, is_stride FROM intervals
                WHERE activity_id = ? AND (source IS NULL OR source != 'pace_segment')""",
             (activity_id,),
         ).fetchall()
-        fit_intervals = [r for r in rows if r["source"] is None]
-        strava_laps = [r for r in rows if r["source"] == "strava_lap"]
-        other = [r for r in rows if r["source"] not in (None, "strava_lap")]
-
-        if fit_intervals and strava_laps:
-            # FIT preferred: count from FIT + manual/other, exclude Strava
-            visible = fit_intervals + other
-        else:
-            visible = rows
-
+        visible = preferred_intervals(rows)
         count = sum(1 for r in visible if r["is_stride"])
         return count or None  # NULL if zero
 
@@ -1261,6 +1237,16 @@ def create_app(config=None):
         iv["display_pace"] = _format_pace(iv.get("avg_pace_s_per_mi"))
         iv["display_hr"] = f"{iv['avg_hr']:.1f}" if iv.get("avg_hr") else ""
         iv["display_cadence"] = f"{iv['avg_cadence']:.0f}" if iv.get("avg_cadence") else ""
+        if iv.get('is_walking'):
+            points = 0
+        elif iv.get('is_stride'):
+            points = STRIDE_PTS
+        elif iv.get('is_hill_sprint'):
+            points = HILL_PTS
+        else:
+            zone = iv.get('pace_zone')
+            points = INTENSITY_PTS_PER_MIN.get('E' if zone == 'walk' else zone, 0) * (iv.get('duration_s') or 0) / 60
+        iv['intensity_points'] = round(points, 2)
         return iv
 
     @app.route("/api/activity/<int:activity_id>/intervals")
@@ -1275,24 +1261,21 @@ def create_app(config=None):
         ).fetchall()
         intervals = []
         laps = []
-        for r in rows:
+        splits = []
+        for r in effective_intervals(_apply_interval_zone_overrides(conn, rows)):
             iv = _format_interval(r)
-            if iv.get("source") == "strava_lap":
+            if is_auto_split(iv):
+                splits.append(iv)
+            elif iv.get("source") == "strava_lap":
                 laps.append(iv)
             else:
                 intervals.append(iv)
-
-        # When both FIT laps and Strava laps exist, hide Strava laps
-        # (FIT has higher GPS resolution; showing both is confusing)
-        has_fit = any(iv.get("source") is None for iv in intervals)
-        if has_fit and laps:
-            laps = []
 
         # Build rep distance summary from whichever source we're showing
         summary = _build_rep_summary(intervals or laps)
 
         conn.close()
-        return jsonify({"intervals": intervals, "laps": laps, "summary": summary})
+        return jsonify({"intervals": intervals, "laps": laps, "splits": splits, "summary": summary})
 
     def _build_rep_summary(all_intervals):
         """Group work intervals by rep distance and compute averages.
@@ -1478,6 +1461,7 @@ def create_app(config=None):
             "suppress_hr": bool(a.get("suppress_hr")),
             "suppress_cadence": bool(a.get("suppress_cadence")),
             "exclude_from_vdot": bool(a.get("exclude_from_vdot")),
+            "vdot_exclusion_source": a.get("vdot_exclusion_source"),
             "overridden_fields": overridden,
         })
 
@@ -1493,6 +1477,10 @@ def create_app(config=None):
         if not updates:
             conn.close()
             return jsonify({"ok": False, "error": "No valid flags"}), 400
+        flags = updates.copy()
+        if "exclude_from_vdot" in updates:
+            # Both checked and unchecked are explicit choices, overriding defaults.
+            updates["vdot_exclusion_source"] = None
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         conn.execute(
             f"UPDATE activities SET {set_clause} WHERE id = ?",
@@ -1500,7 +1488,7 @@ def create_app(config=None):
         )
         conn.commit()
         conn.close()
-        return jsonify({"ok": True, **{k: bool(v) for k, v in updates.items()}})
+        return jsonify({"ok": True, **{k: bool(v) for k, v in flags.items()}})
 
     @app.route("/api/activity/<int:activity_id>/splits", methods=["POST"])
     def api_create_split(activity_id):
@@ -1683,6 +1671,8 @@ def create_app(config=None):
                         f"UPDATE activities SET {field} = ?, updated_at = datetime('now') WHERE id = ?",
                         (value, activity_id),
                     )
+        if field == "distance_mi":
+            refresh_stride_vdot_exclusion(conn, activity_id)
         conn.commit()
 
         # Return the activity date so JS can refresh aggregates
@@ -1711,32 +1701,17 @@ def create_app(config=None):
         ).fetchone()
         if row:
             aid = row["activity_id"]
-            # Sum non-walking interval distances, avoiding double-count
-            # when both NULL-source (FIT) and strava_lap exist
-            has_both = conn.execute(
-                """SELECT COUNT(DISTINCT CASE WHEN source IS NULL THEN 1 END) as has_null,
-                          COUNT(DISTINCT CASE WHEN source = 'strava_lap' THEN 1 END) as has_strava
-                   FROM intervals WHERE activity_id = ?
-                     AND (source IS NULL OR source = 'strava_lap')""",
-                (aid,),
-            ).fetchone()
-            if has_both["has_null"] and has_both["has_strava"]:
-                source_filter = "AND source = 'strava_lap'"
-            else:
-                source_filter = "AND (source IS NULL OR source != 'pace_segment')"
-            total = conn.execute(
-                f"""SELECT COALESCE(SUM(
-                       COALESCE(canonical_distance_mi, gps_measured_distance_mi, prescribed_distance_mi, 0)
-                   ), 0) as total
-                   FROM intervals
-                   WHERE activity_id = ? AND NOT is_walking
-                     {source_filter}""",
-                (aid,),
-            ).fetchone()["total"]
+            rows = conn.execute("SELECT * FROM intervals WHERE activity_id = ?", (aid,)).fetchall()
+            total = sum(
+                iv["canonical_distance_mi"] or iv["gps_measured_distance_mi"] or iv["prescribed_distance_mi"] or 0
+                for iv in preferred_intervals(rows)
+                if not iv["is_walking"] and iv["source"] != "manual_split"
+            )
             conn.execute(
                 "UPDATE activities SET adjusted_distance_mi = ? WHERE id = ?",
                 (total if total > 0 else None, aid),
             )
+            refresh_stride_vdot_exclusion(conn, aid)
         conn.commit()
         conn.close()
         return jsonify({"ok": True, "interval_id": interval_id, "is_walking": is_walking})
@@ -1752,7 +1727,8 @@ def create_app(config=None):
         value = bool(data.get("value", False))
         conn = get_db()
         conn.execute(
-            f"UPDATE intervals SET {field} = ?, source = 'manual' WHERE id = ?",
+            f"UPDATE intervals SET {field} = ?, source = CASE "
+            "WHEN source IN ('mile_split', 'manual_split') THEN source ELSE 'manual' END WHERE id = ?",
             (value, interval_id),
         )
 
@@ -1766,11 +1742,13 @@ def create_app(config=None):
             (new_strides, activity_id),
         )
 
+        vdot_eligibility = refresh_stride_vdot_exclusion(conn, activity_id)
         conn.commit()
         conn.close()
         return jsonify({
             "ok": True, "interval_id": interval_id, field: value,
             "activity_id": activity_id, "strides": new_strides,
+            **vdot_eligibility,
         })
 
     # ── Interval editing ──────────────────────────────────────────
@@ -1797,13 +1775,14 @@ def create_app(config=None):
             return jsonify({"error": "interval not found"}), 404
 
         iv = dict(row)
+        edited_source = iv["source"] if iv["source"] in ("mile_split", "manual_split") else "manual"
 
         if field == "distance":
             # Value is in miles
             dist = float(value)
             conn.execute(
-                "UPDATE intervals SET canonical_distance_mi = ?, source = 'manual' WHERE id = ?",
-                (dist, interval_id),
+                "UPDATE intervals SET canonical_distance_mi = ?, source = ? WHERE id = ?",
+                (dist, edited_source, interval_id),
             )
             # Recalculate pace if duration exists
             dur = iv.get("duration_s")
@@ -1817,8 +1796,8 @@ def create_app(config=None):
         elif field == "duration_s":
             dur = float(value)
             conn.execute(
-                "UPDATE intervals SET duration_s = ?, source = 'manual' WHERE id = ?",
-                (dur, interval_id),
+                "UPDATE intervals SET duration_s = ?, source = ? WHERE id = ?",
+                (dur, edited_source, interval_id),
             )
             # Recalculate pace if distance exists
             dist = iv.get("canonical_distance_mi") or iv.get("gps_measured_distance_mi") or iv.get("prescribed_distance_mi")
@@ -1832,17 +1811,42 @@ def create_app(config=None):
         elif field == "avg_hr":
             hr = float(value) if value else None
             conn.execute(
-                "UPDATE intervals SET avg_hr = ?, source = 'manual' WHERE id = ?",
-                (hr, interval_id),
+                "UPDATE intervals SET avg_hr = ?, source = ? WHERE id = ?",
+                (hr, edited_source, interval_id),
             )
 
         elif field == "pace_zone":
-            zone = value if value else None
+            if value not in (None, "", "E", "M", "T", "CV", "I", "R", "FR"):
+                conn.close()
+                return jsonify({"error": "Unknown intensity zone"}), 400
+            # Zone edits have their own persistent override. Preserve the
+            # recorded source and auto/manual lap kind for future imports.
+            edited_source = iv['source']
+            override_source = edited_source or 'fit_lap'
+            zone = value or None
+            if not zone:
+                from runbase.analysis.vdot import get_current_vdot, vdot_to_boundaries, classify_pace
+                date = conn.execute('SELECT date FROM activities WHERE id=?', (iv['activity_id'],)).fetchone()[0]
+                vdot = get_current_vdot(conn, date)
+                if vdot and iv.get('avg_pace_s_per_mi'):
+                    zone = classify_pace(iv['avg_pace_s_per_mi'], vdot_to_boundaries(vdot))
+                conn.execute(
+                    'DELETE FROM interval_zone_overrides WHERE activity_id=? AND rep_number=? AND source=?',
+                    (iv['activity_id'], iv['rep_number'], override_source),
+                )
             conn.execute(
-                "UPDATE intervals SET pace_zone = ?, source = 'manual' WHERE id = ?",
-                (zone, interval_id),
+                "UPDATE intervals SET pace_zone = ?, source = ? WHERE id = ?",
+                (zone, edited_source, interval_id),
             )
+            if value and iv["rep_number"] is not None:
+                conn.execute(
+                    """INSERT INTO interval_zone_overrides (activity_id, source, rep_number, pace_zone)
+                       VALUES (?, ?, ?, ?) ON CONFLICT(activity_id, source, rep_number)
+                       DO UPDATE SET pace_zone=excluded.pace_zone""",
+                    (iv["activity_id"], override_source, iv["rep_number"], zone),
+                )
 
+        refresh_stride_vdot_exclusion(conn, iv["activity_id"])
         conn.commit()
 
         # Fetch updated interval for response
@@ -2252,42 +2256,26 @@ def create_app(config=None):
 
     # ── Import pipeline ─────────────────────────────────────────────
 
-    _import_lock = threading.Lock()
-    _import_status = {"running": False, "output": "", "success": None}
+    import_job = ImportJob(
+        [sys.executable, "-u", "-m", "runbase", "pipeline", "-v"],
+        cwd=Path(__file__).resolve().parents[2],
+        timeout_s=config.get("review", {}).get("import_timeout_s", 1800),
+    )
 
     @app.route("/api/import", methods=["POST"])
     def api_import():
-        if _import_status["running"]:
-            return jsonify({"ok": False, "error": "Import already running"})
-        _import_status["running"] = True
-        _import_status["output"] = ""
-        _import_status["success"] = None
-
-        def run_pipeline():
-            try:
-                import sys
-                result = subprocess.run(
-                    [sys.executable, "-m", "runbase", "pipeline", "-v"],
-                    capture_output=True, text=True, timeout=300,
-                )
-                _import_status["output"] = result.stdout + result.stderr
-                _import_status["success"] = result.returncode == 0
-            except Exception as e:
-                _import_status["output"] = str(e)
-                _import_status["success"] = False
-            finally:
-                _import_status["running"] = False
-
-        threading.Thread(target=run_pipeline, daemon=True).start()
+        if not import_job.start():
+            return jsonify({"ok": False, "error": "Import already running"}), 409
         return jsonify({"ok": True, "message": "Import started"})
 
     @app.route("/api/import/status")
     def api_import_status():
-        return jsonify({
-            "running": _import_status["running"],
-            "success": _import_status["success"],
-            "output": _import_status["output"],
-        })
+        return jsonify(import_job.snapshot())
+
+    @app.route("/api/system/status")
+    def api_system_status():
+        from runbase.status import system_status
+        return jsonify(system_status(config))
 
     @app.route("/api/activity/<int:activity_id>/override/<field>", methods=["DELETE"])
     def api_delete_override(activity_id, field):
@@ -2317,9 +2305,11 @@ def create_app(config=None):
                 enrich_activity(conn, aid, cfg, verbose=False)
                 results.append({"id": aid, "ok": True})
             except Exception as e:
+                conn.rollback()
                 results.append({"id": aid, "ok": False, "error": str(e)})
         conn.close()
-        return jsonify({"ok": True, "results": results})
+        ok = all(result["ok"] for result in results)
+        return jsonify({"ok": ok, "results": results}), 200 if ok else 500
 
     @app.route("/api/activity/<int:activity_id>/vdot", methods=["POST"])
     def api_set_vdot(activity_id):
@@ -2454,17 +2444,31 @@ def create_app(config=None):
     def api_shoes_summary():
         conn = get_db()
         rows = conn.execute(
-            """SELECT s.id, s.name, s.brand, s.model, s.purchase_date, s.retired,
+            """WITH metrics AS (
+                   SELECT *, COALESCE(adjusted_distance_mi, distance_mi, 0) AS dist,
+                          CASE WHEN avg_pace_s_per_mi > 0
+                                    AND COALESCE(adjusted_distance_mi, distance_mi, 0) > 0
+                               THEN COALESCE(adjusted_distance_mi, distance_mi, 0)
+                               ELSE 0 END AS pace_distance,
+                          CASE WHEN computed_vdot IS NOT NULL
+                                    AND NOT COALESCE(exclude_from_vdot, 0)
+                                    AND NOT COALESCE(suppress_hr, 0)
+                               THEN MAX(COALESCE(duration_s, 0), 60)
+                               ELSE 0 END AS cvd_weight
+                   FROM activities
+               )
+               SELECT s.id, s.name, s.brand, s.model, s.purchase_date, s.retired,
                       COUNT(a.id) as activity_count,
-                      COALESCE(SUM(COALESCE(a.adjusted_distance_mi, a.distance_mi, 0)), 0) as total_miles,
+                      COALESCE(SUM(a.dist), 0) as total_miles,
                       MIN(a.date) as first_use,
                       MAX(a.date) as last_use,
-                      CASE WHEN SUM(CASE WHEN a.duration_s > 0 THEN COALESCE(a.adjusted_distance_mi, a.distance_mi, 0) ELSE 0 END) > 0
-                           THEN SUM(CASE WHEN a.duration_s > 0 THEN a.duration_s ELSE 0 END)
-                                / SUM(CASE WHEN a.duration_s > 0 THEN COALESCE(a.adjusted_distance_mi, a.distance_mi, 0) ELSE 0 END)
-                           ELSE NULL END as avg_pace
+                      SUM(a.avg_pace_s_per_mi * a.pace_distance)
+                          / NULLIF(SUM(a.pace_distance), 0) as avg_pace,
+                      SUM(a.computed_vdot * a.cvd_weight)
+                          / NULLIF(SUM(a.cvd_weight), 0) as avg_cvd,
+                      SUM(CASE WHEN a.cvd_weight > 0 THEN 1 ELSE 0 END) as cvd_count
                FROM shoes s
-               LEFT JOIN activities a ON a.shoe_id = s.id
+               LEFT JOIN metrics a ON a.shoe_id = s.id
                GROUP BY s.id
                ORDER BY s.retired ASC, last_use DESC""",
         ).fetchall()
@@ -2494,26 +2498,33 @@ def create_app(config=None):
     def api_trends():
         range_str = request.args.get("range", "1y")
         today_d = date.today()
+        conn = get_db()
 
         range_map = {"6m": 180, "1y": 365, "2y": 730}
         if range_str == "all":
-            range_start = date(2000, 1, 1)
+            first_date = conn.execute(
+                """SELECT MIN(day) FROM (
+                       SELECT MIN(date) AS day FROM activities WHERE date <= ?
+                       UNION ALL
+                       SELECT MIN(effective_date) AS day FROM vdot_history WHERE effective_date <= ?
+                   )""",
+                (today_d.isoformat(), today_d.isoformat()),
+            ).fetchone()[0]
+            range_start = date.fromisoformat(first_date) if first_date else today_d - timedelta(days=365)
         else:
             days = range_map.get(range_str, 365)
             range_start = today_d - timedelta(days=days)
-
-        conn = get_db()
 
         # ── Weekly aggregates (Sun-Sat) ────────────
         rows = conn.execute(
             """SELECT date,
                       COALESCE(adjusted_distance_mi, distance_mi, 0) as dist,
-                      COALESCE(duration_s, 0) as dur,
+                      avg_pace_s_per_mi as pace,
                       avg_hr
                FROM activities
-               WHERE date >= ?
+               WHERE date BETWEEN ? AND ?
                ORDER BY date""",
-            (range_start.isoformat(),),
+            (range_start.isoformat(), today_d.isoformat()),
         ).fetchall()
 
         week_buckets = {}
@@ -2523,11 +2534,15 @@ def create_app(config=None):
             sunday = (dt - timedelta(days=days_since_sunday)).date()
             key = sunday.isoformat()
             if key not in week_buckets:
-                week_buckets[key] = {"distance": 0.0, "duration": 0.0, "hr_sum": 0.0, "hr_dist": 0.0}
+                week_buckets[key] = {"distance": 0.0, "pace_duration": 0.0, "pace_distance": 0.0,
+                                     "hr_sum": 0.0, "hr_dist": 0.0}
             dist = r["dist"]
-            dur = r["dur"]
             week_buckets[key]["distance"] += dist
-            week_buckets[key]["duration"] += dur
+            # Use recorded running pace: total duration can include walking,
+            # and duration-only activities have no pace to contribute.
+            if dist > 0 and r["pace"] is not None and r["pace"] > 0:
+                week_buckets[key]["pace_duration"] += r["pace"] * dist
+                week_buckets[key]["pace_distance"] += dist
             if r["avg_hr"] and dist > 0:
                 week_buckets[key]["hr_sum"] += r["avg_hr"] * dist
                 week_buckets[key]["hr_dist"] += dist
@@ -2535,7 +2550,7 @@ def create_app(config=None):
         weekly = []
         for week_key in sorted(week_buckets.keys()):
             b = week_buckets[week_key]
-            avg_pace = (b["duration"] / b["distance"]) if b["distance"] > 0 else None
+            avg_pace = (b["pace_duration"] / b["pace_distance"]) if b["pace_distance"] > 0 else None
             avg_hr = (b["hr_sum"] / b["hr_dist"]) if b["hr_dist"] > 0 else None
             weekly.append({
                 "week": week_key,
@@ -2548,8 +2563,8 @@ def create_app(config=None):
         # Seed 90 days before range start
         seed_start = (range_start - timedelta(days=90)).isoformat()
         iscore_rows = conn.execute(
-            """SELECT id, date FROM activities WHERE date >= ? ORDER BY date""",
-            (seed_start,),
+            """SELECT id, date FROM activities WHERE date BETWEEN ? AND ? ORDER BY date""",
+            (seed_start, today_d.isoformat()),
         ).fetchall()
         iscore_ids = [r["id"] for r in iscore_rows]
         iscores = _compute_intensity_scores(conn, iscore_ids) if iscore_ids else {}
@@ -2577,26 +2592,16 @@ def create_app(config=None):
                 })
             d_cursor += timedelta(days=1)
 
-        # Downsample ATL/CTL to ~200 points for performance
-        if len(atl_ctl) > 200:
-            step = len(atl_ctl) / 200
-            downsampled = []
-            i = 0.0
-            while int(i) < len(atl_ctl):
-                downsampled.append(atl_ctl[int(i)])
-                i += step
-            atl_ctl = downsampled
-
         # ── Races ────────────
         race_rows = conn.execute(
             """SELECT id, date, workout_name,
                       COALESCE(adjusted_distance_mi, distance_mi, 0) as distance_mi,
                       duration_s, avg_pace_s_per_mi, vdot
                FROM activities
-               WHERE date >= ?
+               WHERE date BETWEEN ? AND ?
                  AND (workout_category = 'race' OR workout_type = 'race')
                ORDER BY date""",
-            (range_start.isoformat(),),
+            (range_start.isoformat(), today_d.isoformat()),
         ).fetchall()
         races = [dict(r) for r in race_rows]
 
@@ -2604,9 +2609,9 @@ def create_app(config=None):
         vdot_rows = conn.execute(
             """SELECT effective_date, vdot, source, notes
                FROM vdot_history
-               WHERE effective_date >= ?
+               WHERE effective_date BETWEEN ? AND ?
                ORDER BY effective_date""",
-            (range_start.isoformat(),),
+            (range_start.isoformat(), today_d.isoformat()),
         ).fetchall()
         vdot_timeline = [dict(r) for r in vdot_rows]
 
@@ -2614,8 +2619,9 @@ def create_app(config=None):
         cvd_seed = (range_start - timedelta(days=AVD_WINDOW_DAYS)).isoformat()
         cvd_rows = conn.execute(
             "SELECT date, computed_vdot, duration_s FROM activities "
-            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) AND date >= ? ORDER BY date",
-            (cvd_seed,),
+            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) "
+            "AND NOT COALESCE(suppress_hr, 0) AND date BETWEEN ? AND ? ORDER BY date",
+            (cvd_seed, today_d.isoformat()),
         ).fetchall()
         mult = _avd_multiplier(conn)
         conn.close()
@@ -2633,17 +2639,8 @@ def create_app(config=None):
                 })
             d_cursor += timedelta(days=1)
 
-        # Downsample to ~300 points
-        if len(predicted_vdot) > 300:
-            step = len(predicted_vdot) / 300
-            ds = []
-            i = 0.0
-            while int(i) < len(predicted_vdot):
-                ds.append(predicted_vdot[int(i)])
-                i += step
-            predicted_vdot = ds
-
         return jsonify({
+            "date_range": {"start": range_start.isoformat(), "end": today_d.isoformat()},
             "weekly": weekly,
             "atl_ctl": atl_ctl,
             "races": races,
@@ -2667,7 +2664,8 @@ def create_app(config=None):
         # Load all activities with computed_vdot
         cvd_rows = conn.execute(
             "SELECT date, computed_vdot, duration_s FROM activities "
-            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) ORDER BY date",
+            "WHERE computed_vdot IS NOT NULL AND NOT COALESCE(exclude_from_vdot, 0) "
+            "AND NOT COALESCE(suppress_hr, 0) ORDER BY date",
         ).fetchall()
 
         cvd_data = [(r[0], r[1], r[2] or 0) for r in cvd_rows]
@@ -2742,6 +2740,7 @@ def create_app(config=None):
                FROM activities
                WHERE computed_vdot IS NOT NULL
                  AND NOT COALESCE(exclude_from_vdot, 0)
+                 AND NOT COALESCE(suppress_hr, 0)
                  AND temperature_f IS NOT NULL
                  AND humidity_pct IS NOT NULL
                  AND COALESCE(adjusted_distance_mi, distance_mi) >= 3.0

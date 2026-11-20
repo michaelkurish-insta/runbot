@@ -22,80 +22,11 @@ from runbase.analysis.track_detect import (
 )
 from runbase.analysis.pace_segments import is_structured, segment_by_pace
 from runbase.analysis.locations import find_matching_courses, best_course_for_interval
+from runbase.analysis.interval_sources import preferred_intervals
+from runbase.analysis.grade_adjustment import compute_gap as _compute_gap
 
 METERS_PER_MILE = 1609.344
 FT_PER_M = 3.28084
-
-
-def _minetti_cost_ratio(grade: float) -> float:
-    """Minetti 2002 energy cost ratio vs flat running.
-
-    grade: decimal gradient (0.10 = 10%).
-    Returns cost_ratio clamped to a minimum of 0.785 (Strava's revised
-    downhill cap, ~12% max benefit peaking around -9% grade).
-    """
-    i = max(-0.5, min(0.5, grade))
-    cr = 155.4*i**5 - 30.4*i**4 - 43.3*i**3 + 46.3*i**2 + 19.5*i + 3.6
-    ratio = cr / 3.6
-    return max(0.785, ratio)
-
-
-def _compute_gap(streams: list[dict]) -> float | None:
-    """Compute grade-adjusted pace from stream altitude + distance data.
-
-    Uses 30-meter distance windows for grade smoothing and the Minetti 2002
-    energy cost polynomial with a capped downhill benefit.
-
-    Returns gap_s_per_mi or None if insufficient data.
-    """
-    # Filter to points with valid altitude and distance
-    pts = [
-        s for s in streams
-        if s.get("altitude_ft") is not None and s.get("distance_mi") is not None
-            and s.get("timestamp_s") is not None
-    ]
-    if len(pts) < 10:
-        return None
-
-    total_time = 0.0
-    total_adj_dist = 0.0
-    WINDOW_M = 30.0  # grade smoothing window in meters
-
-    for idx in range(1, len(pts)):
-        d_mi = pts[idx]["distance_mi"] - pts[idx - 1]["distance_mi"]
-        dt = pts[idx]["timestamp_s"] - pts[idx - 1]["timestamp_s"]
-        if d_mi <= 0 or dt <= 0:
-            continue
-
-        d_m = d_mi * METERS_PER_MILE
-
-        # Compute grade over ~30m window ending at this point
-        alt_m = pts[idx]["altitude_ft"] / FT_PER_M
-        # Walk backwards to find a point ~30m earlier
-        window_start = idx
-        accum_m = 0.0
-        for j in range(idx - 1, -1, -1):
-            seg_m = (pts[j + 1]["distance_mi"] - pts[j]["distance_mi"]) * METERS_PER_MILE
-            accum_m += seg_m
-            window_start = j
-            if accum_m >= WINDOW_M:
-                break
-
-        if accum_m > 0:
-            alt_start_m = pts[window_start]["altitude_ft"] / FT_PER_M
-            grade = (alt_m - alt_start_m) / accum_m
-            grade = max(-0.5, min(0.5, grade))
-        else:
-            grade = 0.0
-
-        cost_ratio = _minetti_cost_ratio(grade)
-        total_adj_dist += d_mi * cost_ratio
-        total_time += dt
-
-    if total_adj_dist <= 0 or total_time <= 0:
-        return None
-
-    return total_time / total_adj_dist  # seconds per adjusted mile
 
 
 def _compute_elevation(streams: list[dict]) -> tuple[float | None, float | None]:
@@ -311,7 +242,8 @@ def _load_intervals(conn, activity_id: int) -> list[dict]:
                   is_recovery, start_timestamp_s, end_timestamp_s, source, is_race,
                   set_number, elapsed_pace_zone, is_stride, is_walking, is_hill_sprint,
                   pace_zone, location_type
-           FROM intervals WHERE activity_id = ? ORDER BY rep_number""",
+           FROM intervals WHERE activity_id = ?
+             AND (source IS NULL OR source != 'mile_split') ORDER BY rep_number""",
         (activity_id,),
     ).fetchall()
     return [
@@ -663,7 +595,7 @@ def enrich_activity(conn, activity_id: int, config: dict,
                canonical_distance_mi = NULL, location_type = NULL,
                is_recovery = 0, set_number = NULL,
                is_walking = 0, is_stride = 0, is_hill_sprint = 0
-           WHERE activity_id = ? AND source NOT IN ('pace_segment', 'manual')""",
+           WHERE activity_id = ? AND source NOT IN ('pace_segment', 'mile_split', 'manual', 'manual_split')""",
         (activity_id,),
     )
     conn.execute(
@@ -929,11 +861,11 @@ def enrich_activity(conn, activity_id: int, config: dict,
     # pace for very short intervals like strides.
     stride_min_mi = 0.015  # ~24m — excludes watch start/stop stubs
     # Skip pace_segment and manual intervals — user edits are canonical.
-    non_seg = [i for i in intervals if i.get("source") not in ("pace_segment", "manual")]
-    has_null_src = any(i.get("source") is None for i in non_seg)
+    non_seg = [i for i in intervals if i.get("source") not in ("pace_segment", "manual", "manual_split")]
+    has_null_src = any(i.get("source") in (None, "fit_lap") for i in non_seg)
     has_strava_src = any(i.get("source") == "strava_lap" for i in non_seg)
     if has_null_src and has_strava_src:
-        stride_candidates = [i for i in non_seg if i.get("source") is None]
+        stride_candidates = [i for i in non_seg if i.get("source") in (None, "fit_lap")]
     else:
         stride_candidates = non_seg
 
@@ -964,9 +896,9 @@ def enrich_activity(conn, activity_id: int, config: dict,
     # matching flags so they don't leak into workout type computation.
     if has_null_src and has_strava_src:
         stride_reps = {i["rep_number"] for i in non_seg
-                       if i.get("source") is None and i.get("is_stride")}
+                       if i.get("source") in (None, "fit_lap") and i.get("is_stride")}
         hill_reps = {i["rep_number"] for i in non_seg
-                     if i.get("source") is None and i.get("is_hill_sprint")}
+                     if i.get("source") in (None, "fit_lap") and i.get("is_hill_sprint")}
         for i in non_seg:
             if i.get("source") == "strava_lap":
                 if i["rep_number"] in stride_reps:
@@ -1037,14 +969,8 @@ def enrich_activity(conn, activity_id: int, config: dict,
         distance_intervals = segment_intervals
     else:
         # Exclude pace_segments — they only cover part of the activity
-        non_seg = [i for i in intervals if i.get("source") != "pace_segment"]
-        # Deduplicate: if both NULL-source and strava_lap exist, use strava_lap
-        has_null = any(i.get("source") is None for i in non_seg)
-        has_strava = any(i.get("source") == "strava_lap" for i in non_seg)
-        if has_null and has_strava:
-            distance_intervals = [i for i in non_seg if i.get("source") == "strava_lap"]
-        else:
-            distance_intervals = non_seg if non_seg else intervals
+        non_seg = [i for i in intervals if i.get("source") not in ("pace_segment", "manual_split")]
+        distance_intervals = preferred_intervals(non_seg)
     non_walking_distance = sum(
         i.get("gps_measured_distance_mi") or 0
         for i in distance_intervals
@@ -1074,18 +1000,12 @@ def enrich_activity(conn, activity_id: int, config: dict,
     # --- Store VDOT + adjusted distance + pace on activity ---
     # --- Update activity strides count from detected stride intervals ---
     # Count from preferred source only (FIT > Strava), matching the UI display logic.
-    non_seg = [i for i in intervals if i.get("source") != "pace_segment"]
-    _has_fit = any(i.get("source") is None for i in non_seg)
-    _has_strava = any(i.get("source") == "strava_lap" for i in non_seg)
-    if _has_fit and _has_strava:
-        visible = [i for i in non_seg if i.get("source") != "strava_lap"]
-    else:
-        visible = non_seg
+    visible = preferred_intervals(intervals)
     stride_count = sum(1 for i in visible if i.get("is_stride"))
     stride_count = stride_count or None  # store NULL if zero
 
     # Also count hill sprints for the activity record
-    hill_sprint_count = sum(1 for i in intervals if i.get("is_hill_sprint"))
+    hill_sprint_count = sum(1 for i in visible if i.get("is_hill_sprint"))
     hill_sprint_count = hill_sprint_count or None
 
     # Respect manual overrides from the GUI — they are canonical.
@@ -1122,6 +1042,8 @@ def enrich_activity(conn, activity_id: int, config: dict,
         avg_pace_display = None
 
     # --- Compute grade-adjusted pace (GAP) from stream altitude data ---
+    # Use the recording's moving time/distance. Display pace can exclude
+    # recoveries or contain a user override and is not the GAP time basis.
     gap = _compute_gap(streams)
 
     # --- Compute elevation gain/loss ---
@@ -1188,10 +1110,17 @@ def enrich_activity(conn, activity_id: int, config: dict,
                     best_pt["lat"], best_pt["lon"], target_dt, verbose=verbose,
                 )
                 if weather:
-                    temperature_f = weather.get("temperature_f") or temperature_f
-                    humidity_pct = weather.get("humidity_pct") or humidity_pct
-                    weather_conditions = weather.get("weather_conditions") or weather_conditions
-                    cloud_cover_pct = weather.get("cloud_cover_pct") or cloud_cover_pct
+                    # Zero cloud cover/temperature are valid weather readings.
+                    if weather.get("temperature_f") is not None:
+                        temperature_f = weather["temperature_f"]
+                    if weather.get("humidity_pct") is not None:
+                        humidity_pct = weather["humidity_pct"]
+                    if weather.get("weather_conditions") is not None:
+                        weather_conditions = weather["weather_conditions"]
+                    if weather.get("cloud_cover_pct") is not None:
+                        cloud_cover_pct = weather["cloud_cover_pct"]
+                else:
+                    print(f"WARNING: Weather is unavailable for activity #{activity_id}; other enrichment can complete.")
 
     if "distance_mi" in overrides:
         conn.execute(
@@ -1218,6 +1147,15 @@ def enrich_activity(conn, activity_id: int, config: dict,
              cloud_cover_pct, activity_id),
         )
 
+    from runbase.analysis.vdot_eligibility import refresh_stride_vdot_exclusion
+    refresh_stride_vdot_exclusion(conn, activity_id)
+
+    if vdot:
+        conn.execute(
+            "UPDATE activity_sources SET metadata_json = json_remove(metadata_json, '$.enrichment_pending') "
+            "WHERE activity_id = ? AND json_extract(metadata_json, '$.enrichment_pending') = 1",
+            (activity_id,),
+        )
     conn.commit()
 
     if verbose:

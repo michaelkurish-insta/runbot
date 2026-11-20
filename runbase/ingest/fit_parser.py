@@ -3,6 +3,7 @@
 import hashlib
 import re
 from dataclasses import dataclass, field
+from datetime import timedelta, timezone
 from pathlib import Path
 
 from fitparse import FitFile
@@ -12,6 +13,31 @@ from runbase.models import Activity, ActivitySource, Interval, Stream
 SEMICIRCLE_TO_DEGREES = 180.0 / (2 ** 31)
 METERS_PER_MILE = 1609.344
 FEET_PER_METER = 3.28084
+
+
+def _utc_timestamp(value):
+    """FIT date_time fields are UTC even when fitparse returns naive datetimes."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
+
+
+def _local_start_time(messages, start):
+    if start is None:
+        return None
+    utc_start = start.replace(tzinfo=timezone.utc) if start.tzinfo is None else start.astimezone(timezone.utc)
+    for msg in messages:
+        local = msg.get_value("local_timestamp")
+        utc = msg.get_value("timestamp")
+        if local is not None and utc is not None:
+            offset = local.replace(tzinfo=None) - utc.replace(tzinfo=None)
+            if abs(offset) <= timedelta(hours=14):
+                # Other sources store local wall time; retain that convention.
+                return (utc_start + offset).replace(tzinfo=None)
+    # If the file has no local clock, keep its UTC offset explicit.
+    return utc_start
 
 
 def format_pace(seconds_per_mile: float) -> str:
@@ -92,7 +118,7 @@ def _extract_session(messages) -> Activity:
         val = session.get_value(field_name)
         return val if val is not None else default
 
-    start_time = get("start_time")
+    start_time = _local_start_time(messages, get("start_time"))
     start_time_iso = start_time.isoformat() if start_time else None
     date_str = start_time.strftime("%Y-%m-%d") if start_time else ""
 
@@ -187,7 +213,7 @@ def _extract_records(messages, start_time_iso: str | None) -> list[Stream]:
             return val if val is not None else default
 
         timestamp = get("timestamp")
-        timestamp_s = timestamp.timestamp() if timestamp else None
+        timestamp_s = _utc_timestamp(timestamp)
 
         lat_semi = get("position_lat")
         lon_semi = get("position_long")
@@ -257,8 +283,8 @@ def _extract_laps(messages, streams: list[Stream]) -> list[Interval]:
         # Compute avg HR and cadence from stream data within this lap's time range
         lap_start = get("start_time")
         lap_end = get("timestamp")
-        lap_start_ts = lap_start.timestamp() if lap_start else None
-        lap_end_ts = lap_end.timestamp() if lap_end else None
+        lap_start_ts = _utc_timestamp(lap_start)
+        lap_end_ts = _utc_timestamp(lap_end)
 
         avg_hr = None
         avg_cadence = None
@@ -285,6 +311,15 @@ def _extract_laps(messages, streams: list[Stream]) -> list[Interval]:
         if avg_cadence is not None:
             avg_cadence = round(avg_cadence, 2)
 
+        trigger = get("lap_trigger")
+        if trigger == "distance":
+            lap_kind = "split"
+        elif trigger == "session_end" and laps and all(lap.lap_kind == "split" for lap in laps):
+            lap_kind = "split"
+        else:
+            # Unknown/button-triggered laps must not be treated as auto miles.
+            lap_kind = "interval"
+
         laps.append(Interval(
             rep_number=len(laps) + 1,
             gps_measured_distance_mi=distance_mi,
@@ -296,6 +331,7 @@ def _extract_laps(messages, streams: list[Stream]) -> list[Interval]:
             start_timestamp_s=lap_start_ts,
             end_timestamp_s=lap_end_ts,
             source="fit_lap",
+            lap_kind=lap_kind,
         ))
 
     return laps

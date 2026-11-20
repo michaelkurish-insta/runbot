@@ -2,7 +2,16 @@ __pycache__/
 *.pyc
 *.pyo
 venv/
+.venv/
 config/config.yaml
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.xlsx
 scratch/
+
+# Local archives, imports, credentials, backups, and logs
+/data/
+/state/
+/import/

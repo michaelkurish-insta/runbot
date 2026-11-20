@@ -46,7 +46,16 @@ The grid's color-coded "Type" column shows the predominant pace zone of the acti
 | **R** | Repetition / speed | 107% |
 | **FR** | Fast reps / sprints | 115% |
 
-Combo types (e.g., "I/R", "T/I") appear when an activity has work intervals at multiple distinct distances falling in different zones. E and M are excluded from combos since they represent warmup/cooldown — "E/I" is just "I". Zone boundaries are computed from the current VDOT using Daniels-Gilbert %VO2max midpoints between adjacent zones.
+Combo types (e.g., "I/R", "T/I") appear when an activity has work intervals at multiple distinct distances falling in different zones. E and M are excluded when harder work zones are present; an E/M run remains M. Zone boundaries are computed from the current VDOT using Daniels-Gilbert %VO2max midpoints between adjacent zones.
+
+The run editor separates automatic mile splits from button-press intervals. Each
+row has a compact **Intensity** label; click it to reveal the dropdown. Choose M for a
+marathon-pace finishing mile, or Auto to remove the override. Edits survive
+enrichment. The **Points** column shows each split's intensity contribution.
+A final automatic partial mile (below 0.98 miles, allowing for GPS
+rounding) inherits the duration-weighted predominant zone of the preceding full
+miles and does not determine the workout type. Explicit zone overrides still
+control that fragment's points. Button-press intervals are not subject to this rule.
 
 ### Intervals
 
@@ -74,10 +83,12 @@ Each interval tracks: distance, duration, pace, HR, cadence, pace zone, and bool
 
 ## Setup
 
+Use Python 3.13 for the tested dependency set in `requirements.lock`.
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.lock
 ```
 
 Copy the example config and fill in your values:
@@ -92,6 +103,18 @@ Initialize the database:
 ```bash
 python -m runbase db init
 ```
+
+When moving an existing installation, copy the SQLite database and set `paths.db`
+to that file. Update `paths.icloud_healthfit`, `paths.raw_store`, and token paths
+for the new machine. The database, local config, raw archives, and `state/` tokens
+are ignored by Git; credentials must be restored or authorized separately.
+
+Run `python -m runbase status` to check local paths, logins, and recent enrichment.
+The same report is available under **System status** in the review UI. To connect
+Strava, run `python scripts/setup_strava_auth.py --no-browser` and open the printed
+authorization link on this Mac. Import shows live progress and errors, resumes
+interrupted HealthFit enrichment, and refreshes the calendar on completion.
+Garmin login and historical XLSX/ZIP files are optional for HealthFit imports.
 
 ### Configuration
 
@@ -289,7 +312,18 @@ RunBase estimates fitness from every workout and predicts race performance using
 
 ### Step 1: Grade-Adjusted Pace (GAP)
 
-Raw pace is adjusted for terrain using the Minetti 2002 energy cost polynomial. For each 30m distance window in the GPS stream, the grade (rise/run) is computed and an energy cost multiplier is applied. Downhill benefit is capped at a 0.785 ratio (running downhill isn't infinitely easier). The result is the pace you would have run on flat ground at the same effort.
+Recorded moving pace is adjusted for terrain using the Minetti 2002 energy cost
+polynomial. Elevation is sampled every 10 meters and grade is estimated over
+centered 100-meter windows to reduce short-scale altitude noise. Windows never
+cross source boundaries, distance resets, pauses over 30 seconds, missing data,
+or implausible GPS jumps. The distance-weighted terrain factor retains the 0.785
+downhill cost floor. GAP uses stream time and distance rather than the display
+pace, which may exclude recoveries or contain manual edits.
+
+To update existing metrics without re-enriching mileage or intervals, first run
+`venv/bin/python scripts/recalculate_gap.py` for an audit, then add `--apply`.
+The script backs up the database, changes only GAP and CVD, and saves a JSON
+before/after report under the ignored `data/backups/` directory.
 
 ### Step 2: Computed VDOT (CVD)
 
@@ -422,7 +456,10 @@ Click a row to open a popup showing:
 - **Pace chart**: Per-interval pace visualization with zone coloring.
 - **HR chart**: Heart rate over intervals.
 - **GPS map**: Route visualization (if streams exist).
-- **Edit form**: Activity-level fields (distance, duration, name, shoe, notes, VDOT). Save & Close re-enriches the activity.
+- **Edit form**: Activity-level fields (distance, duration, name, shoe, notes, VDOT). Quality flags save with the other edits. Save & Close waits for saves and any required enrichment, then reloads CVD/AVD. Failed saves remain open with an error.
+- **VDOT exclusions**: Daily CVD is duration-weighted across eligible activities; excluded activities and activities with suppressed HR do not contribute to daily CVD or AVD. Mileage and intensity totals still include them.
+- **Stride default**: Activities default to excluded from VDOT when marked strides cover at least 40% of the full recorded activity distance, including recovery distance. Duplicate interval sources count once. The rule refreshes during enrichment and stride/distance edits; explicitly checking or unchecking **Exclude from VDOT** overrides it. Shoe CVD averages honor the same exclusion. To audit existing activities, run `python scripts/apply_stride_vdot_defaults.py`; `--apply` backs up the database and updates only the exclusion flags.
+- **Start time**: The editor displays stored local wall time directly; explicitly UTC timestamps are converted to Eastern time with daylight saving taken into account.
 - **Race entry**: Distance dropdown + time input → computes VDOT and inserts into timeline.
 - **Data quality flags**: Suppress HR, suppress cadence, exclude from VDOT.
 
@@ -435,6 +472,7 @@ Weekly training plan with:
 - **Notes**: Free-form notes per week
 - **Progress tracking**: Actual vs planned mileage and intensity, color-coded
 - **Planned activity parsing**: Understands workout structures like "8x200m", "6x400 @I", "4x(3min I, 2min E)" to estimate intensity scores
+- **CV planning**: Supports "1x8k", "8k @CV", and timed CV blocks. CV pace is estimated at the midpoint between T and I oxygen demands (93% in the model). Remaining planned mileage covers easy recovery, warmup, and cooldown; unspecified recovery time is not added beyond that mileage.
 - **Undo support**: Cmd/Ctrl+Z for recent edits
 
 ### Trends Tab
@@ -442,7 +480,7 @@ Weekly training plan with:
 Charts and tables covering a configurable range (6m, 1y, 2y, all):
 
 - **Weekly mileage** bar chart
-- **Weekly average pace** line chart
+- **Weekly average pace** line chart: distance-weighted recorded running pace; activities without pace or running distance do not contribute
 - **Weekly average HR** line chart
 - **ATL/CTL/TSB** line chart (downsampled to ~200 points)
 - **Predicted VDOT** daily line chart (21-day AVD model, ~300 points)
@@ -451,7 +489,9 @@ Charts and tables covering a configurable range (6m, 1y, 2y, all):
 
 ### Shoes Tab
 
-- Per-shoe summary: total miles, activity count, date range, average pace
+- Per-shoe summary: total miles, activity count, date range, average pace, average CVD
+- Average pace uses recorded running pace weighted by distance. Average CVD is duration-weighted and honors VDOT exclusions and suppressed HR; hover over a CVD value to see the eligible activity count.
+- Strava imports reuse a legacy shoe when linked source records prove it has the same gear ID. A matching model name alone does not combine separate pairs.
 - Monthly mileage breakdown per shoe
 - Active vs retired shoe filtering
 

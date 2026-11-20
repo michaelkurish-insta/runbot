@@ -34,6 +34,14 @@ _CONSECUTIVE_KNOWN_STOP = 10
 # Auth / client
 # ---------------------------------------------------------------------------
 
+def _save_session(garmin, token_store: Path):
+    """Support current garminconnect and older garth-backed clients."""
+    backend = getattr(garmin, 'client', None) or getattr(garmin, 'garth', None)
+    if backend is None:
+        raise RuntimeError('Garmin client has no supported token store')
+    token_store.mkdir(parents=True, exist_ok=True)
+    backend.dump(str(token_store))
+
 def _get_client(config: dict):
     """Create an authenticated Garmin client, resuming from saved tokens."""
     from garminconnect import Garmin, GarminConnectAuthenticationError
@@ -55,7 +63,7 @@ def _get_client(config: dict):
     # Fall back to credential login
     email = garmin_cfg.get("email")
     password = garmin_cfg.get("password")
-    if not email or not password:
+    if not email or not password or str(email).startswith('$') or str(password).startswith('$'):
         raise FileNotFoundError(
             f"Garmin tokens not found at {token_store} and no credentials configured. "
             f"Run: python scripts/setup_garmin_auth.py"
@@ -65,8 +73,7 @@ def _get_client(config: dict):
     garmin.login()
 
     # Save tokens for next time
-    token_store.mkdir(parents=True, exist_ok=True)
-    garmin.garth.dump(str(token_store))
+    _save_session(garmin, token_store)
 
     return garmin
 
@@ -402,11 +409,11 @@ def _download_and_import_fit(garmin, garmin_id: str, conn,
             """INSERT INTO intervals
                (activity_id, rep_number, gps_measured_distance_mi, duration_s,
                 avg_pace_s_per_mi, avg_pace_display, avg_hr, avg_cadence, is_recovery,
-                start_timestamp_s, end_timestamp_s, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                start_timestamp_s, end_timestamp_s, source, lap_kind)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (activity_id, lap.rep_number, lap.gps_measured_distance_mi, lap.duration_s,
              lap.avg_pace_s_per_mi, lap.avg_pace_display, lap.avg_hr, lap.avg_cadence,
-             lap.is_recovery, lap.start_timestamp_s, lap.end_timestamp_s, "fit_lap"),
+             lap.is_recovery, lap.start_timestamp_s, lap.end_timestamp_s, "fit_lap", lap.lap_kind),
         )
         result["lap_count"] += 1
 
@@ -604,9 +611,9 @@ def sync_garmin(config: dict, dry_run: bool = False, verbose: bool = False,
         garmin_cfg.get("token_store", "~/runbase/state/garmin_tokens")
     ).expanduser()
     try:
-        garmin.garth.dump(str(token_store))
-    except Exception:
-        pass
+        _save_session(garmin, token_store)
+    except Exception as exc:
+        print(f"WARNING: Updated Garmin login tokens could not be saved: {exc}")
 
     conn.close()
     return result
